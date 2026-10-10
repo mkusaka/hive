@@ -1,0 +1,24 @@
+{
+  "name": "hive",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p packages/contracts",
+    "lint": "oxlint . --deny-warnings",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "oxfmt": "0.63.0",
+    "oxlint": "1.78.0",
+    "typescript": "latest",
+    "vitest": "^4.1.10"
+  },
+  "packageManager": "bun@1.4.3"
+}
