@@ -8,7 +8,7 @@ Updated per ticket. See [the ticket DAG](#ticket-dag) for dependencies.
 | --------- | ------- | ------------------------------------------------------------------------------------------------------------ |
 | BOOT-01   | done    | Bun workspaces monorepo, `packages/contracts` (ids, idempotency key, event envelope, API error, `parse`), CI |
 | AUTH-01   | pending |                                                                                                              |
-| DB-01     | pending |                                                                                                              |
+| DB-01     | done    | `packages/db`: Phase 1 schema + migration, `claimJob` / `renewLease` / `finishRun`, receipts, outbox, inbox  |
 | EVENT-01  | pending |                                                                                                              |
 | EXEC-01   | pending |                                                                                                              |
 | CLI-01    | pending |                                                                                                              |

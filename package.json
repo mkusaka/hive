@@ -7,11 +7,13 @@
   ],
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit -p packages/contracts",
+    "typecheck": "tsc --noEmit -p packages/contracts && tsc --noEmit -p packages/db",
     "lint": "oxlint . --deny-warnings",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "db:generate": "bun run --cwd packages/db db:generate",
+    "db:check": "bun run --cwd packages/db db:check"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",

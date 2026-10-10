@@ -54,9 +54,9 @@ bun run format:check   # `bun run format` to fix
 bun run test           # vitest across all workspace packages
 ```
 
-Layout: Bun workspaces under `apps/*` and `packages/*`. Today only `packages/contracts` exists, holding the shared
-Valibot schemas. See [docs/architecture.md](docs/architecture.md#25-monorepo-layout-and-dependency-direction-28)
-for the target layout.
+Layout: Bun workspaces under `apps/*` and `packages/*`. Today `packages/contracts` holds the shared Valibot schemas
+and `packages/db` holds the D1 schema, migrations and atomic repository. See
+[docs/architecture.md](docs/architecture.md#25-monorepo-layout-and-dependency-direction-28) for the target layout.
 
 ## License
 
