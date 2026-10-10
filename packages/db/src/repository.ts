@@ -3,12 +3,13 @@
 // `atomic_guards` turns it into a CHECK violation (§11.3).
 import { and, asc, eq, inArray, lte, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import { inboxItems, messages, operationReceipts, outbox } from "./schema.ts";
+import { events, inboxItems, messages, operationReceipts, outbox } from "./schema.ts";
 
 const iso = (ms = Date.now()) => new Date(ms).toISOString();
 const activeRunStates = "('starting', 'running', 'waiting_approval', 'stopping')";
 
-const guard = (db: D1Database, operationId: string) =>
+/** [set, clear] around a statement that must change exactly one row. Each pair in a batch needs its own id. */
+const guard = (db: D1Database, operationId: string = crypto.randomUUID()) =>
   [
     db
       .prepare("INSERT INTO atomic_guards (operation_id, ok) VALUES (?, changes())")
@@ -343,16 +344,27 @@ export const acquireOutboxBatch = (
     .returning();
 };
 
-export const markOutboxSent = async (db: D1Database, input: { id: string; owner: string }) => {
+const settleOutbox = async (
+  db: D1Database,
+  input: { id: string; owner: string },
+  state: "sent" | "dead",
+) => {
   const rows = await drizzle(db)
     .update(outbox)
-    .set({ state: "sent", updatedAt: iso() })
+    .set({ state, updatedAt: iso() })
     .where(
       and(eq(outbox.id, input.id), eq(outbox.leaseOwner, input.owner), eq(outbox.state, "sending")),
     )
     .returning({ id: outbox.id });
   return rows.length === 1;
 };
+
+export const markOutboxSent = (db: D1Database, input: { id: string; owner: string }) =>
+  settleOutbox(db, input, "sent");
+
+/** Gives up on a row; it stays for inspection and explicit replay (§6.3). */
+export const markOutboxDead = (db: D1Database, input: { id: string; owner: string }) =>
+  settleOutbox(db, input, "dead");
 
 // ------------------------------------------------- Messages and inbox items
 
@@ -427,4 +439,212 @@ export const createInboxItem = async (
       ),
     );
   return { created: false, item: existing! };
+};
+
+// ------------------------------------------------ Batchable statement forms
+// For commands that commit Message, Event, Inbox, Receipt and Outbox in one batch (§11.1).
+// Plain INSERTs: a duplicate violates a UNIQUE constraint, which fails and rolls back the batch.
+
+/** Same `seq` rule as `appendMessage`. */
+export const insertMessage = (
+  db: D1Database,
+  input: {
+    id: string;
+    workspaceId: string;
+    conversationId: string;
+    actorId: string;
+    clientMessageId: string;
+    body: string;
+  },
+) =>
+  db
+    .prepare(
+      `INSERT INTO messages (id, workspace_id, conversation_id, seq, actor_id, client_message_id, body)
+       VALUES (?, ?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE conversation_id = ?), ?, ?, ?)`,
+    )
+    .bind(
+      input.id,
+      input.workspaceId,
+      input.conversationId,
+      input.conversationId,
+      input.actorId,
+      input.clientMessageId,
+      input.body,
+    );
+
+export const insertEvent = (db: D1Database, e: typeof events.$inferInsert) =>
+  db
+    .prepare(
+      `INSERT INTO events (id, workspace_id, type, schema_version, source_kind, integration_id,
+         external_event_id, source_device_id, actor_kind, actor_id, subject_kind, subject_id, data,
+         correlation_id, causation_id, occurred_at, received_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      e.id,
+      e.workspaceId,
+      e.type,
+      e.schemaVersion,
+      e.sourceKind,
+      e.integrationId ?? null,
+      e.externalEventId ?? null,
+      e.sourceDeviceId ?? null,
+      e.actorKind,
+      e.actorId,
+      e.subjectKind ?? null,
+      e.subjectId ?? null,
+      JSON.stringify(e.data),
+      e.correlationId,
+      e.causationId ?? null,
+      e.occurredAt,
+      e.receivedAt,
+      e.expiresAt ?? null,
+    );
+
+type InboxInput = {
+  id: string;
+  workspaceId: string;
+  inputId: string;
+  botId: string;
+  lane: string;
+  purpose: string;
+  conversationId: string | null;
+  deliveryMode: "wake" | "notify";
+};
+
+export const insertInboxItem = (db: D1Database, input: InboxInput) =>
+  db
+    .prepare(
+      `INSERT INTO inbox_items (id, workspace_id, input_id, bot_id, conversation_id, lane, purpose, delivery_mode)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      input.id,
+      input.workspaceId,
+      input.inputId,
+      input.botId,
+      input.conversationId,
+      input.lane,
+      input.purpose,
+      input.deliveryMode,
+    );
+
+/** A queued Job; UNIQUE (workspace_id, trigger_key) makes it idempotent. Placement is the Bot's snapshot. */
+export const createJob = (
+  db: D1Database,
+  input: { id: string; workspaceId: string; botId: string; triggerKey: string },
+) =>
+  db
+    .prepare(
+      `INSERT INTO jobs (id, workspace_id, bot_id, state, trigger_key, placement)
+       VALUES (?, ?, ?, 'queued', ?,
+         (SELECT placement_policy FROM bots WHERE workspace_id = ? AND id = ?))`,
+    )
+    .bind(
+      input.id,
+      input.workspaceId,
+      input.botId,
+      input.triggerKey,
+      input.workspaceId,
+      input.botId,
+    );
+
+// ------------------------------------------------------------- Event route
+
+export const eventRouter = { consumer: "event-router", handlerVersion: "1" } as const;
+
+const insertConsumerReceipt = (db: D1Database, workspaceId: string, eventId: string) =>
+  db
+    .prepare(
+      "INSERT INTO event_receipts (workspace_id, event_id, consumer, handler_version) VALUES (?, ?, ?, ?)",
+    )
+    .bind(workspaceId, eventId, eventRouter.consumer, eventRouter.handlerVersion);
+
+const hasConsumerReceipt = async (db: D1Database, eventId: string) =>
+  (await db
+    .prepare(
+      "SELECT 1 FROM event_receipts WHERE event_id = ? AND consumer = ? AND handler_version = ?",
+    )
+    .bind(eventId, eventRouter.consumer, eventRouter.handlerVersion)
+    .first()) !== null;
+
+/**
+ * Runs the router's batch behind its consumer receipt. Returns false when the event was already routed
+ * (receipt present before, or written by a concurrent consumer whose batch won).
+ */
+const routeOnce = async (
+  db: D1Database,
+  workspaceId: string,
+  eventId: string,
+  statements: D1PreparedStatement[],
+) => {
+  if (await hasConsumerReceipt(db, eventId)) return false;
+  try {
+    await db.batch([insertConsumerReceipt(db, workspaceId, eventId), ...statements]);
+    return true;
+  } catch (error) {
+    if (await hasConsumerReceipt(db, eventId)) return false;
+    throw error;
+  }
+};
+
+/** An event with no recipients (no subscriptions yet): only the consumer receipt (§9.4, AT-06). */
+export const recordEventRouted = (
+  db: D1Database,
+  input: { workspaceId: string; eventId: string },
+) => routeOnce(db, input.workspaceId, input.eventId, []);
+
+/**
+ * Event route (§11.1): consumer receipt, Delivery, Inbox item and (for `wake`) a queued Job in one batch.
+ * The Inbox item may already exist (agent.send writes it at intake): it is linked to the Delivery, and
+ * exactly one row must change. The Job's trigger key is `inbox:<inboxItemId>`.
+ */
+export const createDeliveryAndInbox = async (
+  db: D1Database,
+  input: InboxInput & { eventId: string },
+): Promise<{ routed: false } | { routed: true; deliveryId: string; jobId: string | null }> => {
+  const deliveryId = crypto.randomUUID();
+  const jobId = input.deliveryMode === "wake" ? crypto.randomUUID() : null;
+  const [setGuard, clearGuard] = guard(db);
+  const routed = await routeOnce(db, input.workspaceId, input.eventId, [
+    db
+      .prepare(
+        `INSERT INTO event_deliveries (id, workspace_id, event_id, bot_id, lane, purpose)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(deliveryId, input.workspaceId, input.eventId, input.botId, input.lane, input.purpose),
+    db
+      .prepare(
+        `INSERT INTO inbox_items (id, workspace_id, input_id, bot_id, conversation_id, lane, purpose, delivery_mode, delivery_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (workspace_id, input_id, bot_id, lane, purpose)
+         DO UPDATE SET delivery_id = excluded.delivery_id, updated_at = ?
+         WHERE inbox_items.delivery_id IS NULL`,
+      )
+      .bind(
+        input.id,
+        input.workspaceId,
+        input.inputId,
+        input.botId,
+        input.conversationId,
+        input.lane,
+        input.purpose,
+        input.deliveryMode,
+        deliveryId,
+        iso(),
+      ),
+    setGuard,
+    clearGuard,
+    ...(jobId
+      ? [
+          createJob(db, {
+            id: jobId,
+            workspaceId: input.workspaceId,
+            botId: input.botId,
+            triggerKey: `inbox:${input.id}`,
+          }),
+        ]
+      : []),
+  ]);
+  return routed ? { routed: true, deliveryId, jobId } : { routed: false };
 };

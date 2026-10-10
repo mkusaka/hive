@@ -1,6 +1,6 @@
 import * as v from "valibot";
 import { describe, expect, it } from "vitest";
-import { eventEnvelope, parse } from "./index.ts";
+import { BotCreate, EventEmit, eventEnvelope, parse } from "./index.ts";
 
 const BuildFailed = eventEnvelope(v.strictObject({ command: v.string(), exitCode: v.number() }));
 
@@ -32,5 +32,37 @@ describe("EventEnvelope", () => {
     expect(parse(BuildFailed, { ...valid, extra: true }).ok).toBe(false);
     expect(parse(BuildFailed, { ...valid, source: { kind: "email" } }).ok).toBe(false);
     expect(parse(BuildFailed, { ...valid, data: { command: "x" } }).ok).toBe(false);
+  });
+});
+
+const emit = (event: object) => parse(EventEmit, { type: "event.emit", event });
+
+describe("command schemas", () => {
+  it("fills placement policy defaults", () => {
+    expect(parse(BotCreate, { type: "bot.create", name: "coder" })).toEqual({
+      ok: true,
+      value: {
+        type: "bot.create",
+        name: "coder",
+        placementPolicy: {
+          mode: "any",
+          allowedDeviceIds: [],
+          preferredDeviceIds: [],
+          fallbackOnUnavailable: true,
+          overflowToFallback: false,
+          requiredCapabilities: [],
+          recovery: "manual",
+        },
+      },
+    });
+  });
+
+  it("requires event data and caps it at 64 KiB of JSON bytes", () => {
+    expect(emit({ type: "custom.build.failed", data: null }).ok).toBe(true);
+    expect(emit({ type: "custom.build.failed" }).ok).toBe(false);
+    expect(emit({ type: "Custom", data: 1 }).ok).toBe(false);
+    // 3 bytes per char: under 64 Ki characters but over 64 KiB.
+    expect(emit({ type: "custom.x", data: "あ".repeat(22_000) }).ok).toBe(false);
+    expect(emit({ type: "custom.x", data: "a".repeat(60_000) }).ok).toBe(true);
   });
 });

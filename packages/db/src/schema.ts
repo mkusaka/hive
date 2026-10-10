@@ -84,7 +84,14 @@ export const actors = sqliteTable(
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
-  (t) => [scoped(t), oneOf("actors_kind", t.kind, actorKinds)],
+  (t) => [
+    scoped(t),
+    oneOf("actors_kind", t.kind, actorKinds),
+    // One actor per user per Workspace; created with the membership (workspace.create today).
+    uniqueIndex("actors_workspace_user")
+      .on(t.workspaceId, t.userId)
+      .where(sql`${t.userId} IS NOT NULL`),
+  ],
 );
 
 // ----------------------------------------------------------------- Devices
@@ -142,6 +149,32 @@ export const channels = sqliteTable(
     updatedAt: updatedAt(),
   },
   (t) => [scoped(t), unique().on(t.workspaceId, t.name)],
+);
+
+const channelRoles = ["owner", "member"] as const;
+
+/** current state. Users and Bots join a Channel through their actor row. */
+export const channelMembers = sqliteTable(
+  "channel_members",
+  {
+    workspaceId: workspaceId(),
+    channelId: text("channel_id").notNull(),
+    actorId: text("actor_id").notNull(),
+    role: text("role", { enum: channelRoles }).notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.workspaceId, t.channelId, t.actorId] }),
+    oneOf("channel_members_role", t.role, channelRoles),
+    foreignKey({
+      columns: [t.workspaceId, t.channelId],
+      foreignColumns: [channels.workspaceId, channels.id],
+    }),
+    foreignKey({
+      columns: [t.workspaceId, t.actorId],
+      foreignColumns: [actors.workspaceId, actors.id],
+    }),
+  ],
 );
 
 /** current state. Phase 1: one main conversation per channel. */
@@ -312,6 +345,11 @@ export const inboxItems = sqliteTable(
     lane: text("lane").notNull(),
     purpose: text("purpose").notNull(),
     deliveryId: text("delivery_id"),
+    // docs/architecture.md §7.2. No SQL CHECK: adding one to an existing table makes drizzle-kit
+    // recreate it; the command schema validates the value.
+    deliveryMode: text("delivery_mode", { enum: ["wake", "notify"] })
+      .notNull()
+      .default("wake"),
     state: text("state", { enum: inboxStates }).notNull().default("pending"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),

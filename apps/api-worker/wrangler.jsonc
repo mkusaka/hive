@@ -3,6 +3,8 @@
   "name": "hive-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-15",
+  // Outbox pump (src/pump.ts) until Cloudflare Queues carry the outbox.
+  "triggers": { "crons": ["* * * * *"] },
   "d1_databases": [
     {
       "binding": "DB",

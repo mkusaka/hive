@@ -1,13 +1,41 @@
 // POST /v1/commands handlers (docs/architecture.md §22.3). Each runs inside `withOperationReceipt`.
-import { commandEnvelope, DeviceRegister, DeviceRevoke, WorkspaceCreate } from "@hive/contracts";
-import { digest, withOperationReceipt } from "@hive/db";
+import {
+  AgentSend,
+  type AgentSendAccepted,
+  BotCreate,
+  ChannelCreate,
+  commandEnvelope,
+  DeviceRegister,
+  DeviceRevoke,
+  EventEmit,
+  type EventEmitAccepted,
+  userEventType,
+  WorkspaceCreate,
+} from "@hive/contracts";
+import {
+  digest,
+  enqueueOutbox,
+  IdempotencyConflict,
+  insertEvent,
+  insertInboxItem,
+  insertMessage,
+  withOperationReceipt,
+} from "@hive/db";
 import * as v from "valibot";
 import { hashSecret, newDeviceSecret } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
 import { HttpError } from "./errors.ts";
 
 export const CommandEnvelope = commandEnvelope(
-  v.variant("type", [WorkspaceCreate, DeviceRegister, DeviceRevoke]),
+  v.variant("type", [
+    WorkspaceCreate,
+    DeviceRegister,
+    DeviceRevoke,
+    ChannelCreate,
+    BotCreate,
+    AgentSend,
+    EventEmit,
+  ]),
 );
 type Envelope = v.InferOutput<typeof CommandEnvelope>;
 type Command = Envelope["command"];
@@ -64,6 +92,13 @@ const workspaceCreate: Handler<v.InferOutput<typeof WorkspaceCreate>> = async (d
           "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES (?, ?, 'owner')",
         )
         .bind(workspaceId, user.userId),
+      // The member's actor row (messages, channel membership) is created with the membership.
+      db
+        .prepare(
+          `INSERT INTO actors (id, workspace_id, kind, user_id, display_name)
+           SELECT ?, ?, 'user', id, COALESCE(email, id) FROM users WHERE id = ?`,
+        )
+        .bind(crypto.randomUUID(), workspaceId, user.userId),
     ],
     { operationId: env.operationId, status: "accepted", workspaceId },
   );
@@ -135,10 +170,219 @@ const deviceRevoke: Handler<v.InferOutput<typeof DeviceRevoke>> = async (db, use
   );
 };
 
+const userActorId = async (db: D1Database, workspaceId: string, userId: string) => {
+  const row = await db
+    .prepare("SELECT id FROM actors WHERE workspace_id = ? AND user_id = ?")
+    .bind(workspaceId, userId)
+    .first<{ id: string }>();
+  if (!row) throw new HttpError("FORBIDDEN", "no actor for this user in the workspace");
+  return row.id;
+};
+
+/** Maps a batch failure caused by UNIQUE (workspace_id, name) to 422. A replay never reaches the batch. */
+const uniqueName = <T>(
+  db: D1Database,
+  table: "channels" | "bots",
+  workspaceId: string,
+  name: string,
+  run: Promise<T>,
+) =>
+  run.catch(async (error: unknown) => {
+    if (error instanceof IdempotencyConflict) throw error;
+    const taken = await db
+      .prepare(`SELECT 1 FROM ${table} WHERE workspace_id = ? AND name = ?`)
+      .bind(workspaceId, name)
+      .first();
+    if (taken) throw new HttpError("INVALID_INPUT", `name already exists: ${name}`);
+    throw error;
+  });
+
+const channelCreate: Handler<v.InferOutput<typeof ChannelCreate>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const actorId = await userActorId(db, workspaceId, user.userId);
+  const channelId = crypto.randomUUID();
+  const conversationId = crypto.randomUUID();
+  const run = receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare("INSERT INTO channels (id, workspace_id, name) VALUES (?, ?, ?)")
+        .bind(channelId, workspaceId, command.name),
+      db
+        .prepare("INSERT INTO conversations (id, workspace_id, channel_id) VALUES (?, ?, ?)")
+        .bind(conversationId, workspaceId, channelId),
+      db
+        .prepare(
+          "INSERT INTO channel_members (workspace_id, channel_id, actor_id, role) VALUES (?, ?, ?, 'owner')",
+        )
+        .bind(workspaceId, channelId, actorId),
+    ],
+    { operationId: env.operationId, status: "accepted", channelId, conversationId },
+  );
+  return uniqueName(db, "channels", workspaceId, command.name, run);
+};
+
+const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const actorId = crypto.randomUUID();
+  const botId = crypto.randomUUID();
+  const run = receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          "INSERT INTO actors (id, workspace_id, kind, display_name) VALUES (?, ?, 'bot', ?)",
+        )
+        .bind(actorId, workspaceId, command.name),
+      db
+        .prepare(
+          "INSERT INTO bots (id, workspace_id, actor_id, name, placement_policy) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(botId, workspaceId, actorId, command.name, JSON.stringify(command.placementPolicy)),
+    ],
+    { operationId: env.operationId, status: "accepted", botId },
+  );
+  return uniqueName(db, "bots", workspaceId, command.name, run);
+};
+
+/** §11.1: Message, Inbox item, Event, Outbox and Receipt in one batch. Routing creates the Job later. */
+const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const member = await db
+    .prepare(
+      `SELECT c.id AS conversation_id, a.id AS actor_id
+         FROM conversations c
+         JOIN channel_members m ON m.workspace_id = c.workspace_id AND m.channel_id = c.channel_id
+         JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+        WHERE c.workspace_id = ? AND c.channel_id = ? AND a.user_id = ?`,
+    )
+    .bind(workspaceId, command.channelId, user.userId)
+    .first<{ conversation_id: string; actor_id: string }>();
+  if (!member) throw new HttpError("FORBIDDEN", "not a member of this channel");
+  const bot = await db
+    .prepare("SELECT 1 FROM bots WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, command.recipientBotId)
+    .first();
+  if (!bot) throw new HttpError("NOT_FOUND", "bot not found");
+
+  const receivedAt = new Date().toISOString();
+  const messageId = crypto.randomUUID();
+  const eventId = crypto.randomUUID();
+  const inboxItemId = crypto.randomUUID();
+  const response: AgentSendAccepted = {
+    operationId: env.operationId,
+    status: "accepted",
+    messageId,
+    inboxItemId,
+    jobId: null,
+    routingStatus: "pending",
+    receivedAt,
+  };
+  return receipt(
+    db,
+    user,
+    env,
+    [
+      insertMessage(db, {
+        id: messageId,
+        workspaceId,
+        conversationId: member.conversation_id,
+        actorId: member.actor_id,
+        clientMessageId: env.idempotencyKey,
+        body: command.message.text,
+      }),
+      insertEvent(db, {
+        id: eventId,
+        workspaceId,
+        type: "agent.message.sent",
+        schemaVersion: 1,
+        sourceKind: "cli",
+        actorKind: "user",
+        actorId: user.userId,
+        subjectKind: "message",
+        subjectId: messageId,
+        // Read by the event router (pump.ts); the message text stays in `messages`.
+        data: {
+          messageId,
+          kind: command.message.kind,
+          recipientBotId: command.recipientBotId,
+          channelId: command.channelId,
+          conversationId: member.conversation_id,
+          inboxItemId,
+          delivery: command.delivery,
+        },
+        correlationId: env.operationId,
+        occurredAt: receivedAt,
+        receivedAt,
+      }),
+      insertInboxItem(db, {
+        id: inboxItemId,
+        workspaceId,
+        inputId: eventId,
+        botId: command.recipientBotId,
+        conversationId: member.conversation_id,
+        lane: command.channelId,
+        purpose: "agent.send",
+        deliveryMode: command.delivery,
+      }),
+      enqueueOutbox(db, { workspaceId, topic: "event.route", payload: { eventId } }),
+    ],
+    response,
+  );
+};
+
+const eventEmit: Handler<v.InferOutput<typeof EventEmit>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const { event } = command;
+  if (!userEventType.test(event.type)) {
+    throw new HttpError("FORBIDDEN", "users may only emit custom.* events");
+  }
+  const receivedAt = new Date().toISOString();
+  const eventId = crypto.randomUUID();
+  const response: EventEmitAccepted = {
+    operationId: env.operationId,
+    status: "accepted",
+    eventId,
+    receivedAt,
+  };
+  return receipt(
+    db,
+    user,
+    env,
+    [
+      insertEvent(db, {
+        id: eventId,
+        workspaceId,
+        type: event.type,
+        schemaVersion: 1,
+        sourceKind: "cli",
+        actorKind: "user",
+        actorId: user.userId,
+        subjectKind: event.subject?.kind,
+        subjectId: event.subject?.id,
+        data: event.data,
+        correlationId: env.operationId,
+        occurredAt: event.occurredAt ?? receivedAt,
+        receivedAt,
+      }),
+      enqueueOutbox(db, { workspaceId, topic: "event.route", payload: { eventId } }),
+    ],
+    response,
+  );
+};
+
 const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>> } = {
   "workspace.create": workspaceCreate,
   "device.register": deviceRegister,
   "device.revoke": deviceRevoke,
+  "channel.create": channelCreate,
+  "bot.create": botCreate,
+  "agent.send": agentSend,
+  "event.emit": eventEmit,
 };
 
 export const runCommand = (db: D1Database, principal: Principal, envelope: Envelope) => {

@@ -7,11 +7,19 @@ import { authenticateDevice } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
 import { CommandEnvelope, runCommand } from "./commands.ts";
 import { HttpError, toErrorResponse } from "./errors.ts";
+import { pump } from "./pump.ts";
+import { getJob, getOperation, listInbox } from "./queries.ts";
 
 export type Bindings = { DB: D1Database; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string };
 export type AppEnv = {
   Bindings: Bindings;
   Variables: { requestId: string; operationId?: string; principal: Principal };
+};
+
+const user = (c: { get: (key: "principal") => Principal }) => {
+  const principal = c.get("principal");
+  if (principal.kind !== "user") throw new HttpError("FORBIDDEN", "user principal required");
+  return principal;
 };
 
 /** `jwks` is injectable so tests can sign Access assertions with a local key. */
@@ -50,6 +58,24 @@ export const createApp = ({
     c.set("operationId", parsed.value.operationId);
     const { status, response } = await runCommand(c.env.DB, c.get("principal"), parsed.value);
     return c.json(response, status as ContentfulStatusCode);
+  });
+
+  app.post("/v1/executor/pump", async (c) => {
+    const device = c.get("principal") as Extract<Principal, { kind: "device" }>;
+    return c.json(await pump(c.env.DB, { owner: `device:${device.deviceId}`, limit: 50 }));
+  });
+
+  app.get("/v1/operations/:id", async (c) => {
+    const { userId, workspaceIds } = user(c);
+    return c.json(await getOperation(c.env.DB, userId, workspaceIds, c.req.param("id")));
+  });
+  app.get("/v1/jobs/:id", async (c) =>
+    c.json(await getJob(c.env.DB, user(c).workspaceIds, c.req.param("id"))),
+  );
+  app.get("/v1/inbox", async (c) => {
+    const botId = c.req.query("botId");
+    if (!botId) throw new HttpError("INVALID_INPUT", "botId is required");
+    return c.json(await listInbox(c.env.DB, user(c).workspaceIds, botId));
   });
 
   return app;

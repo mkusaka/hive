@@ -85,6 +85,89 @@ export const DeviceRevoke = v.strictObject({
   deviceId: DeviceId,
 });
 
+export const ChannelCreate = v.strictObject({ type: v.literal("channel.create"), name: Name });
+
+const DeviceIds = v.optional(v.array(DeviceId), []);
+
+// docs/architecture.md §3.2, §10.2. Every field defaults, so `{}` means "any eligible device".
+export const PlacementPolicy = v.strictObject({
+  mode: v.optional(v.picklist(["pinned", "preferred", "any"]), "any"),
+  allowedDeviceIds: DeviceIds,
+  preferredDeviceIds: DeviceIds,
+  fallbackOnUnavailable: v.optional(v.boolean(), true),
+  overflowToFallback: v.optional(v.boolean(), false),
+  environmentId: v.optional(Name),
+  requiredCapabilities: v.optional(v.array(Name), []),
+  recovery: v.optional(v.picklist(["manual", "safe_auto"]), "manual"),
+});
+export type PlacementPolicy = v.InferOutput<typeof PlacementPolicy>;
+
+export const BotCreate = v.strictObject({
+  type: v.literal("bot.create"),
+  name: Name,
+  placementPolicy: v.optional(PlacementPolicy, {}),
+});
+
+// docs/architecture.md §5.3, §7.2. Direct delivery to a Bot's Inbox; lane = channel.
+export const AgentSend = v.strictObject({
+  type: v.literal("agent.send"),
+  recipientBotId: BotId,
+  channelId: ChannelId,
+  message: v.strictObject({
+    kind: v.picklist(["request", "notification"]),
+    text: v.pipe(v.string(), v.minLength(1), v.maxLength(64 * 1024)),
+  }),
+  delivery: v.picklist(["wake", "notify"]),
+});
+
+// UTF-8 size of the JSON text. No TextEncoder: contracts stay runtime-neutral (`types: []`).
+// JSON.stringify escapes lone surrogates, so every code point here is well-formed.
+const jsonBytes = (value: unknown) => {
+  let bytes = 0;
+  for (const ch of JSON.stringify(value) ?? "") {
+    const c = ch.codePointAt(0)!;
+    bytes += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+};
+
+/** Namespaced event type. Which namespaces an actor may publish is checked by the server (§5.1). */
+export const EventType = v.pipe(v.string(), v.regex(/^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$/));
+/** The only namespace a user may emit (docs/architecture.md §5.1). */
+export const userEventType = /^custom\.[a-z0-9_.]+$/;
+
+// docs/architecture.md §5.3. Pub/sub: with no subscribers nothing starts.
+export const EventEmit = v.strictObject({
+  type: v.literal("event.emit"),
+  event: v.strictObject({
+    type: EventType,
+    subject: v.optional(v.strictObject({ kind: Name, id: Name })),
+    data: v.pipe(
+      v.unknown(),
+      v.check((data) => data !== undefined, "data is required"),
+      v.check((data) => jsonBytes(data) <= 64 * 1024, "data must be at most 64 KiB of JSON"),
+    ),
+    occurredAt: v.optional(Timestamp),
+  }),
+});
+
+// docs/architecture.md §22.4. A Job id is never invented at intake: routing creates it later.
+export type AgentSendAccepted = {
+  operationId: string;
+  status: "accepted";
+  messageId: string;
+  inboxItemId: string;
+  jobId: null;
+  routingStatus: "pending";
+  receivedAt: string;
+};
+export type EventEmitAccepted = {
+  operationId: string;
+  status: "accepted";
+  eventId: string;
+  receivedAt: string;
+};
+
 // docs/architecture.md §22.5
 export const apiErrorStatus = {
   UNAUTHENTICATED: 401,

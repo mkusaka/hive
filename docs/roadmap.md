@@ -4,20 +4,20 @@
 
 Updated per ticket. See [the ticket DAG](#ticket-dag) for dependencies.
 
-| Ticket    | State   | Notes                                                                                                                         |
-| --------- | ------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| BOOT-01   | done    | Bun workspaces monorepo, `packages/contracts` (ids, idempotency key, event envelope, API error, `parse`), CI                  |
-| AUTH-01   | done    | `apps/api-worker`: Access + device-token principals, `POST /v1/commands` (workspace/device), `/v1/me`; G-02/G-04 not executed |
-| DB-01     | done    | `packages/db`: Phase 1 schema + migration, `claimJob` / `renewLease` / `finishRun`, receipts, outbox, inbox                   |
-| EVENT-01  | pending |                                                                                                                               |
-| EXEC-01   | pending |                                                                                                                               |
-| CLI-01    | pending |                                                                                                                               |
-| SYNC-01   | pending |                                                                                                                               |
-| SDK-01    | pending |                                                                                                                               |
-| UI-01     | pending |                                                                                                                               |
-| WORK-01   | pending |                                                                                                                               |
-| INTEG-01  | pending |                                                                                                                               |
-| MOBILE-01 | pending |                                                                                                                               |
+| Ticket    | State   | Notes                                                                                                                             |
+| --------- | ------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| BOOT-01   | done    | Bun workspaces monorepo, `packages/contracts` (ids, idempotency key, event envelope, API error, `parse`), CI                      |
+| AUTH-01   | done    | `apps/api-worker`: Access + device-token principals, `POST /v1/commands` (workspace/device), `/v1/me`; G-02/G-04 not executed     |
+| DB-01     | done    | `packages/db`: Phase 1 schema + migration, `claimJob` / `renewLease` / `finishRun`, receipts, outbox, inbox                       |
+| EVENT-01  | done    | `channel/bot.create`, `agent.send`, `event.emit`, outbox pump → Delivery / Inbox / queued Job; no Queues yet (cron + manual pump) |
+| EXEC-01   | pending |                                                                                                                                   |
+| CLI-01    | pending |                                                                                                                                   |
+| SYNC-01   | pending |                                                                                                                                   |
+| SDK-01    | pending |                                                                                                                                   |
+| UI-01     | pending |                                                                                                                                   |
+| WORK-01   | pending |                                                                                                                                   |
+| INTEG-01  | pending |                                                                                                                                   |
+| MOBILE-01 | pending |                                                                                                                                   |
 
 Gates G-01..G-10: **none executed yet.**
 
