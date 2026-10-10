@@ -26,8 +26,8 @@ marker in the journal. Only then does the loop claim new Jobs.
 ## Running against `wrangler dev`
 
 1. Start the API Worker locally (see `apps/api-worker/README.md`, Local development).
-2. As a user, register a device and keep the token (returned only once). User routes need a real Access
-   assertion, so this step needs Access in front of the Worker:
+2. As a user, register a device and keep the token (returned only once). `hive device register` (see
+   `apps/cli/README.md`) does this and writes the token file; by hand it is:
 
    ```sh
    curl -s http://localhost:8787/v1/commands -H "Cf-Access-Jwt-Assertion: <assertion>" \

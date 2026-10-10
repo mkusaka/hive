@@ -22,7 +22,7 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 
 - **User auth.** `Cf-Access-Jwt-Assertion` is verified with `jose` against
   `https://<ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs` (issuer `https://<ACCESS_TEAM_DOMAIN>`, audience
-  `ACCESS_AUD`). `(issuer, sub)` maps to a `users` row, created on first login with the email claim.
+  `ACCESS_AUD`), or against `ACCESS_DEV_JWKS` in local dev (below). `(issuer, sub)` maps to a `users` row, created on first login with the email claim.
 - **Device auth.** The token is `<deviceId>.<secret>`. Only SHA-256(secret) is stored in `device_credentials`; it
   is compared in constant time, and a revoked credential or device is rejected.
 - **Commands.** The envelope `{operationId, idempotencyKey, workspaceId, command}` and command schemas live in
@@ -108,22 +108,33 @@ It runs from the `scheduled()` cron trigger (every minute) and from `POST /v1/ex
 `wrangler.jsonc` has a **placeholder `database_id`** (all zeros) until the owner provisions D1
 (`bunx wrangler d1 create hive`) and replaces it. Local dev uses a local D1 and does not need the real id.
 
-Create `apps/api-worker/.dev.vars` (gitignored) to fill the vars left empty in `wrangler.jsonc`:
-
-```sh
-ACCESS_TEAM_DOMAIN=<team>.cloudflareaccess.com  # Access team domain, no scheme
-ACCESS_AUD=<aud-tag>                            # Application Audience (AUD) tag of the Access app
-```
+`apps/api-worker/.dev.vars` (gitignored) fills the vars left empty in `wrangler.jsonc`. For local dev without
+Access in front, let `scripts/dev-token.ts` write it:
 
 ```sh
 cd apps/api-worker
+bun scripts/dev-token.ts --dev-vars > .dev.vars  # ACCESS_TEAM_DOMAIN, ACCESS_AUD, ACCESS_DEV_JWKS
 bunx wrangler d1 migrations apply hive --local   # applies packages/db/migrations
-bunx wrangler dev
+bunx wrangler dev --local
+export HIVE_ACCESS_JWT=$(bun scripts/dev-token.ts)  # 12 h dev assertion for the hive CLI
 ```
 
-Without Cloudflare Access in front, requests need a real Access assertion, so local dev is mostly useful for
-`/healthz` and device-token routes. Tests sign assertions with a local key instead (`createApp({ jwks })`).
+- **`ACCESS_DEV_JWKS`** (optional, `.dev.vars` only, **never** in `wrangler.jsonc` or a deployed Worker): a JSON
+  Web Key Set. When set, user assertions are verified with `createLocalJWKSet` against it instead of the Access
+  certs; issuer and audience are still checked. Anyone holding the matching private key can sign in as anyone.
+- **`scripts/dev-token.ts`** generates an ES256 keypair once into `apps/api-worker/.dev-keys.json` (gitignored,
+  mode 0600) and reuses it. `--dev-vars` prints the three `.dev.vars` lines; otherwise it prints a JWT (iss
+  `https://<ACCESS_TEAM_DOMAIN>`, aud `ACCESS_AUD`, `--sub` default `dev`, `--email` default `dev@example.test`,
+  12 h). It reads `ACCESS_TEAM_DOMAIN` / `ACCESS_AUD` from the environment, defaulting to the values `--dev-vars`
+  writes. `mintDevToken` is exported for `test/devToken.test.ts`.
+- **With real Access** (G-02 not executed yet): put `ACCESS_TEAM_DOMAIN` / `ACCESS_AUD` in `.dev.vars` without
+  `ACCESS_DEV_JWKS`, then get an assertion with `cloudflared access login <api url>` and
+  `cloudflared access token -app <api url>`.
+- `wrangler dev` does not fire the cron trigger, so the outbox is routed by `POST /v1/executor/pump`, which
+  `hive executor run` calls before each poll.
 
 ## Tests
 
 `bun run test` from the repo root runs `test/` in miniflare with the `packages/db` migrations applied.
+`test/cli.test.ts` drives the Phase 1 loop through the `hive` CLI's command functions (`@hive/cli/commands`);
+`test/devToken.test.ts` covers the `ACCESS_DEV_JWKS` path.

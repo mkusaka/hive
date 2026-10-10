@@ -25,8 +25,20 @@
       "devDependencies": {
         "@cloudflare/vitest-pool-workers": "^0.21.3",
         "@cloudflare/workers-types": "^5.20260814.1",
+        "@hive/cli": "workspace:*",
         "@hive/executor": "workspace:*",
         "wrangler": "^4.123.0",
+      },
+    },
+    "apps/cli": {
+      "name": "@hive/cli",
+      "version": "0.0.0",
+      "bin": {
+        "hive": "src/main.ts",
+      },
+      "dependencies": {
+        "@hive/contracts": "workspace:*",
+        "@hive/executor": "workspace:*",
       },
     },
     "apps/executor": {
@@ -138,6 +150,8 @@
     "@esbuild/win32-x64": ["@esbuild/win32-x64@0.28.1", "", { "os": "win32", "cpu": "x64" }, "sha512-bm4Mowrv+GXMlpWX++EcXw/iLyd1o3+bJkC2DkWXYVvgZCqD/bSj9ctZeAMC3cIxgjRVR2Dufaiu4YPxr5gW1A=="],
 
     "@hive/api-worker": ["@hive/api-worker@workspace:apps/api-worker"],
+
+    "@hive/cli": ["@hive/cli@workspace:apps/cli"],
 
     "@hive/contracts": ["@hive/contracts@workspace:packages/contracts"],
 

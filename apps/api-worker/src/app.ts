@@ -18,7 +18,13 @@ import {
 import { pump } from "./pump.ts";
 import { getJob, getOperation, listInbox } from "./queries.ts";
 
-export type Bindings = { DB: D1Database; ACCESS_TEAM_DOMAIN: string; ACCESS_AUD: string };
+export type Bindings = {
+  DB: D1Database;
+  ACCESS_TEAM_DOMAIN: string;
+  ACCESS_AUD: string;
+  /** Local dev only: a JSON Web Key Set used instead of the Access certs (`.dev.vars`). */
+  ACCESS_DEV_JWKS?: string;
+};
 export type AppEnv = {
   Bindings: Bindings;
   Variables: { requestId: string; operationId?: string; principal: Principal };

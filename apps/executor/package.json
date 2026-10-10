@@ -6,7 +6,8 @@
   "exports": {
     "./cloudClient": "./src/cloudClient.ts",
     "./runner": "./src/runner.ts",
-    "./adapters/fake": "./src/adapters/fake.ts"
+    "./adapters/fake": "./src/adapters/fake.ts",
+    "./journal": "./src/journal.ts"
   },
   "scripts": {
     "start": "bun run src/main.ts"

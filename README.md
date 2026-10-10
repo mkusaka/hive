@@ -56,8 +56,38 @@ bun run test           # vitest across all workspace packages
 
 Layout: Bun workspaces under `apps/*` and `packages/*`. Today `packages/contracts` holds the shared Valibot schemas
 `packages/db` holds the D1 schema, migrations and atomic repository, `apps/api-worker` is the Access-protected
-API Worker and `apps/executor` is the Local Executor (fake provider only). See
+API Worker, `apps/executor` is the Local Executor (fake provider only) and `apps/cli` is the `hive` CLI. See
 [docs/architecture.md](docs/architecture.md#25-monorepo-layout-and-dependency-direction-28) for the target layout.
+
+## Try it locally
+
+The Phase 1 loop, CLI → Cloud → PC → Cloud result, against a local Worker and D1. No Cloudflare account is
+needed: `scripts/dev-token.ts` stands in for Access (see `apps/api-worker/README.md`).
+
+```sh
+# Terminal 1: the API Worker
+cd apps/api-worker
+bun scripts/dev-token.ts --dev-vars > .dev.vars
+bunx wrangler d1 migrations apply hive --local
+bunx wrangler dev --local
+
+# Terminal 2: the CLI, from the repo root
+alias hive='bun apps/cli/src/main.ts'
+export HIVE_ACCESS_JWT=$(bun apps/api-worker/scripts/dev-token.ts)
+hive workspace create --id ws-dev --name home --api-url http://localhost:8787
+hive device register --name pc1 --os darwin --agent-version 0.0.0
+hive channel create --name dev                 # note channelId
+hive bot create --name coder                   # note botId
+hive agent send <botId> --channel <channelId> --message 'check PR #123'
+hive executor run --once                       # pumps the outbox, claims the Job, runs the fake provider
+hive job watch <jobId>                         # jobId from the executor output; exits 0 on succeeded
+```
+
+`agent send ... --wait` instead blocks until the Job finishes; it needs an executor polling meanwhile (for
+example `hive executor run` without `--once` in a third terminal).
+
+Credentials (`apiUrl`, `workspaceId`, `deviceToken`) are stored in `~/.config/hive/credentials.json`; see
+[apps/cli/README.md](apps/cli/README.md).
 
 ## License
 

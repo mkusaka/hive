@@ -152,3 +152,4 @@ vite.config.ts.timestamp-*
 .wrangler
 .dev.vars*
 worktrees
+.dev-keys.json

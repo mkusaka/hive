@@ -1,5 +1,5 @@
 // User auth: Cloudflare Access assertion (docs/architecture.md §18.1).
-import { createRemoteJWKSet, type JWTVerifyGetKey, jwtVerify } from "jose";
+import { createLocalJWKSet, createRemoteJWKSet, type JWTVerifyGetKey, jwtVerify } from "jose";
 import type { Bindings } from "../app.ts";
 import { HttpError } from "../errors.ts";
 import type { Principal } from "./principal.ts";
@@ -8,7 +8,15 @@ const issuerOf = (env: Bindings) => `https://${env.ACCESS_TEAM_DOMAIN}`;
 
 // One remote set per isolate so jose's key cache survives across requests.
 let remote: { issuer: string; jwks: JWTVerifyGetKey } | undefined;
+let dev: { json: string; jwks: JWTVerifyGetKey } | undefined;
 export const remoteJwks = (env: Bindings): JWTVerifyGetKey => {
+  // Local dev only (`.dev.vars`, never wrangler.jsonc): trust the key set minted by scripts/dev-token.ts.
+  if (env.ACCESS_DEV_JWKS) {
+    if (dev?.json !== env.ACCESS_DEV_JWKS) {
+      dev = { json: env.ACCESS_DEV_JWKS, jwks: createLocalJWKSet(JSON.parse(env.ACCESS_DEV_JWKS)) };
+    }
+    return dev.jwks;
+  }
   const issuer = issuerOf(env);
   if (remote?.issuer !== issuer) {
     remote = { issuer, jwks: createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`)) };
