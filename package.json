@@ -7,7 +7,7 @@
   ],
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit -p packages/contracts && tsc --noEmit -p packages/db",
+    "typecheck": "tsc --noEmit -p packages/contracts && tsc --noEmit -p packages/db && tsc --noEmit -p apps/api-worker",
     "lint": "oxlint . --deny-warnings",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",

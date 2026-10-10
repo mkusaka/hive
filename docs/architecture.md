@@ -1309,7 +1309,8 @@ Domain Extension:
 
 ## 25. Monorepo layout and dependency direction (§28)
 
-Target layout. Only `packages/contracts` and `packages/db` exist today; later tickets add the rest.
+Target layout. Only `packages/contracts`, `packages/db` and `apps/api-worker` exist today; later tickets add the
+rest.
 
 ```text
 apps/

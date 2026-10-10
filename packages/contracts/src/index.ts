@@ -59,6 +59,32 @@ export type EventEnvelope<TData> = Omit<
   "data"
 > & { data: TData };
 
+// docs/architecture.md §22.1, §22.4. The server checks `workspaceId` against membership.
+export const commandEnvelope = <TCommand extends v.GenericSchema>(command: TCommand) =>
+  v.strictObject({
+    operationId: v.pipe(v.string(), v.minLength(1)),
+    idempotencyKey: IdempotencyKey,
+    workspaceId: WorkspaceId,
+    command,
+  });
+
+const Name = v.pipe(v.string(), v.minLength(1), v.maxLength(200));
+
+/** Dev bootstrap: creates the envelope's `workspaceId` with the caller as owner. */
+export const WorkspaceCreate = v.strictObject({ type: v.literal("workspace.create"), name: Name });
+
+export const DeviceRegister = v.strictObject({
+  type: v.literal("device.register"),
+  name: Name,
+  os: Name,
+  agentVersion: Name,
+});
+
+export const DeviceRevoke = v.strictObject({
+  type: v.literal("device.revoke"),
+  deviceId: DeviceId,
+});
+
 // docs/architecture.md §22.5
 export const apiErrorStatus = {
   UNAUTHENTICATED: 401,

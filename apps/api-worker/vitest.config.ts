@@ -1,0 +1,25 @@
+import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-workers";
+import { defineConfig } from "vitest/config";
+
+const migrations = new URL("../../packages/db/migrations", import.meta.url).pathname;
+
+export default defineConfig({
+  plugins: [
+    cloudflareTest(async () => ({
+      miniflare: {
+        d1Databases: ["DB"],
+        bindings: {
+          TEST_MIGRATIONS: await readD1Migrations(migrations),
+          ACCESS_TEAM_DOMAIN: "test.cloudflareaccess.com",
+          ACCESS_AUD: "test-aud",
+        },
+        compatibilityDate: "2026-08-15",
+      },
+    })),
+  ],
+  test: {
+    name: "api-worker",
+    include: ["test/**/*.test.ts"],
+    setupFiles: ["./test/setup.ts"],
+  },
+});
