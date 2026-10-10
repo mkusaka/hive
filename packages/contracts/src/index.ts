@@ -120,16 +120,17 @@ export const AgentSend = v.strictObject({
   delivery: v.picklist(["wake", "notify"]),
 });
 
-// UTF-8 size of the JSON text. No TextEncoder: contracts stay runtime-neutral (`types: []`).
-// JSON.stringify escapes lone surrogates, so every code point here is well-formed.
-const jsonBytes = (value: unknown) => {
+// UTF-8 size. No TextEncoder: contracts stay runtime-neutral (`types: []`). A lone surrogate counts 3,
+// as TextEncoder would encode it (U+FFFD).
+const utf8Bytes = (text: string) => {
   let bytes = 0;
-  for (const ch of JSON.stringify(value) ?? "") {
+  for (const ch of text) {
     const c = ch.codePointAt(0)!;
     bytes += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
   }
   return bytes;
 };
+const jsonBytes = (value: unknown) => utf8Bytes(JSON.stringify(value) ?? "");
 
 /** Namespaced event type. Which namespaces an actor may publish is checked by the server (§5.1). */
 export const EventType = v.pipe(v.string(), v.regex(/^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$/));
@@ -168,6 +169,74 @@ export type EventEmitAccepted = {
   receivedAt: string;
 };
 
+// ------------------------------------------------- Executor (§9.2, §10.3)
+// Device principal only, same envelope as user commands (`commandEnvelope`).
+
+/** Defaults to `["bot:<botId>"]` on the server: one root Run per Bot at a time. */
+export const JobClaim = v.strictObject({
+  type: v.literal("job.claim"),
+  jobId: JobId,
+  expectedRevision: v.pipe(v.number(), v.integer(), v.minValue(1)),
+  resourceKeys: v.optional(v.array(Name)),
+});
+
+const Generation = v.pipe(v.number(), v.integer(), v.minValue(1));
+
+export const RunLeaseRenew = v.strictObject({
+  type: v.literal("run.lease.renew"),
+  runId: RunId,
+  executionGeneration: Generation,
+});
+
+export const RunResultSubmit = v.strictObject({
+  type: v.literal("run.result.submit"),
+  runId: RunId,
+  executionGeneration: Generation,
+  state: v.picklist(["succeeded", "failed"]),
+  summary: v.pipe(
+    v.string(),
+    v.check((s) => utf8Bytes(s) <= 8 * 1024, "summary must be at most 8 KiB"),
+  ),
+  error: v.optional(v.pipe(v.string(), v.maxLength(8 * 1024))),
+});
+
+export const ExecutorCommand = v.variant("type", [JobClaim, RunLeaseRenew, RunResultSubmit]);
+export type ExecutorCommand = v.InferInput<typeof ExecutorCommand>;
+
+export type JobClaimed = {
+  runId: string;
+  executionId: string;
+  executionGeneration: number;
+  leaseExpiresAt: string;
+  job: { id: string; botId: string; inboxItemId: string | null; placement: PlacementPolicy };
+};
+export type ClaimFailureReason =
+  | "stale_revision"
+  | "resource_busy"
+  | "already_claimed"
+  | "not_eligible";
+export type LeaseRenewed = { leaseExpiresAt: string };
+export type RunResultAccepted = { ok: true };
+
+/** `GET /v1/executor/jobs?state=queued` item. */
+export type QueuedJob = {
+  id: string;
+  botId: string;
+  revision: number;
+  inboxItemId: string | null;
+  placement: PlacementPolicy;
+  createdAt: string;
+};
+
+/** `GET /v1/executor/runs/:id`: the device's own Run, for reconcile after a restart. */
+export type ExecutorRun = {
+  id: string;
+  jobId: string;
+  state: string;
+  executionGeneration: number;
+  active: boolean;
+};
+
 // docs/architecture.md §22.5
 export const apiErrorStatus = {
   UNAUTHENTICATED: 401,
@@ -190,6 +259,8 @@ export const ApiError = v.strictObject({
   requestId: v.string(),
   operationId: v.nullable(v.string()),
   retryable: v.boolean(),
+  /** Safe machine-readable detail, e.g. a claim failure reason. */
+  reason: v.optional(v.string()),
 });
 export type ApiError = v.InferOutput<typeof ApiError>;
 

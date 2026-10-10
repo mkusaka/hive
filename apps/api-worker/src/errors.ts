@@ -8,6 +8,7 @@ export class HttpError extends Error {
     readonly code: ApiErrorCode,
     message: string,
     readonly retryable = false,
+    readonly reason?: string,
   ) {
     super(message);
   }
@@ -28,6 +29,7 @@ export const toErrorResponse = (error: Error, c: Context<AppEnv>) => {
     requestId,
     operationId: c.get("operationId") ?? null,
     retryable: error.retryable,
+    ...(error.reason ? { reason: error.reason } : {}),
   };
   return c.json(body, apiErrorStatus[error.code]);
 };

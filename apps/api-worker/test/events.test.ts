@@ -1,7 +1,7 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { routeEvent } from "../src/pump.ts";
-import { call, envelope, login, register, withWorkspace } from "./helpers.ts";
+import { envelope, type Json, login, setup, withWorkspace } from "./helpers.ts";
 
 const db = env.DB;
 const count = async (from: string, ...params: unknown[]) =>
@@ -9,39 +9,6 @@ const count = async (from: string, ...params: unknown[]) =>
     .prepare(`SELECT COUNT(*) AS n FROM ${from}`)
     .bind(...params)
     .first<{ n: number }>())!.n;
-
-type Json = Record<string, unknown>;
-
-// Workspace + device + channel + bot, all fresh per test.
-const setup = async () => {
-  const { user, workspaceId } = await withWorkspace();
-  const ok = async (command: unknown) => {
-    const res = await user.command(envelope(workspaceId, command));
-    expect(res.status).toBe(200);
-    return res.json<Json>();
-  };
-  const { deviceToken } = await ok(register);
-  const { channelId } = await ok({ type: "channel.create", name: "dev" });
-  const { botId } = await ok({ type: "bot.create", name: "coder" });
-  const pump = async () => {
-    const res = await call("/v1/executor/pump", { Authorization: `Bearer ${deviceToken}` }, {});
-    expect(res.status).toBe(200);
-    return res.json<{ processed: number; dead: number }>();
-  };
-  const send = (delivery = "wake", idempotencyKey?: string) =>
-    envelope(
-      workspaceId,
-      {
-        type: "agent.send",
-        recipientBotId: botId,
-        channelId,
-        message: { kind: "request", text: "check PR #123" },
-        delivery,
-      },
-      idempotencyKey,
-    );
-  return { user, workspaceId, channelId: channelId as string, botId: botId as string, pump, send };
-};
 
 const jobsFor = (inboxItemId: string) =>
   count("jobs WHERE trigger_key = ?", `inbox:${inboxItemId}`);

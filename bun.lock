@@ -25,7 +25,15 @@
       "devDependencies": {
         "@cloudflare/vitest-pool-workers": "^0.21.3",
         "@cloudflare/workers-types": "^5.20260814.1",
+        "@hive/executor": "workspace:*",
         "wrangler": "^4.123.0",
+      },
+    },
+    "apps/executor": {
+      "name": "@hive/executor",
+      "version": "0.0.0",
+      "dependencies": {
+        "@hive/contracts": "workspace:*",
       },
     },
     "packages/contracts": {
@@ -134,6 +142,8 @@
     "@hive/contracts": ["@hive/contracts@workspace:packages/contracts"],
 
     "@hive/db": ["@hive/db@workspace:packages/db"],
+
+    "@hive/executor": ["@hive/executor@workspace:apps/executor"],
 
     "@img/colour": ["@img/colour@1.1.0", "", {}, "sha512-Td76q7j57o/tLVdgS746cYARfSyxk8iEfRxewL9h4OMzYhbW4TAcppl0mT4eyqXddh6L/jwoM75mo7ixa/pCeQ=="],
 

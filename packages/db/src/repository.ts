@@ -231,12 +231,19 @@ export const renewLease = async (
 };
 
 /**
- * Run completion (§11.1): fenced terminal Run, Execution, released reservations, Job state, outbox and
- * receipt. A replay with the same operationId returns the stored `{ ok: true }`.
+ * Run completion (§11.1): fenced terminal Run with its result, Execution, released reservations, Job state,
+ * outbox, the caller's extra `statements` (e.g. the Inbox outcome) and receipt. A replay with the same
+ * operationId returns the stored `{ ok: true }`.
  */
 export const finishRun = async (
   db: D1Database,
-  input: Fence & { state: "succeeded" | "failed"; operationId: string },
+  input: Fence & {
+    state: "succeeded" | "failed";
+    operationId: string;
+    summary?: string;
+    error?: string;
+    statements?: D1PreparedStatement[];
+  },
 ): Promise<{ ok: true } | { ok: false; reason: "stale_generation" }> => {
   const run = await db
     .prepare("SELECT workspace_id, job_id FROM runs WHERE id = ?")
@@ -247,7 +254,13 @@ export const finishRun = async (
     workspaceId: run.workspace_id,
     actorId: input.deviceId,
     idempotencyKey: input.operationId,
-    requestDigest: await digest([input.runId, input.executionGeneration, input.state]),
+    requestDigest: await digest([
+      input.runId,
+      input.executionGeneration,
+      input.state,
+      input.summary ?? null,
+      input.error ?? null,
+    ]),
   };
   const now = iso();
   const [setGuard, clearGuard] = guard(db, input.operationId);
@@ -258,10 +271,18 @@ export const finishRun = async (
       statements: [
         db
           .prepare(
-            `UPDATE runs SET state = ?, lease_expires_at = NULL, updated_at = ?
+            `UPDATE runs SET state = ?, result_summary = ?, result_error = ?, lease_expires_at = NULL, updated_at = ?
             WHERE id = ? AND device_id = ? AND execution_generation = ? AND state IN ${activeRunStates}`,
           )
-          .bind(input.state, now, input.runId, input.deviceId, input.executionGeneration),
+          .bind(
+            input.state,
+            input.summary ?? null,
+            input.error ?? null,
+            now,
+            input.runId,
+            input.deviceId,
+            input.executionGeneration,
+          ),
         setGuard,
         db
           .prepare(
@@ -284,6 +305,7 @@ export const finishRun = async (
           topic: "run.finished",
           payload: { runId: input.runId, jobId: run.job_id, state: input.state },
         }),
+        ...(input.statements ?? []),
         clearGuard,
       ],
     }));

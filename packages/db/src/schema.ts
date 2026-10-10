@@ -433,6 +433,9 @@ export const runs = sqliteTable(
     state: text("state", { enum: runStates }).notNull().default("starting"),
     leaseExpiresAt: text("lease_expires_at"),
     continuedFromRunId: text("continued_from_run_id"),
+    // Submitted by the executor with the terminal state (run.result.submit).
+    resultSummary: text("result_summary"),
+    resultError: text("result_error"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },

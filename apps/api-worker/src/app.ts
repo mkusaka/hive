@@ -7,6 +7,14 @@ import { authenticateDevice } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
 import { CommandEnvelope, runCommand } from "./commands.ts";
 import { HttpError, toErrorResponse } from "./errors.ts";
+import {
+  type Device,
+  ExecutorEnvelope,
+  getExecutorRun,
+  heartbeat,
+  listQueuedJobs,
+  runExecutorCommand,
+} from "./executor.ts";
 import { pump } from "./pump.ts";
 import { getJob, getOperation, listInbox } from "./queries.ts";
 
@@ -19,6 +27,11 @@ export type AppEnv = {
 const user = (c: { get: (key: "principal") => Principal }) => {
   const principal = c.get("principal");
   if (principal.kind !== "user") throw new HttpError("FORBIDDEN", "user principal required");
+  return principal;
+};
+const device = (c: { get: (key: "principal") => Principal }): Device => {
+  const principal = c.get("principal");
+  if (principal.kind !== "device") throw new HttpError("FORBIDDEN", "device principal required");
   return principal;
 };
 
@@ -60,10 +73,30 @@ export const createApp = ({
     return c.json(response, status as ContentfulStatusCode);
   });
 
-  app.post("/v1/executor/pump", async (c) => {
-    const device = c.get("principal") as Extract<Principal, { kind: "device" }>;
-    return c.json(await pump(c.env.DB, { owner: `device:${device.deviceId}`, limit: 50 }));
+  app.post("/v1/executor/pump", async (c) =>
+    c.json(await pump(c.env.DB, { owner: `device:${device(c).deviceId}`, limit: 50 })),
+  );
+
+  app.post("/v1/executor/commands", async (c) => {
+    const parsed = parse(ExecutorEnvelope, await c.req.json().catch(() => null));
+    if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
+    c.set("operationId", parsed.value.operationId);
+    const { status, response } = await runExecutorCommand(c.env.DB, device(c), parsed.value);
+    return c.json(response, status as ContentfulStatusCode);
   });
+  app.post("/v1/executor/heartbeat", async (c) => c.json(await heartbeat(c.env.DB, device(c))));
+  app.get("/v1/executor/jobs", async (c) => {
+    if (c.req.query("state") !== "queued")
+      throw new HttpError("INVALID_INPUT", "state=queued is required");
+    const limit = Number(c.req.query("limit") ?? 50);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new HttpError("INVALID_INPUT", "limit must be an integer in 1..100");
+    }
+    return c.json(await listQueuedJobs(c.env.DB, device(c), limit));
+  });
+  app.get("/v1/executor/runs/:id", async (c) =>
+    c.json(await getExecutorRun(c.env.DB, device(c), c.req.param("id"))),
+  );
 
   app.get("/v1/operations/:id", async (c) => {
     const { userId, workspaceIds } = user(c);

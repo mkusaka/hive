@@ -8,6 +8,8 @@ D1 schema, migrations and the atomic repository for the Phase 1 slice
   history or rebuildable projection.
 - `src/repository.ts`: plain functions over a `D1Database`. Critical commands (`claimJob`, `finishRun`,
   `withOperationReceipt`) are prepared-statement batches; a 0-row CAS is made to fail through `atomic_guards`.
+  `finishRun` stores the Run's `summary` / `error` and runs the caller's extra `statements` (the Inbox outcome) in
+  the same batch.
 - Batchable statements for one-batch commands (§11.1): `insertMessage`, `insertEvent`, `insertInboxItem`,
   `createJob` (queued, placement snapshot from the Bot, UNIQUE trigger key) and `enqueueOutbox`.
 - Event route: `createDeliveryAndInbox` (consumer receipt, Delivery, linked inbox item, Job for `wake`) and
@@ -32,8 +34,6 @@ bun run db:check   # migrations are consistent and `db:generate` has nothing lef
 
 - `inbox_items.delivery_mode` has no SQL CHECK: adding one to an existing table makes drizzle-kit recreate the
   table. The command schema validates it.
-
-Deferred to EXEC-01:
 
 - `finishRun` updates the Job only while it is `active`; a `cancelled` or `recovery_required` Job is left as is while
   the Run goes terminal and its reservations are released.

@@ -68,3 +68,46 @@ export const withWorkspace = async () => {
 
 export const executorMe = (token: string) =>
   call("/v1/executor/me", { Authorization: `Bearer ${token}` });
+
+export type Json = Record<string, unknown>;
+
+// Workspace + device + channel + bot, all fresh per test.
+export const setup = async () => {
+  const { user, workspaceId } = await withWorkspace();
+  const ok = async (command: unknown) => {
+    const res = await user.command(envelope(workspaceId, command));
+    expect(res.status).toBe(200);
+    return res.json<Json>();
+  };
+  const { deviceId, deviceToken } = await ok(register);
+  const { channelId } = await ok({ type: "channel.create", name: "dev" });
+  const { botId } = await ok({ type: "bot.create", name: "coder" });
+  const pump = async () => {
+    const res = await call("/v1/executor/pump", { Authorization: `Bearer ${deviceToken}` }, {});
+    expect(res.status).toBe(200);
+    return res.json<{ processed: number; dead: number }>();
+  };
+  const send = (delivery = "wake", idempotencyKey?: string) =>
+    envelope(
+      workspaceId,
+      {
+        type: "agent.send",
+        recipientBotId: botId,
+        channelId,
+        message: { kind: "request", text: "check PR #123" },
+        delivery,
+      },
+      idempotencyKey,
+    );
+  return {
+    user,
+    workspaceId,
+    deviceId: deviceId as string,
+    deviceToken: deviceToken as string,
+    channelId: channelId as string,
+    botId: botId as string,
+    ok,
+    pump,
+    send,
+  };
+};

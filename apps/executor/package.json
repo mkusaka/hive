@@ -1,0 +1,17 @@
+{
+  "name": "@hive/executor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./cloudClient": "./src/cloudClient.ts",
+    "./runner": "./src/runner.ts",
+    "./adapters/fake": "./src/adapters/fake.ts"
+  },
+  "scripts": {
+    "start": "bun run src/main.ts"
+  },
+  "dependencies": {
+    "@hive/contracts": "workspace:*"
+  }
+}
