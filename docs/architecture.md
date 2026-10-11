@@ -743,6 +743,13 @@ the workspace lists; the row carries no content, and `GET /v1/sidebar` returns o
 - An expired cursor returns `410 CURSOR_EXPIRED` and the scope is re-bootstrapped. Membership/ACL changes bump the
   auth epoch and purge no-longer-permitted cache; newly permitted scopes bootstrap then.
 
+Implemented as (AUDIT-01): `GET /v1/status` exposes the sync head cursor and its age, outbox backlog and
+failures, search freshness, queued / waiting-device / recovery / unknown Jobs, unknown effects, online devices
+and overdue enabled Routines. The desktop polls every 30 seconds and on `sync.changed`; actionable tiles and
+the sidebar Status indicator turn amber. An old sync head in an idle Workspace is not itself client lag.
+Search `indexedThrough` is the latest indexed timestamp (the same marker as search results); `lagMs` is the
+age of the oldest outstanding indexing outbox row, zero when indexing has no backlog.
+
 ### 12.4 Authorization and connections (§15.4)
 
 - Being in a Workspace does not mean receiving signals for all private Channels. Each connection records its
@@ -1251,6 +1258,15 @@ path, usage / failure / artifact rollups and token attribution are not built.
 
 Common query params are `limit / cursor`. The UI never GETs a huge transcript in one request. Webhooks are on a
 separate host / Worker route.
+
+Implemented as (AUDIT-01): `GET /v1/audit?workspaceId=&cursor=&kinds=&actor=&since=` returns newest-first,
+cursor-paginated audit entries with time, actor, kind, target, a bounded summary and allowlisted metadata.
+Command metadata is appended to the existing `audit_log` in the receipt batch; approvals, effects and Run
+lifecycle entries are read from existing tables. No additional table or migration is required. Owners see
+the Workspace's full audit; members see only entries scoped to conversations they can currently read.
+Raw command arguments, message bodies, instructions, credentials and provider error text are not audit data.
+`GET /v1/status?workspaceId=` returns cheap operational counts and freshness markers over the caller's
+permitted scopes. CLI `hive audit list` and `hive status`, and desktop Audit / Status views, use these routes.
 
 ### 22.3 Main commands (§25.3)
 

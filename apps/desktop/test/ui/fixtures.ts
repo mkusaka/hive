@@ -220,4 +220,39 @@ export const routes = (): Routes => ({
       },
     ],
   }),
+  "/v1/audit": (q) => ({
+    entries: q.get("cursor")
+      ? [
+          {
+            id: "audit-2",
+            at: "2026-10-11T11:00:00.000Z",
+            actorId: "user-2",
+            actorLabel: "Rin",
+            kind: "run.finished",
+            target: { type: "run", id: "run-1", label: "Run 1" },
+            summary: "Run finished",
+          },
+        ]
+      : [
+          {
+            id: "audit-1",
+            at: "2026-10-12T11:00:00.000Z",
+            actorId: "user-1",
+            actorLabel: "Mina",
+            kind: "channel.join",
+            target: { type: "channel", id: "ch-2", label: "release" },
+            summary: "Joined release",
+          },
+        ],
+    cursor: q.get("cursor") ? null : "next",
+  }),
+  "/v1/status": {
+    sync: { head: "H0", ageMs: 0 },
+    outbox: { queued: 0, failing: 0, oldestAgeMs: 0 },
+    search: { indexedThrough: "2026-10-12T11:00:00.000Z", lagMs: 0 },
+    jobs: { queued: 0, waitingDevice: 0, recoveryRequired: 0, unknown: 0 },
+    effects: { unknown: 0 },
+    devices: { online: 1, total: 1 },
+    routines: { overdue: 0 },
+  },
 });

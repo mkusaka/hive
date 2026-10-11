@@ -34,18 +34,20 @@ import {
   getOperation,
   getRunApproval,
   getSidebar,
+  getStatus,
   getTask,
+  listAudit,
   listBotConversations,
   listBots,
   listApprovals,
   listChannels,
+  listChannelMembers,
   listDevices,
   listDms,
   listInbox,
   listJobs,
   listMessages,
   listProjects,
-  listChannelMembers,
   listRoutines,
   listSubscriptions,
   listThreads,
@@ -497,6 +499,28 @@ export const createApp = ({
       }),
     ),
   );
+  app.get("/v1/audit", async (c) =>
+    c.json(
+      await listAudit(c.env.DB, {
+        workspaceId: workspaceParam(c),
+        userId: user(c).userId,
+        cursor: c.req.query("cursor"),
+        kinds: c.req.query("kinds"),
+        actor: c.req.query("actor"),
+        since: c.req.query("since"),
+        limit: limitParam(c, 50, 200),
+      }),
+    ),
+  );
+  app.get("/v1/status", async (c) =>
+    c.json(
+      await getStatus(c.env.DB, {
+        workspaceId: workspaceParam(c),
+        userId: user(c).userId,
+      }),
+    ),
+  );
+
   app.get("/v1/routines", async (c) =>
     c.json(
       await listRoutines(

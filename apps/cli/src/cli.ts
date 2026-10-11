@@ -387,6 +387,23 @@ const specs: Record<string, Spec> = {
       );
     },
   },
+  "audit list": {
+    usage: "[--kind <kind,...>] [--since <ISO>] [--cursor <cursor>] [--actor <actor-id>]",
+    options: { kind: str, since: str, cursor: str, actor: str },
+    run: async (c) =>
+      c.print(
+        await cmd.listAudit(c.client(), c.workspace(), {
+          kind: c.values.kind as string | undefined,
+          since: c.values.since as string | undefined,
+          cursor: c.values.cursor as string | undefined,
+          actor: c.values.actor as string | undefined,
+        }),
+      ),
+  },
+  status: {
+    usage: "",
+    run: async (c) => c.print(await cmd.getStatus(c.client(), c.workspace())),
+  },
   search: {
     usage: "<query> [--kinds message,task,memory]",
     args: 1,

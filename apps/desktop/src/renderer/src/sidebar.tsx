@@ -12,6 +12,7 @@ export type View =
   | "threads"
   | "inbox"
   | "activity"
+  | "audit"
   | "approvals"
   | "search"
   | "memory"
@@ -23,6 +24,7 @@ const views = [
   ["threads", "Threads"],
   ["inbox", "Inbox"],
   ["activity", "Activity"],
+  ["audit", "Audit"],
   ["approvals", "Approvals"],
   ["search", "Search"],
   ["memory", "Memory"],
@@ -87,6 +89,7 @@ export const Sidebar = (props: {
   /** Opens (or creates) the Bot's DM: a Bot or DM row was clicked. */
   openDm: (botId: string) => void;
   approvals: number;
+  statusAmber: boolean;
   /** The signed-in user (`GET /v1/me`): the account avatar at the bottom. */
   account: { id: string; label: string } | null;
   /** The account menu's Sign out, after the confirm dialog (`hive logout`). */
@@ -305,12 +308,15 @@ export const Sidebar = (props: {
               aria-label={label}
               onClick={() => props.setView(v)}
             >
-              <Icon name={v} />
+              <Icon name={v === "activity" ? "play" : v} />
               {!collapsed && <span>{label}</span>}
               {v === "approvals" && props.approvals > 0 && (
                 <span className="count" aria-label={`${props.approvals} pending`}>
                   {props.approvals}
                 </span>
+              )}
+              {v === "status" && props.statusAmber && (
+                <span className="status-dot" aria-label="Action needed" />
               )}
             </button>
           ))}

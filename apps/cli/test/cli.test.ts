@@ -194,6 +194,60 @@ describe("argv → request", () => {
       ["GET", "/v1/sync/changes?workspaceId=ws-1&cursor=c-1"],
     ]);
   });
+  it("lists filtered audit entries, returns status values, and propagates audit errors", async () => {
+    const entry = {
+      id: "audit-1",
+      at: "2026-10-12T00:00:00.000Z",
+      actorId: "u-2",
+      actorLabel: "Ada",
+      kind: "run.finished",
+      target: { type: "run", id: "r-1", label: "build" },
+      summary: "Run finished",
+      details: { state: "succeeded" },
+    };
+    const status = {
+      sync: { head: "42", ageMs: 0 },
+      outbox: { queued: 1, failing: 0, oldestAgeMs: 10 },
+      search: { indexedThrough: "2026-10-12T00:00:00.000Z", lagMs: 0 },
+      jobs: { queued: 2, waitingDevice: 0, recoveryRequired: 0, unknown: 0 },
+      effects: { unknown: 0 },
+      devices: { online: 1, total: 1 },
+      routines: { overdue: 0 },
+    };
+    const h = harness((call) =>
+      Response.json(
+        call.path.startsWith("/v1/audit") ? { entries: [entry], cursor: "next" } : status,
+      ),
+    );
+    expect(
+      await h.hive(
+        "audit",
+        "list",
+        "--kind",
+        "run.finished,approval.resolved",
+        "--since",
+        "2026-10-11T00:00:00.000Z",
+        "--cursor",
+        "c-1",
+        "--actor",
+        "u-2",
+        "--format",
+        "json",
+      ),
+    ).toBe(0);
+    expect(h.calls[0]).toMatchObject({
+      method: "GET",
+      path: "/v1/audit?workspaceId=ws-1&kinds=run.finished%2Capproval.resolved&since=2026-10-11T00%3A00%3A00.000Z&cursor=c-1&actor=u-2",
+    });
+    expect(JSON.parse(h.out[0]!)).toEqual({ entries: [entry], cursor: "next" });
+    expect(await h.hive("status", "--format", "json")).toBe(0);
+    expect(h.calls[1]).toMatchObject({ method: "GET", path: "/v1/status?workspaceId=ws-1" });
+    expect(JSON.parse(h.out[1]!)).toEqual(status);
+
+    const denied = harness(() => apiError(403, "FORBIDDEN"));
+    expect(await denied.hive("audit", "list")).toBe(3);
+    expect(denied.err).toEqual(["error: FORBIDDEN: FORBIDDEN"]);
+  });
 
   it("event emit reads --data-file - from stdin and parses --subject", async () => {
     const h = harness(undefined, { stdin: '{"command":"bun test","exitCode":1}\n' });
