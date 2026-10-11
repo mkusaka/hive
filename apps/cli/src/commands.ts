@@ -125,6 +125,20 @@ export const eventEmit = (
 const path = (prefix: string, id: string) => `${prefix}/${encodeURIComponent(id)}`;
 export const getOperation = (c: Client, id: string) => c.get(path("/v1/operations", id));
 export const getJob = (c: Client, id: string) => c.get(path("/v1/jobs", id));
+export const getRun = (c: Client, id: string) => c.get(path("/v1/runs", id));
+/** Every confirmed part of the normalized transcript, one page (part) per request. */
+export const runTranscript = async (c: Client, id: string) => {
+  const entries: Json[] = [];
+  let cursor: string | null = "0";
+  while (cursor !== null) {
+    const page = await c.get(`${path("/v1/runs", id)}/transcript?cursor=${cursor}`);
+    entries.push(...(page.entries as Json[]));
+    cursor = page.nextCursor as string | null;
+  }
+  return entries;
+};
+export const rawTranscript = (c: Client, id: string) =>
+  c.getText(`${path("/v1/transcripts", id)}/raw`);
 export const listInbox = (c: Client, botId: string) =>
   c.get(`/v1/inbox?botId=${encodeURIComponent(botId)}`);
 

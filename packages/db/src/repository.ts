@@ -317,13 +317,15 @@ export const finishRun = async (
       statements: [
         db
           .prepare(
-            `UPDATE runs SET state = ?, result_summary = ?, result_error = ?, lease_expires_at = NULL, updated_at = ?
+            `UPDATE runs SET state = ?, result_summary = ?, result_error = ?, lease_expires_at = NULL, updated_at = ?,
+                  finished_at = ?
             WHERE id = ? AND device_id = ? AND execution_generation = ? AND state IN ${activeRunStates}`,
           )
           .bind(
             input.state,
             input.summary ?? null,
             input.error ?? null,
+            now,
             now,
             input.runId,
             input.deviceId,
@@ -465,10 +467,10 @@ export const confirmRunStopped = async (
     await db.batch([
       db
         .prepare(
-          `UPDATE runs SET state = 'interrupted', lease_expires_at = NULL, updated_at = ?
+          `UPDATE runs SET state = 'interrupted', lease_expires_at = NULL, updated_at = ?, finished_at = ?
             WHERE id = ? AND workspace_id = ? AND device_id = ? AND execution_generation = ? AND state = 'unknown'`,
         )
-        .bind(now, ...fence),
+        .bind(now, now, ...fence),
       setGuard,
       clearGuard,
       db

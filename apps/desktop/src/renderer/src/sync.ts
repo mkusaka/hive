@@ -2,7 +2,16 @@
 /* oxlint-disable no-await-in-loop */
 import type { ApiResult } from "../../shared/api.ts";
 
-export type ListKey = "channels" | "messages" | "inbox" | "jobs" | "bots" | "devices" | "approvals";
+/** `run`: the Run open in the Run Inspector (state, persistence, transcript). */
+export type ListKey =
+  | "channels"
+  | "messages"
+  | "inbox"
+  | "jobs"
+  | "bots"
+  | "devices"
+  | "approvals"
+  | "run";
 export const allLists: ListKey[] = [
   "channels",
   "messages",
@@ -11,13 +20,14 @@ export const allLists: ListKey[] = [
   "bots",
   "devices",
   "approvals",
+  "run",
 ];
 
 type Change = { scope: string; entityKind: string };
 
 /**
  * `channel:*` → messages / inbox (and the channel list for a new channel); `workspace:*` → jobs / bots / devices /
- * approvals.
+ * approvals (and the inspected Run for a `run` row).
  */
 export const refetchFor = (changes: Change[]) => {
   const keys = new Set<ListKey>();
@@ -27,6 +37,7 @@ export const refetchFor = (changes: Change[]) => {
       if (entityKind === "channel") keys.add("channels");
     } else if (scope.startsWith("workspace:")) {
       keys.add("jobs").add("bots").add("devices").add("approvals");
+      if (entityKind === "run") keys.add("run");
     }
   }
   return keys;

@@ -25,16 +25,17 @@ bun run --cwd apps/desktop build   # out/{main,preload,renderer}
 
 ## Views
 
-| View      | Data                                                                                                                                                                                     |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Channel   | Channels, the selected channel's latest 50 messages oldest first, Bot picker, composer                                                                                                   |
-| Inbox     | `GET /v1/inbox?botId=` for the picked Bot, with state badges                                                                                                                             |
-| Activity  | `GET /v1/jobs?limit=50` with state badges (incl. `waiting_device`, `recovery_required`) and a Cancel button for queued / waiting / active Jobs; selecting a Job shows `GET /v1/jobs/:id` |
-| Approvals | Pending approvals (`GET /v1/approvals?state=pending`): action, argument summary, cwd label, Bot, expires-in; Allow / Deny send `approval.resolve`. The nav shows the pending count       |
-| Search    | Query box → `GET /v1/search`: kind badge, title, snippet and the index's `indexed through` time; a message hit opens its channel in the Channel view                                     |
-| Memory    | Scope picker (Workspace, member channels, Bots) → `GET /v1/memories`, newest first; the form sends `memory.write` to the picked scope                                                    |
-| Devices   | Name, OS, last heartbeat, revoked                                                                                                                                                        |
-| Status    | Workspace, WebSocket state (connected / reconnecting), last sync cursor (tail), unsynced hint count                                                                                      |
+| View          | Data                                                                                                                                                                                                                                                                                                                                                                |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Channel       | Channels, the selected channel's latest 50 messages oldest first, Bot picker, composer                                                                                                                                                                                                                                                                              |
+| Inbox         | `GET /v1/inbox?botId=` for the picked Bot, with state badges                                                                                                                                                                                                                                                                                                        |
+| Activity      | `GET /v1/jobs?limit=50` with state badges (incl. `waiting_device`, `recovery_required`) and a Cancel button for queued / waiting / active Jobs; selecting a Job shows `GET /v1/jobs/:id` and its Runs; selecting a Run opens the Run Inspector                                                                                                                      |
+| Run Inspector | `GET /v1/runs/:id`: state and `persistence` badges, generation, device, started / finished, provider session present, transcript parts / watermark, result; then every page of `GET /v1/runs/:id/transcript` (kind, tool name, redacted text). Without access to the transcript (not in the Run's channel, bot-pair Run) it says so. Refetched on `run` change rows |
+| Approvals     | Pending approvals (`GET /v1/approvals?state=pending`): action, argument summary, cwd label, Bot, expires-in; Allow / Deny send `approval.resolve`. The nav shows the pending count                                                                                                                                                                                  |
+| Search        | Query box → `GET /v1/search`: kind badge, title, snippet and the index's `indexed through` time; a message hit opens its channel in the Channel view                                                                                                                                                                                                                |
+| Memory        | Scope picker (Workspace, member channels, Bots) → `GET /v1/memories`, newest first; the form sends `memory.write` to the picked scope                                                                                                                                                                                                                               |
+| Devices       | Name, OS, last heartbeat, revoked                                                                                                                                                                                                                                                                                                                                   |
+| Status        | Workspace, WebSocket state (connected / reconnecting), last sync cursor (tail), unsynced hint count                                                                                                                                                                                                                                                                 |
 
 The composer sends `agent.send` (`delivery: "wake"`) with a fresh operation id and idempotency key, shows the
 accepted operation, then polls `GET /v1/operations/:id` every 2 s (up to 10 min) until routing created the Job.
@@ -47,7 +48,7 @@ Accepted is not started: the Job id appears only after the outbox pump ran (`hiv
 1. **Bootstrap.** `GET /v1/sync/changes` without a cursor gives the head cursor; then every list is loaded.
 2. **Pull.** `GET /v1/sync/changes?cursor=` while `hasMore`; the scopes of the returned rows choose what to
    refetch: `channel:*` → messages and inbox (plus the channel list for a `channel` row), `workspace:*` → jobs,
-   bots, devices and approvals. Pulls are serialized; a hint during a pull runs one more.
+   bots, devices and approvals, plus the inspected Run for a `run` row (e.g. persistence turning `complete`). Pulls are serialized; a hint during a pull runs one more.
 3. **410 `CURSOR_EXPIRED`** drops the cursor and bootstraps again.
 4. **Triggers.** A `sync.changed` hint, WebSocket (re)connect, window focus and a timer every 50-70 s. The hint's
    own cursor is not used: it only says "something changed".
@@ -89,7 +90,9 @@ rejection, ApiError mapping, Access header injection).
 
 ## Known gaps
 
-- No OAuth login (G-02), no Run inspector, no threads, no local outbox / `queued_local`.
+- No OAuth login (G-02), no threads, no local outbox / `queued_local`.
+- Run Inspector: loads every transcript page at once (no lazy paging); no raw transcript view, observation
+  history, input snapshot or Agent Tree.
 - G-04 (Access + WebSocket from a native client) is not executed: the socket was verified only against
   `wrangler dev` with a dev assertion. A channel created after the socket opened needs a reconnect for its hints
   (scopes are fixed at upgrade); the periodic pull still picks it up.

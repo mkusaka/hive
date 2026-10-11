@@ -10,6 +10,7 @@ export default defineConfig({
       main: "./src/index.ts",
       miniflare: {
         d1Databases: ["DB"],
+        r2Buckets: ["R2"],
         durableObjects: { REALTIME: { className: "Realtime", useSQLite: true } },
         bindings: {
           TEST_MIGRATIONS: await readD1Migrations(migrations),

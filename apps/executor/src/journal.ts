@@ -3,6 +3,16 @@ import { mkdir, open, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Journal, JournalEntry } from "./runner.ts";
 
+/** The Claude adapter's transcript, `<state-dir>/transcripts/<runId>.jsonl`; null when the Run wrote none. */
+export const transcriptReader = (stateDir: string) => async (runId: string) =>
+  readFile(join(stateDir, "transcripts", `${runId}.jsonl`)).then(
+    (buffer) => new Uint8Array(buffer),
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    },
+  );
+
 export const fileJournal = async (stateDir: string): Promise<Journal> => {
   await mkdir(stateDir, { recursive: true });
   const path = join(stateDir, "journal.jsonl");

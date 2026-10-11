@@ -4,6 +4,7 @@
 /* oxlint-disable no-await-in-loop */
 import type { RunContext } from "@hive/contracts";
 import { CloudError, type CloudClient, type RunApi } from "./cloudClient.ts";
+import type { Uploader } from "./uploader.ts";
 
 export type JournalEntry =
   | {
@@ -14,7 +15,9 @@ export type JournalEntry =
       inboxItemId: string | null;
     }
   | { kind: "intent"; runId: string }
-  | { kind: "result"; runId: string; state: string };
+  | { kind: "result"; runId: string; state: string }
+  /** The cloud ACKed the transcript's `complete` (AT-21: written only after the ACK). */
+  | { kind: "uploaded"; runId: string; lastPartSeq: number };
 
 /** Local Journal (§20.2): append-only; an entry is durable once `append` resolves. */
 export type Journal = {
@@ -56,7 +59,13 @@ export type RunningAgent = {
 };
 export type AgentAdapter = { start(input: LaunchContext): Promise<RunningAgent> };
 
-export type RunnerDeps = { cloud: CloudClient; journal: Journal; adapter: AgentAdapter };
+/** `uploader`: sends each Run's transcript after its result (uploader.ts); none means transcripts stay local. */
+export type RunnerDeps = {
+  cloud: CloudClient;
+  journal: Journal;
+  adapter: AgentAdapter;
+  uploader?: Uploader;
+};
 
 const isStale = (error: unknown) =>
   error instanceof CloudError && error.code === "STALE_GENERATION";
@@ -150,6 +159,8 @@ const execute = async (
       ? "stopped"
       : "stale_generation";
   await journal.append({ kind: "result", runId: ctx.runId, state });
+  // Also after a stale generation: late parts are kept as the attempt's history (§10.3).
+  await deps.uploader?.upload(ctx.runId);
   return { runId: ctx.runId, jobId: ctx.jobId, state };
 };
 
@@ -157,7 +168,7 @@ const execute = async (
  * Startup reconcile (§20.2): every journaled claim without a result, or whose last result is an unconfirmed
  * `stale_generation`, is checked against the cloud. An active Run of the same generation without a result is resumed
  * (the fake adapter is idempotent). An `unknown` Run is confirmed stopped: nothing survives a restart, because the
- * adapter runs in-process. Anything else gets a result marker.
+ * adapter runs in-process. Anything else gets a result marker. Then pending transcript uploads are retried.
  */
 export const reconcile = async (deps: RunnerDeps) => {
   const entries = await deps.journal.readAll();
@@ -196,6 +207,8 @@ export const reconcile = async (deps: RunnerDeps) => {
     const state = run && !run.active ? run.state : run ? "stale_generation" : "missing";
     if (state !== result) await deps.journal.append({ kind: "result", runId: entry.runId, state });
   }
+  // Transcripts of finished Runs whose upload never got its ACK (crash, network, cloud error).
+  await deps.uploader?.pending();
   return resumed;
 };
 

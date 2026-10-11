@@ -1,4 +1,11 @@
-import { parse, RunObservation, type RunPrincipal } from "@hive/contracts";
+import {
+  maxTranscriptPartBytes,
+  parse,
+  RunObservation,
+  type RunPrincipal,
+  UploadComplete,
+  UploadInit,
+} from "@hive/contracts";
 import { type Context, Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { JWTVerifyGetKey } from "jose";
@@ -46,9 +53,18 @@ import {
 } from "./realtime.ts";
 import { listMemories, rebuildSearch, search, searchAccess } from "./search.ts";
 import { listChanges, permittedScopes } from "./sync.ts";
+import {
+  completeUpload,
+  getRun,
+  getTranscript,
+  initUpload,
+  putPart,
+  rawTranscript,
+} from "./transcripts.ts";
 
 export type Bindings = {
   DB: D1Database;
+  R2: R2Bucket;
   REALTIME: DurableObjectNamespace<Realtime>;
   ACCESS_TEAM_DOMAIN: string;
   ACCESS_AUD: string;
@@ -73,6 +89,18 @@ const device = (c: { get: (key: "principal") => Principal }): Device => {
 const runPrincipal = (c: { get: (key: "principal") => Principal }) => {
   const principal = c.get("principal");
   if (principal.kind !== "run") throw new HttpError("FORBIDDEN", "run capability required");
+  return principal;
+};
+
+const tooLarge = () =>
+  new HttpError("INVALID_INPUT", `a part is at most ${maxTranscriptPartBytes} bytes`);
+
+/** Transcript uploads take the Run capability or, after it was revoked at result submit, the device token. */
+const uploader = (c: { get: (key: "principal") => Principal }) => {
+  const principal = c.get("principal");
+  if (principal.kind !== "device" && principal.kind !== "run") {
+    throw new HttpError("FORBIDDEN", "device or run principal required");
+  }
   return principal;
 };
 
@@ -113,15 +141,19 @@ export const createApp = ({
 
   app.get("/healthz", (c) => c.json({ ok: true }));
 
-  // Executor routes take device tokens and `/v1/run/` routes a Run capability; every other /v1 route takes a user's
+  // Executor routes take device tokens (uploads also a Run capability) and `/v1/run/` routes a Run capability; every other /v1 route takes a user's
   // Access assertion, except `/v1/realtime`, which takes a device token when a Bearer token is presented.
   app.use("/v1/*", async (c, next) => {
     const deviceAuth =
       c.req.path.startsWith("/v1/executor/") ||
       (c.req.path === "/v1/realtime" && c.req.header("Authorization")?.startsWith("Bearer "));
+    const capability =
+      c.req.path.startsWith("/v1/run/") ||
+      (c.req.path.startsWith("/v1/executor/uploads/") &&
+        c.req.header("Authorization")?.startsWith("Bearer cap."));
     c.set(
       "principal",
-      c.req.path.startsWith("/v1/run/")
+      capability
         ? await authenticateRun(c.req.raw, c.env)
         : deviceAuth
           ? await authenticateDevice(c.req.raw, c.env)
@@ -196,6 +228,27 @@ export const createApp = ({
     if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
     const { status, body } = await recordObservation(c.env.DB, device(c), parsed.value);
     return c.json(body, status);
+  });
+
+  // Transcript upload (§3.3): init → PUT raw part → complete.
+  app.post("/v1/executor/uploads/init", async (c) => {
+    const parsed = parse(UploadInit, await c.req.json().catch(() => null));
+    if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
+    return c.json(await initUpload(c.env.DB, uploader(c), parsed.value));
+  });
+  app.post("/v1/executor/uploads/complete", async (c) => {
+    const parsed = parse(UploadComplete, await c.req.json().catch(() => null));
+    if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
+    const { workspaceId, body } = await completeUpload(c.env.DB, uploader(c), parsed.value);
+    hint(c, { workspaceId, scopes: [`workspace:${workspaceId}`] });
+    return c.json(body);
+  });
+  app.put("/v1/executor/uploads/:uploadId", async (c) => {
+    const principal = uploader(c);
+    if (Number(c.req.header("Content-Length") ?? 0) > maxTranscriptPartBytes) throw tooLarge();
+    const body = await c.req.arrayBuffer();
+    if (body.byteLength > maxTranscriptPartBytes) throw tooLarge();
+    return c.json(await putPart(c.env.DB, c.env.R2, principal, c.req.param("uploadId"), body));
   });
 
   // In-run hive tools (§18.2): the capability's Run acts as its Bot.
@@ -290,6 +343,17 @@ export const createApp = ({
   });
   app.get("/v1/jobs/:id", async (c) =>
     c.json(await getJob(c.env.DB, user(c).workspaceIds, c.req.param("id"))),
+  );
+  app.get("/v1/runs/:id", async (c) => c.json(await getRun(c.env.DB, user(c), c.req.param("id"))));
+  app.get("/v1/runs/:id/transcript", async (c) =>
+    c.json(
+      await getTranscript(c.env.DB, c.env.R2, user(c), c.req.param("id"), c.req.query("cursor")),
+    ),
+  );
+  app.get("/v1/transcripts/:runId/raw", async (c) =>
+    c.body(await rawTranscript(c.env.DB, c.env.R2, user(c), c.req.param("runId")), 200, {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+    }),
   );
   app.get("/v1/inbox", async (c) => {
     const botId = c.req.query("botId");

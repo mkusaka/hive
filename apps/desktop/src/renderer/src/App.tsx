@@ -1,5 +1,5 @@
-// Phase 2 UI slice: Channel / Inbox / Activity / Approvals / Search / Memory / Devices views and a status bar
-// (docs/architecture.md §21).
+// Phase 2 UI slice: Channel / Inbox / Activity (with the Run Inspector) / Approvals / Search / Memory / Devices views
+// and a status bar (docs/architecture.md §21).
 /* oxlint-disable no-await-in-loop */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HiveConfig } from "../../shared/api.ts";
@@ -38,6 +38,8 @@ export const App = () => {
   const [channelId, setChannelId] = useState("");
   const [botId, setBotId] = useState("");
   const [jobDetail, setJobDetail] = useState<Record<string, unknown> | null>(null);
+  const [runId, setRunId] = useState("");
+  const [run, setRun] = useState<Inspected | null>(null);
 
   /** job.cancel (§9.3): an active Job keeps running until its executor stops it; sync shows the outcome. */
   const cancelJob = async (workspaceId: string, jobId: string) => {
@@ -67,12 +69,13 @@ export const App = () => {
   };
 
   // Refetches run from sync callbacks, so they read the current selection through refs.
-  const selection = useRef({ channelId, botId });
-  selection.current = { channelId, botId };
+  const selection = useRef({ channelId, botId, runId });
+  selection.current = { channelId, botId, runId };
 
   const refetch = useCallback(async (keys: Set<ListKey>, ws: string) => {
-    const { channelId: ch, botId: bot } = selection.current;
+    const { channelId: ch, botId: bot, runId: inspected } = selection.current;
     const tasks: Promise<void>[] = [];
+    if (keys.has("run") && inspected) tasks.push(inspect(inspected).then(setRun));
     const load = (key: ListKey, path: string | null, field: string, set: (rows: Row[]) => void) => {
       if (keys.has(key) && path) tasks.push(get(path).then((body) => set(body[field] as Row[])));
     };
@@ -151,6 +154,10 @@ export const App = () => {
   useEffect(() => {
     if (config && !config.problem && botId) void refetch(new Set(["inbox"]), config.workspaceId);
   }, [config, botId, refetch]);
+  useEffect(() => {
+    setRun(null);
+    if (config && !config.problem && runId) void refetch(new Set(["run"]), config.workspaceId);
+  }, [config, runId, refetch]);
   useEffect(() => {
     if (!channelId && channels[0]) setChannelId(channels[0].id);
     if (!botId && bots[0]) setBotId(bots[0].id);
@@ -253,7 +260,25 @@ export const App = () => {
                 ))}
               </ul>
             </div>
-            <pre>{jobDetail ? JSON.stringify(jobDetail, null, 2) : "Select a Job"}</pre>
+            <div>
+              <pre>{jobDetail ? JSON.stringify(jobDetail, null, 2) : "Select a Job"}</pre>
+              {Array.isArray(jobDetail?.runs) && (
+                <ul className="list">
+                  {(jobDetail.runs as Row[]).map((r) => (
+                    <li key={r.id}>
+                      <button
+                        className={r.id === runId ? "active" : ""}
+                        onClick={() => setRunId(r.id)}
+                      >
+                        Run {text(r.generation)} <Badge state={r.state} />{" "}
+                        <span className="mono">{r.id}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {run && <RunInspector run={run} />}
+            </div>
           </section>
         )}
         {view === "approvals" && (
@@ -308,6 +333,65 @@ export const App = () => {
         {sync.error && <span className="error">{sync.error}</span>}
       </footer>
     </div>
+  );
+};
+
+type Inspected = {
+  detail: Record<string, unknown>;
+  /** Null when the transcript is not readable (not a member of the Run's channel, or a bot-pair Run). */
+  entries: { seq: number; kind: string; text: string; toolName?: string }[] | null;
+  error: string | null;
+};
+
+/** `GET /v1/runs/:id` and every confirmed page of its normalized transcript (a page is one ≤ 1 MiB part). */
+const inspect = async (id: string): Promise<Inspected> => {
+  const run = `/v1/runs/${encodeURIComponent(id)}`;
+  const detail = await get(run);
+  const entries: NonNullable<Inspected["entries"]> = [];
+  try {
+    for (let cursor: unknown = "0"; typeof cursor === "string";) {
+      const page = await get(`${run}/transcript?${new URLSearchParams({ cursor })}`);
+      entries.push(...(page.entries as typeof entries));
+      cursor = page.nextCursor;
+    }
+    return { detail, entries, error: null };
+  } catch (error) {
+    return { detail, entries: null, error: String(error) };
+  }
+};
+
+/** Run Inspector (§21): state, transcript persistence, provider session presence and the normalized transcript. */
+const RunInspector = ({ run }: { run: Inspected }) => {
+  const d = run.detail;
+  const transcript = d.transcript as { parts: number; confirmedThroughSeq: number | null };
+  return (
+    <section className="inspector">
+      <h3>
+        Run <span className="mono">{text(d.id)}</span> <Badge state={d.state} />{" "}
+        <Badge state={d.persistence} />
+      </h3>
+      <p>
+        generation {text(d.generation)} · device <span className="mono">{text(d.deviceId)}</span> ·
+        started {text(d.startedAt)} · finished {text(d.finishedAt)} · provider session{" "}
+        {d.hasProviderSession ? "yes" : "no"} · parts {transcript.parts} (confirmed through{" "}
+        {text(transcript.confirmedThroughSeq)})
+      </p>
+      {d.resultError ? <p className="error">{text(d.resultError)}</p> : null}
+      {d.resultSummary ? <p>{text(d.resultSummary)}</p> : null}
+      {run.entries === null ? (
+        <p className="error">Transcript unavailable: {run.error}</p>
+      ) : (
+        <ol className="transcript">
+          {run.entries.map((e, i) => (
+            <li key={i}>
+              <span className={`badge ${e.kind}`}>{e.kind}</span>
+              {e.toolName ? <span className="mono"> {e.toolName}</span> : null}
+              <pre>{e.text}</pre>
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
   );
 };
 

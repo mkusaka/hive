@@ -361,6 +361,28 @@ const specs: Record<string, Spec> = {
     args: 1,
     run: async (c) => c.print(await cmd.getJob(c.client(), c.args[0]!)),
   },
+  "run get": {
+    usage: "<run-id>",
+    args: 1,
+    run: async (c) => c.print(await cmd.getRun(c.client(), c.args[0]!)),
+  },
+  "run transcript": {
+    usage: "<run-id> [--raw]",
+    args: 1,
+    options: { raw: flag },
+    run: async (c) => {
+      // Raw: the provider's JSONL as stored (workspace owner only).
+      if (c.values.raw)
+        return void c.deps.stdout(
+          (await cmd.rawTranscript(c.client(), c.args[0]!)).replace(/\n$/, ""),
+        );
+      const entries = await cmd.runTranscript(c.client(), c.args[0]!);
+      if (c.values.format === "json") return c.print({ entries });
+      for (const e of entries) {
+        c.deps.stdout(`${e.seq} ${e.kind}${e.toolName ? `(${e.toolName})` : ""}: ${e.text}`);
+      }
+    },
+  },
   "job watch": {
     usage: "<job-id> [--timeout <s>]",
     args: 1,

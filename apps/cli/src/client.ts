@@ -35,7 +35,7 @@ export const invalid = (message: string) => new CliError("INVALID_ARGS", 2, mess
 export type Client = ReturnType<typeof createClient>;
 
 export const createClient = (opts: { apiUrl: string; accessJwt?: string; fetch: Fetch }) => {
-  const request = async (method: "GET" | "POST", path: string, body?: unknown) => {
+  const send = async (method: "GET" | "POST", path: string, body?: unknown) => {
     if (!opts.accessJwt) {
       throw new CliError(
         "UNAUTHENTICATED",
@@ -52,8 +52,8 @@ export const createClient = (opts: { apiUrl: string; accessJwt?: string; fetch: 
       .catch((error: unknown) => {
         throw new CliError("NETWORK", 7, `request failed: ${String(error)}`);
       });
-    const json: unknown = await res.json().catch(() => null);
     if (!res.ok) {
+      const json: unknown = await res.json().catch(() => null);
       const error = (json ?? {}) as Partial<ApiError>;
       throw new CliError(
         error.code ?? "HTTP",
@@ -62,10 +62,15 @@ export const createClient = (opts: { apiUrl: string; accessJwt?: string; fetch: 
         json,
       );
     }
-    return json as Record<string, unknown>;
+    return res;
   };
+  const request = async (method: "GET" | "POST", path: string, body?: unknown) =>
+    (await (await send(method, path, body)).json().catch(() => null)) as Record<string, unknown>;
   return {
     get: (path: string) => request("GET", path),
+    /** A non-JSON body as text (the raw transcript). */
+    getText: async (path: string) =>
+      new TextDecoder().decode(await (await send("GET", path)).arrayBuffer()),
     command: (
       envelope: { operationId: string; idempotencyKey: string; workspaceId: string },
       command: { type: string } & Record<string, unknown>,

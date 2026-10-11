@@ -7,8 +7,9 @@ import { text } from "node:stream/consumers";
 import { claudeAdapter } from "@hive/executor/adapters/claude";
 import { saveEnvironment } from "@hive/executor/environments";
 import { fakeAdapter } from "@hive/executor/adapters/fake";
-import { fileJournal } from "@hive/executor/journal";
+import { fileJournal, transcriptReader } from "@hive/executor/journal";
 import { runLoop } from "@hive/executor/runner";
+import { transcriptUploader } from "@hive/executor/uploader";
 import { type Credentials, run } from "./cli.ts";
 
 const dir = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "hive");
@@ -58,11 +59,18 @@ process.exitCode = await run(process.argv.slice(2), {
   },
   stdout: (line) => console.log(line),
   stderr: (line) => console.error(line),
-  runExecutor: async (cloud, once, provider) =>
-    runLoop(
+  runExecutor: async (cloud, once, provider) => {
+    const journal = await fileJournal(executorDir);
+    return runLoop(
       {
         cloud,
-        journal: await fileJournal(executorDir),
+        journal,
+        uploader: transcriptUploader({
+          cloud,
+          journal,
+          read: transcriptReader(executorDir),
+          provider,
+        }),
         adapter:
           provider === "claude"
             ? claudeAdapter({ stateDir: executorDir })
@@ -73,5 +81,6 @@ process.exitCode = await run(process.argv.slice(2), {
       },
       // docs/roadmap.md §1: executor Job reconcile every 30 s (no WebSocket yet).
       { once, pollMs: 30_000 },
-    ),
+    );
+  },
 });

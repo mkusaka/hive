@@ -745,6 +745,40 @@ export type ExecutorRun = {
   active: boolean;
 };
 
+// ------------------------------------------------ Transcript upload (§3.3, §13.2)
+
+/** Largest part the cloud accepts; the executor splits at 1 MiB on line boundaries. */
+export const maxTranscriptPartBytes = 8 * 1024 * 1024;
+
+const Sha256Hex = v.pipe(v.string(), v.regex(/^[0-9a-f]{64}$/));
+
+export const UploadInit = v.strictObject({
+  runId: RunId,
+  partSeq: v.pipe(v.number(), v.integer(), v.minValue(0)),
+  byteSize: v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(maxTranscriptPartBytes)),
+  sha256: Sha256Hex,
+  provider: v.optional(Name),
+});
+export type UploadInit = v.InferInput<typeof UploadInit>;
+/** `committed`: the part is already in the manifest with this hash, so the PUT can be skipped. */
+export type UploadInitialized = { uploadId: string; partId: string; committed: boolean };
+
+/** `lastPartSeq` -1: the Run produced an empty transcript. */
+export const UploadComplete = v.strictObject({
+  runId: RunId,
+  lastPartSeq: v.pipe(v.number(), v.integer(), v.minValue(-1)),
+});
+export type UploadComplete = v.InferInput<typeof UploadComplete>;
+
+/** One normalized transcript entry (§13.2): derived from the raw parts at read time, redacted, ≤ 4 KiB text. */
+export type TranscriptEntry = {
+  /** Line number in the raw stream; the blocks of one message share it. */
+  seq: number;
+  kind: "system" | "assistant" | "tool_use" | "tool_result" | "result" | "user";
+  text: string;
+  toolName?: string;
+};
+
 // docs/architecture.md §22.5
 export const apiErrorStatus = {
   UNAUTHENTICATED: 401,

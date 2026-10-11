@@ -5,8 +5,9 @@ import { parseArgs } from "node:util";
 import { claudeAdapter } from "./adapters/claude.ts";
 import { fakeAdapter } from "./adapters/fake.ts";
 import { createCloudClient } from "./cloudClient.ts";
-import { fileJournal } from "./journal.ts";
+import { fileJournal, transcriptReader } from "./journal.ts";
 import { runLoop } from "./runner.ts";
+import { transcriptUploader } from "./uploader.ts";
 
 const { values } = parseArgs({
   options: {
@@ -31,10 +32,18 @@ if (values.provider !== "fake" && values.provider !== "claude") {
   process.exit(2);
 }
 
+const cloud = createCloudClient({ apiUrl, token: (await readFile(tokenFile, "utf8")).trim() });
+const journal = await fileJournal(stateDir);
 const result = await runLoop(
   {
-    cloud: createCloudClient({ apiUrl, token: (await readFile(tokenFile, "utf8")).trim() }),
-    journal: await fileJournal(stateDir),
+    cloud,
+    journal,
+    uploader: transcriptUploader({
+      cloud,
+      journal,
+      read: transcriptReader(stateDir),
+      provider: values.provider,
+    }),
     adapter:
       values.provider === "claude"
         ? claudeAdapter({ stateDir })

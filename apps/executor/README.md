@@ -19,7 +19,9 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK) and `fake
   with error `cancelled`; the cloud finishes the Job `cancelled`. Web-standard APIs only, so it also runs inside
   workerd tests.
 - `src/journal.ts`: the Local Journal file, `<state-dir>/journal.jsonl`, one fsynced JSON line per entry
-  (`claim`, `intent`, `result`). The intent is written before the adapter starts (§20.2).
+  (`claim`, `intent`, `result`, `uploaded`). The intent is written before the adapter starts (§20.2).
+  `transcriptReader(stateDir)` reads `<state-dir>/transcripts/<runId>.jsonl` (null when absent).
+- `src/uploader.ts`: transcript upload (see Transcript upload).
 - `src/adapters/fake.ts`: exits after `FAKE_DELAY_MS` (default 50) with code 0 and summary
   `fake: handled inbox item <id>`; `FAKE_FAIL=1` exits 1. It is idempotent, so reconcile may simply start it again.
 - `src/adapters/claude.ts`: one SDK `query()` per Run (see below).
@@ -64,6 +66,24 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK) and `fake
   `CLAUDE_CONFIG_DIR=<profile dir> hive executor run --provider claude`. hive never switches to an API key; an
   `ANTHROPIC_API_KEY` in the environment would be used by the SDK, so keep it unset for subscription use. The
   SDK runs its bundled Claude Code (2.1.289 with SDK 0.3.289), not the installed `claude`.
+
+## Transcript upload
+
+`transcriptUploader` (UPLOAD-01; docs/architecture.md §3.3, §13.3, AT-21), wired by `main.ts` and `hive executor run`:
+
+- **When.** Right after a Run's `result` is journaled (also for a stale or stopped attempt: late parts are kept as
+  history), and at startup for every journaled result without an `uploaded` marker (Runs the cloud reported
+  `missing` are skipped).
+- **How.** `splitParts` cuts the transcript into parts of ≤ 1 MiB after a newline (a single longer line is a part
+  of its own; the cloud refuses parts over 8 MiB). For each part: SHA-256, `POST /v1/executor/uploads/init`, and
+  `PUT /v1/executor/uploads/:uploadId` unless the cloud already has it; then `POST /v1/executor/uploads/complete`
+  with the last part seq (-1 when the Run wrote no transcript, e.g. the fake provider). The split is deterministic
+  and init is idempotent, so a retry restarts from part 0 safely. The device token is used: the Run capability is
+  revoked at result submit.
+- **ACK.** `{kind: "uploaded", runId, lastPartSeq}` is journaled only after `complete` succeeded. A failure is retried
+  3 times (1 s, 2 s backoff), then logged; the Run stays `persistence: pending` until the next start. The poll loop
+  never fails because of an upload.
+- **Retention.** The local transcript file is kept; there is no local cleanup yet.
 
 ## Tool policy and approvals
 
@@ -126,7 +146,7 @@ loop claim new Jobs.
 ## Tests
 
 `bun run test` from the repo root. `test/runner.test.ts` runs in Node against an in-memory cloud;
-`test/claude.test.ts` drives the Claude adapter with a fake `queryFn` (SDK message shapes, no subprocess);
+`test/uploader.test.ts` covers the splitter and the uploader's ACK / retry rules; `test/claude.test.ts` drives the Claude adapter with a fake `queryFn` (SDK message shapes, no subprocess);
 `test/tools.test.ts` covers the hive tools and the `waiting` exit; `test/toolPolicy.test.ts` the SDK options, the
 path hook, the approval gate and the environment cwd; the end-to-end
 loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (workerd).
@@ -135,8 +155,9 @@ loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (
 
 - No process supervisor: the adapter runs in-process; no PID / start identity in the journal, so reconcile can only
   resume idempotent adapters.
-- No R2 upload of transcripts or artifacts (the JSONL transcript stays local); no SessionStore adapter (G-07), so
-  no cross-device resume.
+- Transcripts are uploaded after the Run, not streamed while it runs; no artifact upload, no local retention
+  cleanup and no SessionStore adapter (G-07), so no cross-device resume. A failed upload is retried only at the
+  next start.
 - No OS sandbox and no Bash path restriction; no effect broker for external writes (§19). No Codex adapter. A Run
   resumed by reconcile has no capability, so no hive tools and every `ask` tool is denied.
 - Only `runtime.run.started` and `runtime.run.stopped` are observed; no usage / cost or other runtime events are

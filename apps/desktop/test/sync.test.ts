@@ -57,6 +57,16 @@ describe("sync controller", () => {
     expect(h.refetched.slice(1)).toEqual([["channels", "inbox", "messages"]]);
   });
 
+  it("refetches the inspected Run for a run change row", async () => {
+    const h = harness([
+      page("H0", []),
+      page("C1", [{ scope: "workspace:ws-1", entityKind: "run" }]),
+    ]);
+    await h.sync.pull();
+    await h.sync.hint();
+    expect(h.refetched[1]).toEqual(["approvals", "bots", "devices", "jobs", "run"]);
+  });
+
   it("re-bootstraps on 410 CURSOR_EXPIRED", async () => {
     const h = harness([
       page("H0", []),

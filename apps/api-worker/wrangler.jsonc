@@ -14,6 +14,9 @@
       "migrations_dir": "../../packages/db/migrations",
     },
   ],
+  // Transcript parts and other objects (src/transcripts.ts). PLACEHOLDER bucket name: create it with
+  // `bunx wrangler r2 bucket create hive-objects` (or change the name here) before deploying.
+  "r2_buckets": [{ "binding": "R2", "bucket_name": "hive-objects" }],
   // Realtime DO (src/realtime.ts): one per Workspace, WebSocket connections only.
   "durable_objects": { "bindings": [{ "name": "REALTIME", "class_name": "Realtime" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Realtime"] }],

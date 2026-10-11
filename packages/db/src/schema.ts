@@ -807,6 +807,14 @@ export const runs = sqliteTable(
     providerSessionId: text("provider_session_id"),
     // Set by the same observation; null means the launch was never confirmed (§10.4 "unknown after launch intent").
     startedAt: text("started_at"),
+    // Set with the terminal state (finishRun, confirmRunStopped).
+    finishedAt: text("finished_at"),
+    // Transcript persistence (§9.1 "Run=succeeded, persistence=pending"): `complete` once every part up to the
+    // executor's final part is confirmed in `transcript_parts`. No CHECK: adding one to an existing SQLite table
+    // makes drizzle-kit recreate `runs`.
+    persistence: text("persistence", { enum: ["pending", "complete"] })
+      .notNull()
+      .default("pending"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -885,6 +893,55 @@ export const runCapabilities = sqliteTable(
   (t) => [
     index("run_capabilities_run").on(t.runId),
     foreignKey({ columns: [t.workspaceId, t.runId], foreignColumns: [runs.workspaceId, runs.id] }),
+  ],
+);
+
+/**
+ * current state (docs/architecture.md §3.3, §13.2). One raw provider transcript per Run, stored as immutable R2 parts
+ * `workspace/<workspace_id>/transcript/<id>/<part_seq>`. `confirmed_through_seq` is the highest part_seq with every
+ * part from 0 committed (null: none). Raw only: the normalized view is derived at read time and never indexed.
+ */
+export const transcriptStreams = sqliteTable(
+  "transcript_streams",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    runId: text("run_id").notNull().unique(),
+    provider: text("provider").notNull(),
+    confirmedThroughSeq: integer("confirmed_through_seq"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    scoped(t),
+    foreignKey({ columns: [t.workspaceId, t.runId], foreignColumns: [runs.workspaceId, runs.id] }),
+  ],
+);
+
+/**
+ * immutable history: the manifest. A row is committed only after its object is stored and verified in R2 (store
+ * first, then manifest). `entry_count` is the number of JSONL lines in the part.
+ */
+export const transcriptParts = sqliteTable(
+  "transcript_parts",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    streamId: text("stream_id").notNull(),
+    partSeq: integer("part_seq").notNull(),
+    byteSize: integer("byte_size").notNull(),
+    sha256: text("sha256").notNull(),
+    entryCount: integer("entry_count").notNull(),
+    r2Key: text("r2_key").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    unique().on(t.streamId, t.partSeq),
+    check("transcript_parts_seq", sql`${t.partSeq} >= 0`),
+    foreignKey({
+      columns: [t.workspaceId, t.streamId],
+      foreignColumns: [transcriptStreams.workspaceId, transcriptStreams.id],
+    }),
   ],
 );
 

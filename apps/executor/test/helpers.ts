@@ -134,6 +134,12 @@ export const fakeCloud = (overrides: Partial<CloudClient> = {}) => {
       observed.push(input);
     },
     forRun: () => fakeRunApi().api,
+    uploadInit: async (input) => {
+      calls.push(`init:${input.partSeq}`);
+      return { uploadId: `up-${input.partSeq}`, partId: `p-${input.partSeq}`, committed: false };
+    },
+    uploadPart: async (uploadId) => void calls.push(`put:${uploadId}`),
+    uploadComplete: async (input) => void calls.push(`complete:${input.lastPartSeq}`),
     ...overrides,
   };
   return { cloud, calls, submitted, observed };

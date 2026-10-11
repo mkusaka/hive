@@ -141,7 +141,8 @@ pre {
   background: #dbeafe;
 }
 .badge.succeeded,
-.badge.processed {
+.badge.processed,
+.badge.complete {
   background: #d1fadf;
 }
 .badge.failed,
@@ -164,4 +165,14 @@ footer {
   background: #b3261e;
   color: #fff;
   font-size: 12px;
+}
+.inspector {
+  margin-top: 8px;
+}
+.transcript {
+  list-style: none;
+  padding: 0;
+}
+.transcript li {
+  margin-bottom: 6px;
 }

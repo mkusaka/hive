@@ -1,6 +1,7 @@
 declare namespace Cloudflare {
   interface Env {
     DB: D1Database;
+    R2: R2Bucket;
     REALTIME: DurableObjectNamespace<import("../src/realtime.ts").Realtime>;
     ACCESS_TEAM_DOMAIN: string;
     ACCESS_AUD: string;

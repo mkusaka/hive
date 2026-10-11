@@ -28,6 +28,8 @@ hive memory delete <memory-id> [--revision <n>]        # tombstone; a live memor
 hive agent send <bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]
 hive event emit <type> [--data-file <path|->] [--subject <kind:id>]
 hive op get <operation-id>
+hive run get <run-id>                                  # state, persistence (pending|complete), transcript parts
+hive run transcript <run-id> [--raw]                   # normalized, redacted entries; --raw: owner-only JSONL
 hive job get <job-id>
 hive job watch <job-id> [--timeout <s>]                # polls GET /v1/jobs/:id every 2 s
 hive inbox list --bot <bot-id>
@@ -93,7 +95,11 @@ a fresh UUID per invocation).
 - **`executor run`** wraps `runLoop` from `@hive/executor` with the credentials' `deviceToken`; the journal lives in
   `<config dir>/hive/executor/` (Claude transcripts under `transcripts/`, run cwd under `runs/`; see
   `apps/executor/README.md`). `FAKE_DELAY_MS` / `FAKE_FAIL=1` tune the fake provider. Before each poll it calls
-  `POST /v1/executor/pump`, because no Queue consumer exists yet and `wrangler dev` fires no cron.
+  `POST /v1/executor/pump`, because no Queue consumer exists yet and `wrangler dev` fires no cron. After each Run
+  (and at start for earlier ones) it uploads the Run's transcript; see `apps/executor/README.md`, Transcript upload.
+- **`run transcript`** pages `GET /v1/runs/:id/transcript` until the last confirmed part and prints
+  `<seq> <kind>[(<tool>)]: <text>` per entry (`--format json`: `{entries}`). It needs membership of the Run's
+  channel or Workspace ownership (404 otherwise). `--raw` prints `GET /v1/transcripts/:id/raw` as-is (owner only).
 
 ## Credentials
 

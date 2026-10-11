@@ -12,6 +12,9 @@ import type {
   RunContext,
   RunObservation,
   SearchResult,
+  UploadComplete,
+  UploadInit,
+  UploadInitialized,
 } from "@hive/contracts";
 
 // No parameter properties: Node's type stripping rejects them.
@@ -60,6 +63,10 @@ export type CloudClient = {
     executionGeneration: number;
   }): Promise<RunContext>;
   observe(input: RunObservation): Promise<void>;
+  /** Transcript upload (§3.3) with the device token: also after the Run's capability was revoked. */
+  uploadInit(input: UploadInit): Promise<UploadInitialized>;
+  uploadPart(uploadId: string, bytes: Uint8Array): Promise<void>;
+  uploadComplete(input: UploadComplete): Promise<void>;
   /** A client acting as the Run behind `capabilityToken`. */
   forRun(capabilityToken: string): RunApi;
 };
@@ -74,15 +81,20 @@ export const createCloudClient = ({
   fetch?: (input: URL, init: RequestInit) => Promise<Response>;
 }): CloudClient => {
   const request = async <T>(
-    method: "GET" | "POST",
+    method: "GET" | "POST" | "PUT",
     path: string,
     body?: unknown,
     bearer: string = token,
   ) => {
+    // Bytes go as a raw body (a transcript part); anything else as JSON.
+    const raw = body instanceof Uint8Array;
     const res = await fetchImpl(new URL(path, apiUrl), {
       method,
-      headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      headers: {
+        Authorization: `Bearer ${bearer}`,
+        "Content-Type": raw ? "application/octet-stream" : "application/json",
+      },
+      body: body === undefined ? undefined : raw ? body : JSON.stringify(body),
     });
     const json: unknown = await res.json().catch(() => null);
     if (!res.ok) {
@@ -148,6 +160,13 @@ export const createCloudClient = ({
       ),
     observe: async (input) => {
       await request("POST", "/v1/executor/observations", input);
+    },
+    uploadInit: (input) => request("POST", "/v1/executor/uploads/init", input),
+    uploadPart: async (uploadId, bytes) => {
+      await request("PUT", `/v1/executor/uploads/${encodeURIComponent(uploadId)}`, bytes);
+    },
+    uploadComplete: async (input) => {
+      await request("POST", "/v1/executor/uploads/complete", input);
     },
     forRun: (capabilityToken) => ({
       // A random key per call: each tool call is a new operation (the model retries by calling again).

@@ -92,6 +92,13 @@
       "when": 1791691887003,
       "tag": "0012_search_fts",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1791693194580,
+      "tag": "0013_transcripts",
+      "breakpoints": true
     }
   ]
 }
