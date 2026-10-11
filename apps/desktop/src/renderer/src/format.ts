@@ -1,8 +1,9 @@
 // Pure formatting for the chat UI: a small safe Markdown subset (as data, rendered by React without HTML), Routine
 // schedule lines and avatar colors.
+import type { JSONContent } from "@tiptap/core";
 
 export type Inline =
-  | { kind: "text" | "bold" | "code"; text: string }
+  | { kind: "text" | "bold" | "italic" | "code"; text: string }
   | { kind: "link"; text: string; url: string }
   /** A `<@bot:ID>` token (contracts `mentionToken`); the view shows the Bot's name. */
   | { kind: "mention"; id: string };
@@ -11,9 +12,10 @@ export type Block =
   | { kind: "ul" | "ol"; items: Inline[][] }
   | { kind: "code"; text: string };
 
-const inlinePattern = /\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\)|<@bot:([^>\s]+)>/g;
+const inlinePattern =
+  /\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\)|<@bot:([^>\s]+)>|(?<!\w)_([^_\n]+)_(?!\w)/g;
 
-/** `**bold**`, `` `code` ``, `[text](url)` and mention tokens; everything else is text. */
+/** `**bold**`, `_italic_`, `` `code` ``, `[text](url)` and mention tokens; everything else is text. */
 export const parseInline = (text: string): Inline[] => {
   const out: Inline[] = [];
   let last = 0;
@@ -22,6 +24,7 @@ export const parseInline = (text: string): Inline[] => {
     if (m[1] !== undefined) out.push({ kind: "bold", text: m[1] });
     else if (m[2] !== undefined) out.push({ kind: "code", text: m[2] });
     else if (m[5] !== undefined) out.push({ kind: "mention", id: m[5] });
+    else if (m[6] !== undefined) out.push({ kind: "italic", text: m[6] });
     else out.push({ kind: "link", text: m[3]!, url: m[4]! });
     last = m.index + m[0].length;
   }
@@ -68,6 +71,41 @@ export const parseMarkdown = (source: string): Block[] => {
   }
   return blocks;
 };
+
+const marks: Record<string, string> = { bold: "**", italic: "_", code: "`" };
+
+const inlineMarkdown = (nodes: JSONContent[] = []) =>
+  nodes
+    .map((n) => {
+      if (n.type === "mention") return `<@bot:${String(n.attrs?.id)}>`;
+      if (n.type === "hardBreak") return "\n";
+      return (n.marks ?? []).reduce((out, m) => {
+        const wrap = marks[m.type];
+        return wrap ? `${wrap}${out}${wrap}` : out;
+      }, n.text ?? "");
+    })
+    .join("");
+
+const blockMarkdown = (n: JSONContent): string => {
+  if (n.type === "codeBlock")
+    return `\`\`\`${String(n.attrs?.language ?? "")}\n${inlineMarkdown(n.content)}\n\`\`\``;
+  if (n.type === "bulletList" || n.type === "orderedList")
+    return (n.content ?? [])
+      .map((item, i) => {
+        const marker = n.type === "bulletList" ? "- " : `${Number(n.attrs?.start ?? 1) + i}. `;
+        return marker + (item.content ?? []).map(blockMarkdown).join("\n").replaceAll("\n", "\n  ");
+      })
+      .join("\n");
+  return inlineMarkdown(n.content);
+};
+
+/**
+ * The composer's editor document as a message body: mention nodes as `<@bot:ID>` tokens, hard breaks as newlines,
+ * bold / italic / code marks, lists and fenced code blocks as the Markdown subset above; one block per line (an
+ * empty paragraph is a blank line), so Shift+Enter lines arrive as typed.
+ */
+export const toMarkdown = (doc: JSONContent) =>
+  (doc.content ?? []).map(blockMarkdown).join("\n").trim();
 
 export type Schedule =
   | { kind: "cron"; expr: string; timezone: string }

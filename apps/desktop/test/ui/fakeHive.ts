@@ -1,5 +1,5 @@
 // `window.hive` replaced by an in-memory fake (the renderer never calls fetch; IPC is the seam) and `renderApp`.
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createElement } from "react";
 import { afterEach } from "vitest";
@@ -104,6 +104,15 @@ export const renderApp = (overrides: Options = {}) => {
 /** Queries inside the sidebar, once the app has loaded its config. */
 export const sidebar = async () =>
   within((await screen.findByRole("button", { name: "Toggle sidebar" })).closest("aside")!);
+
+/** The composer's Tiptap editor (role textbox) once its placeholder reads `placeholder`. */
+export const findComposer = (placeholder: string) =>
+  waitFor(() => {
+    const box = screen.getByRole("textbox", { name: "Message" });
+    const shown = box.querySelector("[data-placeholder]")?.getAttribute("data-placeholder");
+    if (shown !== placeholder) throw new Error(`composer placeholder: ${shown}`);
+    return box;
+  });
 
 afterEach(() => {
   cleanup();

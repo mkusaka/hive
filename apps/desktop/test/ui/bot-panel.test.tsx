@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { renderApp, sidebar } from "./fakeHive.ts";
+import { findComposer, renderApp, sidebar } from "./fakeHive.ts";
 import { dms } from "./fixtures.ts";
 
 /** Opens coder's DM from its sidebar blob, then its panel from the DM header. */
@@ -14,7 +14,7 @@ const openCoder = async () => {
   return { ...app, panel };
 };
 const waitForHead = async (container: HTMLElement) => {
-  await screen.findByPlaceholderText("Message coder");
+  await findComposer("Message coder");
   return container.querySelector<HTMLElement>(".chat-head")!;
 };
 

@@ -1,8 +1,14 @@
 // The Channel conversation: header (star, name pill, topic, member count, "…"), day sections with sticky date pills, Markdown bubbles and the composer (message.post with @mentions).
 // A DM uses the same view: its header is the Bot (opens the Bot panel) and every message goes to that Bot.
 /* oxlint-disable no-await-in-loop */
-import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { type Inline, parseMarkdown } from "./format.ts";
+import { Extension } from "@tiptap/core";
+import Mention from "@tiptap/extension-mention";
+import Placeholder from "@tiptap/extension-placeholder";
+import { EditorContent, useEditor } from "@tiptap/react";
+import StarterKit from "@tiptap/starter-kit";
+import type { SuggestionProps } from "@tiptap/suggestion";
+import { Fragment, useEffect, useRef, useState } from "react";
+import { type Inline, parseMarkdown, toMarkdown } from "./format.ts";
 import { Avatar, Icon, type Row, text } from "./ui.tsx";
 
 /** Bot id → name, for mention tokens. */
@@ -16,6 +22,8 @@ export const Inlines = ({ inlines, names }: { inlines: Inline[]; names: Names })
       </span>
     ) : part.kind === "bold" ? (
       <strong key={i}>{part.text}</strong>
+    ) : part.kind === "italic" ? (
+      <em key={i}>{part.text}</em>
     ) : part.kind === "code" ? (
       <code key={i}>{part.text}</code>
     ) : part.kind === "link" ? (
@@ -80,17 +88,15 @@ const byDay = (messages: Row[]) => {
 /** `jobIds`: null while routing is pending, then one per mentioned Bot (empty: nobody was mentioned). */
 type Operation = { operationId: string; jobIds: string[] | null; error?: string };
 
-const escapeRegExp = (s: string) => s.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** The Bots the `@` suggestion offers for `query` (name prefix); in a DM only its Bot, the implicit recipient. */
+export const mentionItems = (bots: Row[], query: string, dmBot: string | null) =>
+  bots.filter(
+    (b) =>
+      (dmBot === null || b.id === dmBot) &&
+      String(b.name).toLowerCase().startsWith(query.toLowerCase()),
+  );
 
-/** `@name` → `<@bot:ID>` for the names picked from the popup, longest first. */
-const withTokens = (draft: string, picked: Names) =>
-  [...picked]
-    .toSorted(([a], [b]) => b.length - a.length)
-    .reduce(
-      (out, [name, id]) =>
-        out.replaceAll(new RegExp(`@${escapeRegExp(name)}(?![\\w-])`, "g"), `<@bot:${id}>`),
-      draft,
-    );
+type Suggestion = SuggestionProps<Row, { id: string; label: string }>;
 
 export const ChannelView = (props: {
   ws: string;
@@ -107,20 +113,76 @@ export const ChannelView = (props: {
   starred: boolean;
   toggleStar: () => void;
 }) => {
-  const [draft, setDraft] = useState("");
-  const [caret, setCaret] = useState(0);
+  const [suggestion, setSuggestion] = useState<Suggestion | null>(null);
   const [active, setActive] = useState(0);
-  /** The draft at the last Esc: the popup stays closed until the draft changes. */
-  const [dismissed, setDismissed] = useState<string | null>(null);
-  const picked = useRef(new Map<string, string>());
-  const box = useRef<HTMLTextAreaElement>(null);
-  const nextCaret = useRef<number | null>(null);
+  const [empty, setEmpty] = useState(true);
   const [op, setOp] = useState<Operation | null>(null);
   const end = useRef<HTMLDivElement>(null);
-  useLayoutEffect(() => {
-    if (nextCaret.current === null) return;
-    box.current?.setSelectionRange(nextCaret.current, nextCaret.current);
-    nextCaret.current = null;
+  /** What the editor's extensions (created once) read at call time. */
+  const live = useRef({
+    props,
+    placeholder: "",
+    send: async () => {},
+    keyDown: (_: KeyboardEvent): boolean => false,
+    menuOpen: false,
+  });
+  const editor = useEditor({
+    extensions: [
+      StarterKit.configure({
+        heading: false,
+        blockquote: false,
+        horizontalRule: false,
+        strike: false,
+        underline: false,
+        link: false,
+      }),
+      Placeholder.configure({ placeholder: () => live.current.placeholder }),
+      Mention.configure({
+        HTMLAttributes: { class: "mention" },
+        suggestion: {
+          items: ({ query }) => {
+            const p = live.current.props;
+            return mentionItems(p.bots, query, p.dm ? String(p.channel?.botId) : null);
+          },
+          render: () => ({
+            onStart: (s) => {
+              setSuggestion(s);
+              setActive(0);
+            },
+            onUpdate: (s) => {
+              setSuggestion(s);
+              setActive(0);
+            },
+            onKeyDown: ({ event }) => live.current.keyDown(event),
+            onExit: () => setSuggestion(null),
+          }),
+        },
+      }),
+      // Above StarterKit's list / paragraph Enter; yields to the open suggestion, which picks on Enter.
+      Extension.create({
+        name: "composerKeys",
+        priority: 1000,
+        addKeyboardShortcuts: () => ({
+          Enter: () => {
+            if (live.current.menuOpen) return false;
+            void live.current.send();
+            return true;
+          },
+          // A new line in code, a new item in a list (an empty one leaves it), else a new paragraph, so "- " or
+          // "1. " at its start makes a list.
+          "Shift-Enter": ({ editor: e }) =>
+            e.commands.first(({ commands }) => [
+              () => commands.newlineInCode(),
+              () => commands.splitListItem("listItem"),
+              () => commands.splitBlock(),
+            ]),
+        }),
+      }),
+    ],
+    editorProps: {
+      attributes: { role: "textbox", "aria-label": "Message", "aria-multiline": "true" },
+    },
+    onUpdate: ({ editor: e }) => setEmpty(toMarkdown(e.getJSON()) === ""),
   });
   // Braces: Chromium's scrollIntoView returns a Promise, which React would call as the cleanup.
   useEffect(() => {
@@ -129,27 +191,9 @@ export const ChannelView = (props: {
 
   const botByActor = new Map(props.bots.map((b) => [String(b.actorId), b]));
   const names: Names = new Map(props.bots.map((b) => [b.id, String(b.name)]));
-  // The `@prefix` right before the caret opens the popup.
-  // No popup in a DM: its Bot is the recipient.
-  const typed =
-    props.dm || dismissed === draft ? null : /(?:^|\s)@([^\s@]*)$/.exec(draft.slice(0, caret));
-  const query = typed?.[1]?.toLowerCase() ?? "";
-  const matches = typed
-    ? props.bots.filter((b) => String(b.name).toLowerCase().startsWith(query))
-    : [];
+  const matches = suggestion?.items ?? [];
   const highlighted = Math.min(active, matches.length - 1);
-  const edit = (value: string, position: number) => {
-    setDraft(value);
-    setCaret(position);
-    setActive(0);
-  };
-  const pick = (b: Row) => {
-    const name = String(b.name);
-    const start = caret - query.length - 1;
-    picked.current.set(name, b.id);
-    nextCaret.current = start + name.length + 2;
-    edit(`${draft.slice(0, start)}@${name} ${draft.slice(caret)}`, nextCaret.current);
-  };
+  const pick = (b: Row) => suggestion?.command({ id: b.id, label: String(b.name) });
   const posted = [
     ...new Map(
       props.messages.flatMap((m) => {
@@ -160,7 +204,8 @@ export const ChannelView = (props: {
   ];
 
   const send = async () => {
-    if (!draft.trim() || !props.channel) return;
+    const draft = editor ? toMarkdown(editor.getJSON()) : "";
+    if (!draft || !props.channel) return;
     const operationId = crypto.randomUUID();
     const result = await window.hive.api.command({
       operationId,
@@ -169,12 +214,11 @@ export const ChannelView = (props: {
       command: {
         type: "message.post",
         ...(props.dm ? { conversationId: props.channel.id } : { channelId: props.channel.id }),
-        text: withTokens(draft, picked.current),
+        text: draft,
       },
     });
     if (!result.ok) return setOp({ operationId, jobIds: null, error: result.error.message });
-    edit("", 0);
-    picked.current.clear();
+    editor?.chain().clearContent(true).focus().run();
     const mentioned = (result.value.inboxItemIds as unknown[] | undefined)?.length ?? 0;
     setOp({ operationId, jobIds: mentioned === 0 ? [] : null });
     if (mentioned === 0) return;
@@ -188,9 +232,28 @@ export const ChannelView = (props: {
     }
   };
 
-  if (!props.channel) return <div className="empty">No channel yet.</div>;
-  const name = text(props.channel.name);
+  const name = text(props.channel?.name);
   const title = props.dm ? name : `#${name}`;
+  live.current = {
+    props,
+    placeholder: `Message ${title}`,
+    send,
+    menuOpen: matches.length > 0,
+    keyDown: (event) => {
+      if (matches.length === 0) return false;
+      const step = { ArrowDown: 1, ArrowUp: -1 }[event.key];
+      if (step) setActive((highlighted + step + matches.length) % matches.length);
+      else if (event.key === "Enter" || event.key === "Tab") pick(matches[highlighted]!);
+      else return event.key === "Escape";
+      return true;
+    },
+  };
+  // The placeholder is read when decorations are drawn: redraw them when the conversation changes.
+  useEffect(() => {
+    if (editor && !editor.isDestroyed) editor.view.dispatch(editor.state.tr);
+  }, [editor, title]);
+
+  if (!props.channel) return <div className="empty">No channel yet.</div>;
   const memberCount = Number(props.channel.memberCount ?? 0);
   const dmBot = String(props.channel.botId);
   return (
@@ -310,7 +373,7 @@ export const ChannelView = (props: {
                 key={b.id}
                 role="option"
                 aria-selected={i === highlighted}
-                // mousedown, not click: the textarea keeps focus and its caret.
+                // mousedown, not click: the editor keeps focus and its caret.
                 onMouseDown={(e) => {
                   e.preventDefault();
                   pick(b);
@@ -321,35 +384,8 @@ export const ChannelView = (props: {
             ))}
           </ul>
         )}
-        <textarea
-          ref={box}
-          rows={1}
-          value={draft}
-          onChange={(e) => edit(e.target.value, e.target.selectionStart)}
-          onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
-          onKeyDown={(e) => {
-            if (e.nativeEvent.isComposing) return;
-            if (matches.length > 0) {
-              const step = { ArrowDown: 1, ArrowUp: -1 }[e.key];
-              if (step) {
-                e.preventDefault();
-                return setActive((highlighted + step + matches.length) % matches.length);
-              }
-              if (e.key === "Enter" || e.key === "Tab") {
-                e.preventDefault();
-                return pick(matches[highlighted]!);
-              }
-              if (e.key === "Escape") return setDismissed(draft);
-            }
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              void send();
-            }
-          }}
-          placeholder={`Message ${title}`}
-          aria-label="Message"
-        />
-        <button className="send" aria-label="Send" disabled={!draft.trim()}>
+        <EditorContent editor={editor} className="composer-input" />
+        <button className="send" aria-label="Send" disabled={empty}>
           <Icon name="send" />
         </button>
       </form>

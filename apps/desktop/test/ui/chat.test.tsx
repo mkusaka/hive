@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 import { act, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { dayLabel } from "../../src/renderer/src/chat.tsx";
+import { dayLabel, mentionItems } from "../../src/renderer/src/chat.tsx";
+import { parseMarkdown, toMarkdown } from "../../src/renderer/src/format.ts";
 import { renderApp } from "./fakeHive.ts";
 import { channels, messages } from "./fixtures.ts";
 
@@ -14,6 +15,21 @@ const accepted = (inboxItemIds: string[]) => () => ({
   ok: true as const,
   value: { status: "accepted", inboxItemIds },
 });
+
+const text = (t: string, mark?: string) => ({
+  type: "text",
+  text: t,
+  ...(mark ? { marks: [{ type: mark }] } : {}),
+});
+const para = (...content: object[]) => ({ type: "paragraph", content });
+const item = (t: string) => ({ type: "listItem", content: [para(text(t))] });
+
+/** The composer's editor (contenteditable, role textbox). */
+const editor = () => screen.getByRole("textbox", { name: "Message" });
+const placeholder = (box: HTMLElement) =>
+  box.querySelector("[data-placeholder]")?.getAttribute("data-placeholder");
+const editorPills = (box: HTMLElement) =>
+  [...box.querySelectorAll(".mention")].map((m) => [m.textContent, m.getAttribute("data-id")]);
 
 const options = () =>
   screen
@@ -44,21 +60,23 @@ describe("chat", () => {
   it("posts message.post on Enter; without a mention it says nobody was woken", async () => {
     const { hive, user } = renderApp({ command: accepted([]) });
     await screen.findByText("please fix the build");
-    const box = screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
-    expect(box.placeholder).toBe("Message #general");
+    const box = editor();
+    expect(placeholder(box)).toBe("Message #general");
     await user.type(box, "hello{Enter}");
     expect(hive.sent("message.post")).toEqual([post("hello")]);
     expect(await screen.findByText(/posted, no Bot mentioned/)).toBeTruthy();
-    expect(box.value).toBe("");
+    // Cleared and still focused: the placeholder is back.
+    expect(box.textContent).toBe("");
+    expect(placeholder(box)).toBe("Message #general");
+    expect(document.activeElement).toBe(box);
   });
 
   it("sends with the button, and Shift+Enter adds a line instead", async () => {
     const { hive, user } = renderApp();
     await screen.findByText("please fix the build");
-    const box = screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
+    const box = editor();
     await user.type(box, "line 1{Shift>}{Enter}{/Shift}line 2");
     expect(hive.calls.command).toEqual([]);
-    expect(box.value).toBe("line 1\nline 2");
     await user.click(screen.getByRole("button", { name: "Send" }));
     expect(hive.sent("message.post")).toEqual([post("line 1\nline 2")]);
   });
@@ -66,7 +84,7 @@ describe("chat", () => {
   it("opens the @ popup filtered by the prefix and picks with Enter", async () => {
     const { hive, user } = renderApp({ command: accepted(["in-1"]) });
     await screen.findByText("please fix the build");
-    const box = screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
+    const box = editor();
     await user.type(box, "@");
     expect(options()).toEqual([
       ["C coder", "true"],
@@ -75,7 +93,8 @@ describe("chat", () => {
     await user.type(box, "cod");
     expect(options()).toEqual([["C coder", "true"]]);
     await user.keyboard("{Enter}");
-    expect(box.value).toBe("@coder ");
+    // A pill node in the editor holding the Bot's id and name.
+    expect(editorPills(box)).toEqual([["@coder", "bot-1"]]);
     expect(screen.queryByRole("listbox")).toBeNull();
     expect(hive.calls.command).toEqual([]);
     await user.type(box, "reply with exactly: mention ok{Enter}");
@@ -88,10 +107,10 @@ describe("chat", () => {
   it("moves with the arrows, picks with Tab, closes on Esc", async () => {
     const { hive, user } = renderApp();
     await screen.findByText("please fix the build");
-    const box = screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
+    const box = editor();
     await user.type(box, "@");
     await user.keyboard("{ArrowDown}{Tab}");
-    expect(box.value).toBe("@reviewer ");
+    expect(editorPills(box)).toEqual([["@reviewer", "bot-2"]]);
     await user.type(box, "and @");
     expect(screen.getByRole("listbox")).toBeTruthy();
     await user.keyboard("{Escape}");
@@ -104,16 +123,66 @@ describe("chat", () => {
   it("shows one Job id per mentioned Bot once routing created them", async () => {
     const { hive, user } = renderApp({ command: accepted(["in-1", "in-2"]) });
     await screen.findByText("please fix the build");
-    await user.type(
-      screen.getByRole("textbox", { name: "Message" }),
-      "@c{Enter}@r{Enter}hi{Enter}",
-    );
+    await user.type(editor(), "@c{Enter}@r{Enter}hi{Enter}");
     expect(hive.sent("message.post")).toEqual([post("<@bot:bot-1> <@bot:bot-2> hi")]);
     hive.routes[`/v1/operations/${hive.calls.command[0]!.operationId}`] = {
       jobIds: ["job-7", "job-8"],
     };
     expect(await screen.findByText("job-8", {}, { timeout: 4000 })).toBeTruthy();
     expect(screen.getByText(/jobs/).textContent).toMatch(/jobs job-7, job-8$/);
+  });
+
+  it("sends bold, italic, code and a list typed with Markdown shortcuts as Markdown", async () => {
+    const { hive, user } = renderApp();
+    await screen.findByText("please fix the build");
+    await user.type(
+      editor(),
+      "see **this** and _that_ in `x`{Shift>}{Enter}{/Shift}- one{Shift>}{Enter}{/Shift}two{Enter}",
+    );
+    expect(hive.sent("message.post")).toEqual([
+      post("see **this** and _that_ in `x`\n- one\n- two"),
+    ]);
+  });
+
+  it("serializes mentions, breaks, lists and code blocks; the bubble parser reads it back", () => {
+    const md = toMarkdown({
+      type: "doc",
+      content: [
+        para(
+          { type: "mention", attrs: { id: "bot-1", label: "coder" } },
+          text(" fix"),
+          {
+            type: "hardBreak",
+          },
+          text("now", "bold"),
+        ),
+        { type: "orderedList", attrs: { start: 3 }, content: [item("a"), item("b")] },
+        { type: "codeBlock", attrs: { language: "ts" }, content: [text("let x = 1;\nx++;")] },
+      ],
+    });
+    expect(md).toBe("<@bot:bot-1> fix\n**now**\n3. a\n4. b\n```ts\nlet x = 1;\nx++;\n```");
+    expect(parseMarkdown(md)).toEqual([
+      {
+        kind: "p",
+        inlines: [
+          { kind: "mention", id: "bot-1" },
+          { kind: "text", text: " fix\n" },
+          { kind: "bold", text: "now" },
+        ],
+      },
+      { kind: "ol", items: [[{ kind: "text", text: "a" }], [{ kind: "text", text: "b" }]] },
+      { kind: "code", text: "let x = 1;\nx++;" },
+    ]);
+  });
+
+  it("offers the Bots by name prefix; in a DM only its Bot", () => {
+    const bots = [
+      { id: "bot-1", name: "coder" },
+      { id: "bot-2", name: "reviewer" },
+    ];
+    expect(mentionItems(bots, "", null).map((b) => b.id)).toEqual(["bot-1", "bot-2"]);
+    expect(mentionItems(bots, "RE", null).map((b) => b.id)).toEqual(["bot-2"]);
+    expect(mentionItems(bots, "", "bot-1").map((b) => b.id)).toEqual(["bot-1"]);
   });
 
   it("renders mention tokens as @name pills in bubbles and the sidebar preview", async () => {
