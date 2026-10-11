@@ -17,6 +17,26 @@ const collapsedKey = "hive.sidebarCollapsed";
 const isLive = (config: HiveConfig | null): config is HiveConfig =>
   config !== null && config.apiUrl !== "" && config.workspaceId !== "" && !config.loginRequired;
 
+type Status = {
+  sync: { head: string; ageMs: number };
+  outbox: { queued: number; failing: number; oldestAgeMs: number };
+  search: { indexedThrough: string | null; lagMs: number };
+  jobs: { queued: number; waitingDevice: number; recoveryRequired: number; unknown: number };
+  effects: { unknown: number };
+  devices: { online: number; total: number };
+  routines: { overdue: number };
+};
+
+const cursorSeq = (cursor: string | null) => {
+  if (!cursor) return null;
+  try {
+    const encoded = cursor.replaceAll("-", "+").replaceAll("_", "/");
+    return Number(JSON.parse(atob(encoded)).seq);
+  } catch {
+    return null;
+  }
+};
+
 export const App = () => {
   const [config, setConfig] = useState<HiveConfig | null>(null);
   const [view, setView] = useState<View>("channel");
@@ -25,6 +45,10 @@ export const App = () => {
   const [skippedDevice, setSkippedDevice] = useState(false);
   const [connection, setConnection] = useState("reconnecting");
   const [sync, setSync] = useState<SyncStatus>({ cursor: null, unsynced: 0, error: null });
+  const [status, setStatus] = useState<Status | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const configRef = useRef<HiveConfig | null>(null);
+  configRef.current = config;
 
   const [channels, setChannels] = useState<Row[]>([]);
   const [dms, setDms] = useState<Row[]>([]);
@@ -176,13 +200,24 @@ export const App = () => {
     const failed = (await Promise.allSettled(tasks)).find((r) => r.status === "rejected");
     setError(failed ? String(failed.reason) : null);
   }, []);
+  const refreshStatus = useCallback(async (workspaceId: string) => {
+    try {
+      setStatus((await get(inWorkspace("status", workspaceId))) as Status);
+      setStatusError(null);
+    } catch (e) {
+      setStatusError(String(e));
+    }
+  }, []);
 
   const syncRef = useRef<ReturnType<typeof createSync> | null>(null);
   useEffect(() => {
     // Subscribe before asking for config: the reply carries the connection state at that moment.
     const off = window.hive.onRealtime((event) => {
-      if (event.type === "sync.changed") void syncRef.current?.hint();
-      else {
+      if (event.type === "sync.changed") {
+        void syncRef.current?.hint();
+        const live = configRef.current;
+        if (isLive(live)) void refreshStatus(live.workspaceId);
+      } else {
         setConnection(event.state);
         if (event.state === "connected") void syncRef.current?.pull(); // reconcile on reconnect
       }
@@ -193,7 +228,7 @@ export const App = () => {
       if (c.openBot) openBot(c.openBot);
     });
     return off;
-  }, [openBot]);
+  }, [openBot, refreshStatus]);
 
   useEffect(() => {
     if (!isLive(config)) return;
@@ -222,6 +257,12 @@ export const App = () => {
       window.removeEventListener("focus", onFocus);
     };
   }, [config, refetch]);
+  useEffect(() => {
+    if (!isLive(config)) return;
+    void refreshStatus(config.workspaceId);
+    const timer = setInterval(() => void refreshStatus(config.workspaceId), 30_000);
+    return () => clearInterval(timer);
+  }, [config, refreshStatus]);
 
   // Who "You" is in the message list (messages carry the author's user id) and the account avatar.
   useEffect(() => {
@@ -311,6 +352,19 @@ export const App = () => {
     );
   const ws = config.workspaceId;
 
+  const hasStatusWarning =
+    connection !== "connected" ||
+    (status !== null &&
+      (sync.unsynced > 0 ||
+        (cursorSeq(sync.cursor) ?? -1) < (cursorSeq(status.sync.head) ?? -1) ||
+        status.outbox.queued > 0 ||
+        status.outbox.failing > 0 ||
+        status.search.lagMs > 0 ||
+        status.jobs.recoveryRequired > 0 ||
+        status.jobs.unknown > 0 ||
+        status.effects.unknown > 0 ||
+        status.devices.online < status.devices.total ||
+        status.routines.overdue > 0));
   const panelBotRow = panelBot ? bots.find((b) => b.id === panelBot) : undefined;
   const dm = dmId ? dms.find((d) => d.id === dmId) : undefined;
   const channel = channels.find((c) => c.id === channelId);
@@ -358,6 +412,7 @@ export const App = () => {
         }}
         openDm={(id) => void openDm(id)}
         approvals={approvals.length}
+        statusAmber={hasStatusWarning}
         account={me ? { id: me, label: meLabel } : null}
         signOut={() =>
           void window.hive
@@ -523,6 +578,23 @@ export const App = () => {
             </div>
           </section>
         )}
+        {view === "audit" && (
+          <AuditView
+            ws={ws}
+            openTarget={(target) => {
+              if (target.type === "channel") {
+                setChannelId(target.id);
+                setDmId(null);
+                setView("channel");
+              } else if (target.type === "bot") {
+                setPanel({ kind: "bot", id: target.id });
+              } else if (target.type === "run") {
+                setView("activity");
+                setRunId(target.id);
+              }
+            }}
+          />
+        )}
         {view === "approvals" && (
           <ApprovalsView
             approvals={approvals}
@@ -541,22 +613,13 @@ export const App = () => {
         )}
         {view === "memory" && <MemoryView ws={ws} channels={channels} bots={bots} />}
         {view === "status" && (
-          <section className="view">
-            <h2>Status</h2>
-            <dl className="kv">
-              <dt>Workspace</dt>
-              <dd className="mono">{ws}</dd>
-              <dt>WebSocket</dt>
-              <dd className={connection === "connected" ? "ok" : "warn"}>{connection}</dd>
-              <dt>Sync cursor</dt>
-              <dd className="mono" title={sync.cursor ?? ""}>
-                {sync.cursor ? sync.cursor.slice(-12) : "—"}
-              </dd>
-              <dt>Unsynced hints</dt>
-              <dd>{sync.unsynced}</dd>
-            </dl>
-            {sync.error && <p className="error">{sync.error}</p>}
-          </section>
+          <StatusView
+            ws={ws}
+            status={status}
+            error={statusError}
+            sync={sync}
+            connection={connection}
+          />
         )}
       </main>
       {panelBotRow && (
@@ -610,6 +673,197 @@ export const App = () => {
         />
       )}
     </div>
+  );
+};
+type AuditTarget = { type: string; id: string; label: string };
+type AuditEntry = Row & {
+  at: string;
+  actorId: string;
+  actorLabel: string;
+  kind: string;
+  target: AuditTarget;
+  summary: string;
+};
+
+const AuditView = (props: { ws: string; openTarget: (target: AuditTarget) => void }) => {
+  const [kind, setKind] = useState("");
+  const [actor, setActor] = useState("");
+  const [entries, setEntries] = useState<AuditEntry[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const cursorRef = useRef<string | null>(null);
+  const requestId = useRef(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(
+    async (append: boolean) => {
+      const request = ++requestId.current;
+      setLoading(true);
+      try {
+        const body = await get(
+          inWorkspace("audit", props.ws, {
+            ...(kind ? { kinds: kind } : {}),
+            ...(actor ? { actor } : {}),
+            ...(append && cursorRef.current ? { cursor: cursorRef.current } : {}),
+          }),
+        );
+        if (request !== requestId.current) return;
+        setEntries((old) =>
+          append ? [...old, ...(body.entries as AuditEntry[])] : (body.entries as AuditEntry[]),
+        );
+        cursorRef.current = (body.cursor as string | null) ?? null;
+        setCursor(cursorRef.current);
+        setError(null);
+      } catch (e) {
+        if (request === requestId.current) setError(String(e));
+      } finally {
+        if (request === requestId.current) setLoading(false);
+      }
+    },
+    [actor, kind, props.ws],
+  );
+  useEffect(() => {
+    void load(false);
+    return () => {
+      requestId.current += 1;
+    };
+  }, [load]);
+  return (
+    <section className="view">
+      <h2>Audit</h2>
+      <div className="audit-filters">
+        <label>
+          Kind <input aria-label="Kind" value={kind} onChange={(e) => setKind(e.target.value)} />
+        </label>
+        <label>
+          Actor{" "}
+          <input aria-label="Actor" value={actor} onChange={(e) => setActor(e.target.value)} />
+        </label>
+      </div>
+      {error && <p className="error">{error}</p>}
+      {loading && entries.length === 0 ? (
+        <p className="empty">Loading audit entries…</p>
+      ) : entries.length === 0 ? (
+        <p className="empty">No audit entries match these filters.</p>
+      ) : (
+        <ul className="list audit-list">
+          {entries.map((entry) => (
+            <li key={entry.id}>
+              <time className="meta">{new Date(entry.at).toLocaleString("en-US")}</time>
+              <span className="actor">
+                <span className="avatar plain">{entry.actorLabel.slice(0, 1)}</span>
+                {entry.actorLabel}
+              </span>
+              <Badge state={entry.kind} />
+              <button
+                className="link"
+                disabled={!["channel", "run", "bot"].includes(entry.target.type)}
+                onClick={() => props.openTarget(entry.target)}
+              >
+                {entry.target.label}
+              </button>
+              <span>{entry.summary}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {cursor && (
+        <button disabled={loading} onClick={() => void load(true)}>
+          Load more
+        </button>
+      )}
+    </section>
+  );
+};
+
+const StatusView = (props: {
+  ws: string;
+  status: Status | null;
+  error: string | null;
+  sync: SyncStatus;
+  connection: string;
+}) => {
+  const { status } = props;
+  const behind =
+    props.sync.unsynced > 0 ||
+    (status !== null && (cursorSeq(props.sync.cursor) ?? -1) < (cursorSeq(status.sync.head) ?? -1));
+  const tiles: [string, boolean, string, string][] = status
+    ? [
+        [
+          "Sync lag",
+          behind || props.connection !== "connected",
+          behind ? "Sync this client to catch up." : "Reconnect this client.",
+          `${behind ? "Behind" : props.connection}`,
+        ],
+        [
+          "Outbox backlog",
+          status.outbox.queued > 0 || status.outbox.failing > 0,
+          "Run the outbox pump.",
+          `${status.outbox.queued} queued, ${status.outbox.failing} failing`,
+        ],
+        [
+          "Search lag",
+          status.search.lagMs > 0,
+          "Wait for indexing to catch up.",
+          `${status.search.lagMs} ms`,
+        ],
+        [
+          "Jobs",
+          status.jobs.recoveryRequired > 0 || status.jobs.unknown > 0,
+          "Run hive job resolve.",
+          `${status.jobs.queued} queued, ${status.jobs.waitingDevice} waiting, ${status.jobs.recoveryRequired} recovery, ${status.jobs.unknown} unknown`,
+        ],
+        [
+          "Effects",
+          status.effects.unknown > 0,
+          "Run hive effect resolve.",
+          `${status.effects.unknown} unknown`,
+        ],
+        [
+          "Devices",
+          status.devices.online < status.devices.total,
+          "Bring offline devices online.",
+          `${status.devices.online} online / ${status.devices.total} total`,
+        ],
+        [
+          "Routines",
+          status.routines.overdue > 0,
+          "Check overdue routines.",
+          `${status.routines.overdue} overdue`,
+        ],
+      ]
+    : [];
+  return (
+    <section className="view">
+      <h2>Status</h2>
+      <dl className="kv">
+        <dt>Workspace</dt>
+        <dd className="mono">{props.ws}</dd>
+        <dt>WebSocket</dt>
+        <dd className={props.connection === "connected" ? "ok" : "warn"}>{props.connection}</dd>
+        <dt>Sync cursor</dt>
+        <dd className="mono" title={props.sync.cursor ?? ""}>
+          {props.sync.cursor ? props.sync.cursor.slice(-12) : "—"}
+        </dd>
+        <dt>Unsynced hints</dt>
+        <dd>{props.sync.unsynced}</dd>
+      </dl>
+      {status ? (
+        <div className="status-tiles">
+          {tiles.map(([name, amber, remedy, value]) => (
+            <article key={name} className={amber ? "amber" : ""}>
+              <h3>{name}</h3>
+              <strong>{value}</strong>
+              {amber && <p>{remedy}</p>}
+            </article>
+          ))}
+        </div>
+      ) : (
+        <p className="empty">Loading status…</p>
+      )}
+      {(props.error ?? props.sync.error) && (
+        <p className="error">{props.error ?? props.sync.error}</p>
+      )}
+    </section>
   );
 };
 

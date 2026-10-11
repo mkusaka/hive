@@ -152,6 +152,70 @@ type TaskHandler<T extends Command> = (
 
 type Change = Omit<Parameters<typeof appendChange>[1], "workspaceId">;
 
+const commandAudit = (
+  db: D1Database,
+  actorId: string,
+  envelope: Envelope,
+  response: unknown,
+  changes: Change[],
+  auditContext?: { conversationId?: string | null },
+) => {
+  const command = envelope.command as Record<string, unknown>;
+  const result = response as Record<string, unknown>;
+  const targetKey = [
+    `${String(command.type).split(".")[0]}Id`,
+    "channelId",
+    "conversationId",
+    "botId",
+    "routineId",
+    "subscriptionId",
+    "jobId",
+    "taskId",
+    "projectId",
+    "deviceId",
+    "memoryId",
+    "integrationId",
+  ].find((key) => typeof result[key] === "string" || typeof command[key] === "string");
+  const targetId = targetKey ? (result[targetKey] ?? command[targetKey]) : envelope.workspaceId;
+  const targetType = targetKey ? targetKey.slice(0, -2) : "workspace";
+  const destination = command.destination as Record<string, unknown> | undefined;
+  const conversationId =
+    auditContext?.conversationId ??
+    (typeof result.conversationId === "string"
+      ? result.conversationId
+      : typeof command.conversationId === "string"
+        ? command.conversationId
+        : typeof destination?.conversationId === "string"
+          ? destination.conversationId
+          : null);
+  const scope =
+    changes.find((change) => change.scope.startsWith("channel:"))?.scope ??
+    `workspace:${envelope.workspaceId}`;
+  return db
+    .prepare(
+      `INSERT INTO audit_log (id, workspace_id, actor_id, action, target_kind, target_id, data)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      crypto.randomUUID(),
+      envelope.workspaceId,
+      actorId,
+      String(command.type),
+      targetType,
+      String(targetId),
+      JSON.stringify({
+        commandType: command.type,
+        operationId: envelope.operationId,
+        revision: typeof result.revision === "number" ? result.revision : undefined,
+        state: typeof result.state === "string" ? result.state : undefined,
+        botId: typeof command.botId === "string" ? command.botId : undefined,
+        result: "accepted",
+        scope,
+        conversationId,
+      }),
+    );
+};
+
 /**
  * Runs the batch with one change row per `changes` entry; returns the touched scopes unless replayed. `actorId` keys
  * the receipt: the user, or the Run for a Run command.
@@ -163,8 +227,10 @@ const receipt = async <T>(
   statements: D1PreparedStatement[],
   response: T,
   changes: Change[],
+  auditContext?: { conversationId?: string | null },
 ) => {
   const { workspaceId } = envelope;
+  const audit = commandAudit(db, actorId, envelope, response, changes, auditContext);
   const result = await withOperationReceipt(
     db,
     {
@@ -174,7 +240,11 @@ const receipt = async <T>(
       requestDigest: await digest(envelope.command),
     },
     () => ({
-      statements: [...statements, ...changes.map((c) => appendChange(db, { workspaceId, ...c }))],
+      statements: [
+        ...statements,
+        audit,
+        ...changes.map((c) => appendChange(db, { workspaceId, ...c })),
+      ],
       status: 200,
       response,
     }),
@@ -1867,6 +1937,11 @@ const subscriptionCreate: Handler<SubscriptionCommand> = async (db, user, env) =
 const json = (value: unknown, stored: string) =>
   value === undefined ? stored : JSON.stringify(value);
 
+const destinationConversationId = (destination: string) => {
+  const parsed = JSON.parse(destination) as { conversationId?: unknown };
+  return typeof parsed.conversationId === "string" ? parsed.conversationId : null;
+};
+
 /** Revision CAS: a stale `expectedRevision` is 409 REVISION_CONFLICT. */
 const subscriptionUpdate: Handler<v.InferOutput<typeof SubscriptionUpdate>> = async (
   db,
@@ -1913,6 +1988,7 @@ const subscriptionUpdate: Handler<v.InferOutput<typeof SubscriptionUpdate>> = as
       revision: command.expectedRevision + 1,
     },
     [subscriptionChange(workspaceId, command.subscriptionId, command.expectedRevision + 1)],
+    { conversationId: destinationConversationId(current.destination) },
   );
   return explainFailure(run, async () => {
     const row = await loadSubscription(db, workspaceId, command.subscriptionId);
@@ -1934,7 +2010,7 @@ const subscriptionPause: Handler<v.InferOutput<typeof SubscriptionPause>> = asyn
   env,
 ) => {
   const { workspaceId, command } = env;
-  await loadSubscription(db, workspaceId, command.subscriptionId);
+  const current = await loadSubscription(db, workspaceId, command.subscriptionId);
   return receipt(
     db,
     user.userId,
@@ -1950,6 +2026,7 @@ const subscriptionPause: Handler<v.InferOutput<typeof SubscriptionPause>> = asyn
     ],
     { operationId: env.operationId, status: "accepted", subscriptionId: command.subscriptionId },
     [subscriptionChange(workspaceId, command.subscriptionId)],
+    { conversationId: destinationConversationId(current.destination) },
   );
 };
 
@@ -1960,7 +2037,7 @@ const subscriptionDelete: Handler<v.InferOutput<typeof SubscriptionDelete>> = as
   env,
 ) => {
   const { workspaceId, command } = env;
-  await loadSubscription(db, workspaceId, command.subscriptionId);
+  const current = await loadSubscription(db, workspaceId, command.subscriptionId);
   return receipt(
     db,
     user.userId,
@@ -1972,6 +2049,7 @@ const subscriptionDelete: Handler<v.InferOutput<typeof SubscriptionDelete>> = as
     ],
     { operationId: env.operationId, status: "accepted", subscriptionId: command.subscriptionId },
     [{ ...subscriptionChange(workspaceId, command.subscriptionId), op: "delete" }],
+    { conversationId: destinationConversationId(current.destination) },
   );
 };
 
@@ -2328,6 +2406,7 @@ const routineUpdate: Handler<v.InferOutput<typeof RoutineUpdate>> = async (db, u
       secret: null as string | null,
     },
     [routineChange(workspaceId, command.routineId, command.expectedRevision + 1)],
+    { conversationId: current.conversation_id },
   );
   const result = await explainFailure(run, async () => {
     const row = await loadRoutine(db, workspaceId, command.routineId);
@@ -2340,7 +2419,7 @@ const routineUpdate: Handler<v.InferOutput<typeof RoutineUpdate>> = async (db, u
 /** Stops new occurrences. Pausing a paused Routine changes nothing. */
 const routinePause: Handler<v.InferOutput<typeof RoutinePause>> = async (db, user, env) => {
   const { workspaceId, command } = env;
-  await loadRoutine(db, workspaceId, command.routineId);
+  const current = await loadRoutine(db, workspaceId, command.routineId);
   return receipt(
     db,
     user.userId,
@@ -2355,6 +2434,7 @@ const routinePause: Handler<v.InferOutput<typeof RoutinePause>> = async (db, use
     ],
     { operationId: env.operationId, status: "accepted", routineId: command.routineId },
     [routineChange(workspaceId, command.routineId)],
+    { conversationId: current.conversation_id },
   );
 };
 
@@ -2377,6 +2457,7 @@ const routineResume: Handler<v.InferOutput<typeof RoutineResume>> = async (db, u
     ],
     { operationId: env.operationId, status: "accepted", routineId: command.routineId, nextFireAt },
     [routineChange(workspaceId, command.routineId)],
+    { conversationId: current.conversation_id },
   );
 };
 
@@ -2402,6 +2483,7 @@ const routineRun: Handler<v.InferOutput<typeof RoutineRun>> = async (db, user, e
       scheduledAt,
     },
     occurrence.changes,
+    { conversationId: routine.conversation_id },
   );
 };
 
@@ -2460,7 +2542,7 @@ const routineRotateSecret: Handler<v.InferOutput<typeof RoutineRotateSecret>> = 
 /** Deletes the Routine and its occurrences in one batch; Jobs it created stay (they do not reference the Routine). */
 const routineDelete: Handler<v.InferOutput<typeof RoutineDelete>> = async (db, user, env) => {
   const { workspaceId, command } = env;
-  await loadRoutine(db, workspaceId, command.routineId);
+  const routine = await loadRoutine(db, workspaceId, command.routineId);
   return receipt(
     db,
     user.userId,
@@ -2481,6 +2563,7 @@ const routineDelete: Handler<v.InferOutput<typeof RoutineDelete>> = async (db, u
     ],
     { operationId: env.operationId, status: "accepted", routineId: command.routineId },
     [routineChange(workspaceId, command.routineId)],
+    { conversationId: routine.conversation_id },
   );
 };
 

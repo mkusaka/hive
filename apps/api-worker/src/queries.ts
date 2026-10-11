@@ -9,6 +9,7 @@ import { displayState } from "@hive/db";
 import { HttpError } from "./errors.ts";
 import { placementDevices } from "./executor.ts";
 import { deviceReasons } from "./placement.ts";
+import { headCursor, permittedScopes } from "./sync.ts";
 
 const notFound = (what: string) => new HttpError("NOT_FOUND", `${what} not found`);
 const placeholders = (ids: string[]) => ids.map(() => "?").join(", ");
@@ -722,4 +723,343 @@ export const getRunApproval = async (
     .first<ApprovalStatus>();
   if (!row) throw notFound("approval");
   return row;
+};
+
+type AuditRow = {
+  id: string;
+  at: string;
+  actorId: string;
+  kind: string;
+  targetType: string;
+  targetId: string;
+  data: string | null;
+  conversationId: string | null;
+};
+
+const auditCursor = (row: Pick<AuditRow, "at" | "id">) =>
+  btoa(JSON.stringify({ at: row.at, id: row.id }))
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/, "");
+
+const parseAuditCursor = (value: string) => {
+  try {
+    const decoded = atob(value.replaceAll("-", "+").replaceAll("_", "/"));
+    const parsed = JSON.parse(decoded) as { at?: unknown; id?: unknown };
+    return typeof parsed.at === "string" &&
+      Number.isFinite(Date.parse(parsed.at)) &&
+      typeof parsed.id === "string" &&
+      parsed.id.length > 0
+      ? { at: parsed.at, id: parsed.id }
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+/** Predicates share the message read rule, including a thread's parent and participant-only DMs. */
+const conversationAccess = (id: string) => `EXISTS (
+  SELECT 1 FROM conversations c WHERE c.workspace_id = ?1 AND c.id = ${id} AND ${mayRead("?2")})`;
+const jobInputMatch = (job: string) =>
+  `(i.workspace_id = ${job}.workspace_id AND ('inbox:' || i.id = ${job}.trigger_key OR i.batch_id = ${job}.inbox_batch_id))`;
+const jobAccess = (job: string) => `(${job}.task_id IS NOT NULL OR (
+  EXISTS (SELECT 1 FROM inbox_items i WHERE ${jobInputMatch(job)})
+  AND NOT EXISTS (SELECT 1 FROM inbox_items i WHERE ${jobInputMatch(job)}
+    AND NOT ${conversationAccess("i.conversation_id")})))`;
+const jobConversation = (job: string) =>
+  `(SELECT MIN(i.conversation_id) FROM inbox_items i WHERE ${jobInputMatch(job)})`;
+
+const auditActorLabel = async (db: D1Database, workspaceId: string, actorId: string) => {
+  const row = await db
+    .prepare(
+      `SELECT COALESCE(u.email, a.display_name, b.name, x.actor_id) AS label
+         FROM (SELECT ? AS actor_id) x
+         LEFT JOIN users u ON u.id = x.actor_id
+         LEFT JOIN actors a ON a.workspace_id = ? AND a.id = x.actor_id
+         LEFT JOIN runs r ON r.workspace_id = ? AND r.id = x.actor_id
+         LEFT JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
+         LEFT JOIN bots b ON b.workspace_id = j.workspace_id AND b.id = j.bot_id`,
+    )
+    .bind(actorId, workspaceId, workspaceId)
+    .first<{ label: string }>();
+  return row?.label ?? actorId;
+};
+
+const auditTargetLabel = async (
+  db: D1Database,
+  workspaceId: string,
+  target: Pick<AuditRow, "targetType" | "targetId">,
+) => {
+  const table =
+    target.targetType === "channel"
+      ? "channels"
+      : target.targetType === "bot"
+        ? "bots"
+        : target.targetType === "routine"
+          ? "routines"
+          : null;
+  if (!table) return target.targetId;
+  const row = await db
+    .prepare(`SELECT name FROM ${table} WHERE workspace_id = ? AND id = ?`)
+    .bind(workspaceId, target.targetId)
+    .first<{ name: string }>();
+  return row?.name ?? target.targetId;
+};
+
+/**
+ * Immutable command entries are appended with their receipts. Approval, effect and Run lifecycle entries are read
+ * from their durable rows so the API contains the lifecycle facts without storing raw command inputs.
+ */
+export const listAudit = async (
+  db: D1Database,
+  input: {
+    workspaceId: string;
+    userId: string;
+    cursor?: string;
+    kinds?: string;
+    actor?: string;
+    since?: string;
+    limit: number;
+  },
+) => {
+  const member = await db
+    .prepare("SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?")
+    .bind(input.workspaceId, input.userId)
+    .first<{ role: string }>();
+  if (!member) throw new HttpError("FORBIDDEN", "workspace membership required");
+  const params: (string | number)[] = [
+    input.workspaceId,
+    input.userId,
+    Number(member.role === "owner"),
+  ];
+  const bind = (value: string | number) => `?${params.push(value)}`;
+  const filters = [
+    `(?3 OR ${conversationAccess("a.conversationId")} OR (
+    a.conversationId IS NULL AND EXISTS (
+      SELECT 1 FROM channel_members cm JOIN actors ca ON ca.workspace_id = cm.workspace_id AND ca.id = cm.actor_id
+      WHERE cm.workspace_id = ?1 AND 'channel:' || cm.channel_id = json_extract(a.data, '$.scope') AND ca.user_id = ?2)))`,
+  ];
+  if (input.kinds !== undefined) {
+    const kinds = input.kinds.split(",");
+    if (kinds.some((kind) => !/^[a-z]+(?:[._][a-z]+)*$/.test(kind)))
+      throw new HttpError("INVALID_INPUT", "kinds must be comma-separated exact kinds");
+    filters.push(`a.kind IN (${kinds.map(bind).join(",")})`);
+  }
+  if (input.actor !== undefined) filters.push(`a.actorId = ${bind(input.actor)}`);
+  if (input.since !== undefined) {
+    const since = Date.parse(input.since);
+    if (!Number.isFinite(since))
+      throw new HttpError("INVALID_INPUT", "since must be an ISO timestamp");
+    filters.push(`a.at >= ${bind(new Date(since).toISOString())}`);
+  }
+  if (input.cursor !== undefined) {
+    const cursor = parseAuditCursor(input.cursor);
+    if (!cursor) throw new HttpError("INVALID_INPUT", "invalid audit cursor");
+    const at = bind(cursor.at);
+    filters.push(`(a.at < ${at} OR a.at = ${at} AND a.id < ${bind(cursor.id)})`);
+  }
+  const limit = bind(input.limit + 1);
+  // D1 limits compound SELECT terms: four sources, with lifecycle pairs expanded via JSON rather than more UNIONs.
+  const { results } = await db
+    .prepare(`
+    WITH audit AS (
+      SELECT id, created_at AS at, actor_id AS actorId, action AS kind, target_kind AS targetType,
+        target_id AS targetId, data, json_extract(data, '$.conversationId') AS conversationId
+      FROM audit_log WHERE workspace_id = ?1
+      UNION ALL
+      SELECT p.id || ':' || json_extract(e.value, '$.suffix'), json_extract(e.value, '$.at'),
+        json_extract(e.value, '$.actor'), 'approval.' || json_extract(e.value, '$.suffix'), 'approval', p.id,
+        json_object('state', json_extract(e.value, '$.state')), ${jobConversation("j")}
+      FROM approvals p JOIN runs r ON r.workspace_id = p.workspace_id AND r.id = p.run_id
+        JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
+        CROSS JOIN json_each(json_array(
+          json_object('suffix', 'requested', 'at', p.requested_at, 'actor', p.run_id, 'state', 'pending'),
+          json_object('suffix', 'resolved', 'at', p.resolved_at, 'actor', COALESCE(p.resolved_by, 'service:approval-expiry'), 'state', p.state))) e
+      WHERE p.workspace_id = ?1 AND json_extract(e.value, '$.at') IS NOT NULL
+      UNION ALL
+      SELECT e.id || ':state', e.updated_at, e.run_id,
+        'effect.' || CASE e.state WHEN 'succeeded' THEN 'performed' ELSE e.state END, 'effect', e.id,
+        json_object('state', e.state), ${jobConversation("j")}
+      FROM effects e JOIN runs r ON r.workspace_id = e.workspace_id AND r.id = e.run_id
+        JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
+      WHERE e.workspace_id = ?1 AND e.state IN ('succeeded', 'failed', 'unknown')
+      UNION ALL
+      SELECT r.id || ':' || json_extract(e.value, '$.suffix'), json_extract(e.value, '$.at'),
+        r.id, 'run.' || json_extract(e.value, '$.suffix'), 'run', r.id,
+        json_object('state', json_extract(e.value, '$.state'), 'deviceId', r.device_id), ${jobConversation("j")}
+      FROM runs r JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
+        CROSS JOIN json_each(json_array(
+          json_object('suffix', 'started', 'at', COALESCE(r.started_at, r.created_at), 'state', 'started'),
+          json_object('suffix', 'finished', 'at', r.finished_at, 'state', r.state))) e
+      WHERE r.workspace_id = ?1 AND json_extract(e.value, '$.at') IS NOT NULL
+    )
+    SELECT a.* FROM audit a WHERE ${filters.join(" AND ")}
+      ORDER BY a.at DESC, a.id DESC LIMIT ${limit}
+  `)
+    .bind(...params)
+    .all<AuditRow>();
+  const page = results.slice(0, input.limit);
+  return {
+    entries: await Promise.all(
+      page.map(async (row) => {
+        const stored = row.data ? (JSON.parse(row.data) as Record<string, unknown>) : {};
+        const details = Object.fromEntries(
+          [
+            "commandType",
+            "operationId",
+            "revision",
+            "state",
+            "botId",
+            "result",
+            "scope",
+            "conversationId",
+            "deviceId",
+          ]
+            .filter((key) => typeof stored[key] === "string" || typeof stored[key] === "number")
+            .map((key) => [
+              key,
+              typeof stored[key] === "string" ? stored[key].slice(0, 200) : stored[key],
+            ]),
+        );
+        const [actorLabel, label] = await Promise.all([
+          auditActorLabel(db, input.workspaceId, row.actorId),
+          auditTargetLabel(db, input.workspaceId, row),
+        ]);
+        return {
+          id: row.id,
+          at: row.at,
+          actorId: row.actorId,
+          actorLabel,
+          kind: row.kind,
+          target: { type: row.targetType, id: row.targetId, label },
+          summary:
+            `${row.kind}${typeof details.state === "string" ? ` ${details.state}` : ""}`.slice(
+              0,
+              200,
+            ),
+          details,
+        };
+      }),
+    ),
+    cursor: results.length > input.limit ? auditCursor(page.at(-1)!) : null,
+  };
+};
+
+export const getStatus = async (db: D1Database, input: { workspaceId: string; userId: string }) => {
+  const now = Date.now();
+  const member = await db
+    .prepare("SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?")
+    .bind(input.workspaceId, input.userId)
+    .first<{ role: string }>();
+  if (!member) throw new HttpError("FORBIDDEN", "workspace membership required");
+  const scopes = await permittedScopes(db, input.workspaceId, {
+    kind: "user",
+    userId: input.userId,
+  });
+  const sourceAccess = `(
+    json_extract(o.payload, '$.sourceKind') = 'message' AND EXISTS (
+      SELECT 1 FROM messages m WHERE m.workspace_id = o.workspace_id
+        AND m.id = json_extract(o.payload, '$.sourceId') AND ${conversationAccess("m.conversation_id")})
+    OR json_extract(o.payload, '$.sourceKind') = 'task' AND EXISTS (
+      SELECT 1 FROM tasks t WHERE t.workspace_id = o.workspace_id AND t.id = json_extract(o.payload, '$.sourceId'))
+    OR json_extract(o.payload, '$.sourceKind') = 'memory' AND EXISTS (
+      SELECT 1 FROM memories m WHERE m.workspace_id = o.workspace_id AND m.id = json_extract(o.payload, '$.sourceId')
+        AND (m.scope_kind <> 'channel' OR EXISTS (
+          SELECT 1 FROM conversations c WHERE c.workspace_id = m.workspace_id AND c.channel_id = m.scope_id AND ${mayRead("?2")})))
+    OR EXISTS (SELECT 1 FROM search_documents d WHERE d.workspace_id = o.workspace_id
+      AND d.source_kind = json_extract(o.payload, '$.sourceKind') AND d.source_id = json_extract(o.payload, '$.sourceId')
+      AND (d.scope IN (SELECT value FROM json_each(?4)) OR d.scope LIKE 'bot:%' OR d.scope LIKE 'task:%')))`;
+  const counts = (await db
+    .prepare(`
+    WITH visible_jobs AS (
+      SELECT j.* FROM jobs j WHERE j.workspace_id = ?1 AND (?3 OR ${jobAccess("j")})
+    ), visible_outbox AS (
+      SELECT o.* FROM outbox o WHERE o.workspace_id = ?1 AND (?3
+        OR o.topic = 'search.index' AND ${sourceAccess}
+        OR o.topic = 'event.route' AND EXISTS (
+          SELECT 1 FROM events e WHERE e.workspace_id = o.workspace_id AND e.id = json_extract(o.payload, '$.eventId')
+            AND (${conversationAccess("json_extract(e.data, '$.conversationId')")}
+              OR e.subject_kind = 'message' AND EXISTS (
+                SELECT 1 FROM messages m WHERE m.workspace_id = e.workspace_id AND m.id = e.subject_id
+                  AND ${conversationAccess("m.conversation_id")})
+              OR json_extract(e.data, '$.conversationId') IS NULL AND (e.subject_kind IS NULL OR e.subject_kind <> 'message')))
+        OR o.topic = 'run.finished' AND EXISTS (
+          SELECT 1 FROM runs r JOIN visible_jobs j ON j.id = r.job_id
+            WHERE r.workspace_id = o.workspace_id AND r.id = json_extract(o.payload, '$.runId'))
+        OR o.topic IN ('effect.perform', 'effect.reconcile') AND EXISTS (
+          SELECT 1 FROM effects e JOIN runs r ON r.workspace_id = e.workspace_id AND r.id = e.run_id
+            JOIN visible_jobs j ON j.id = r.job_id
+            WHERE e.workspace_id = o.workspace_id AND e.id = json_extract(o.payload, '$.effectId')))
+    )
+    SELECT o.*, j.*, d.*,
+      (SELECT MAX(created_at) FROM change_log WHERE workspace_id = ?1
+        AND (?3 OR scope IN (SELECT value FROM json_each(?4)))) AS headAt,
+      (SELECT MAX(indexed_at) FROM search_documents WHERE workspace_id = ?1
+        AND (?3 OR scope IN (SELECT value FROM json_each(?4)) OR scope LIKE 'bot:%' OR scope LIKE 'task:%')) AS indexedThrough,
+      (SELECT COUNT(*) FROM effects e JOIN runs r ON r.workspace_id = e.workspace_id AND r.id = e.run_id
+        JOIN visible_jobs j ON j.id = r.job_id WHERE e.workspace_id = ?1 AND e.state = 'unknown') AS unknownEffects,
+      (SELECT COUNT(*) FROM routines r WHERE r.workspace_id = ?1 AND r.enabled = 1 AND r.next_fire_at < ?7
+        AND (?3 OR r.conversation_id IS NULL OR ${conversationAccess("r.conversation_id")})) AS overdue
+    FROM (
+      SELECT COALESCE(SUM(state IN ('pending', 'sending')), 0) AS outboxQueued,
+        COALESCE(SUM(state <> 'sent' AND (state = 'dead' OR attempt > 1 OR state = 'sending' AND attempt > 0 AND lease_until < ?5)), 0) AS failing,
+        MIN(CASE WHEN state <> 'sent' THEN created_at END) AS oldest,
+        MIN(CASE WHEN topic = 'search.index' AND state <> 'sent' THEN created_at END) AS pendingIndexAt
+      FROM visible_outbox
+    ) o CROSS JOIN (
+      SELECT COALESCE(SUM(state = 'queued'), 0) AS jobsQueued,
+        COALESCE(SUM(state = 'waiting_device'), 0) AS waitingDevice,
+        COALESCE(SUM(state = 'recovery_required'), 0) AS recoveryRequired,
+        (SELECT COUNT(DISTINCT r.job_id) FROM runs r JOIN visible_jobs j ON j.id = r.job_id
+          WHERE r.workspace_id = ?1 AND r.state = 'unknown') AS unknownJobs
+      FROM visible_jobs
+    ) j CROSS JOIN (
+      SELECT COALESCE(SUM(last_heartbeat_at >= ?6), 0) AS online, COUNT(*) AS total
+      FROM devices WHERE workspace_id = ?1 AND revoked_at IS NULL
+    ) d
+  `)
+    .bind(
+      input.workspaceId,
+      input.userId,
+      Number(member.role === "owner"),
+      JSON.stringify(scopes),
+      new Date(now).toISOString(),
+      new Date(now - 45_000).toISOString(),
+      new Date(now - 5 * 60_000).toISOString(),
+    )
+    .first<{
+      headAt: string | null;
+      indexedThrough: string | null;
+      pendingIndexAt: string | null;
+      outboxQueued: number;
+      failing: number;
+      oldest: string | null;
+      jobsQueued: number;
+      waitingDevice: number;
+      recoveryRequired: number;
+      unknownJobs: number;
+      unknownEffects: number;
+      online: number;
+      total: number;
+      overdue: number;
+    }>())!;
+  const ageMs = (at: string | null) => (at ? Math.max(0, now - Date.parse(at)) : 0);
+  return {
+    sync: { head: await headCursor(db, input.workspaceId), ageMs: ageMs(counts.headAt) },
+    outbox: {
+      queued: counts.outboxQueued,
+      failing: counts.failing,
+      oldestAgeMs: ageMs(counts.oldest),
+    },
+    search: { indexedThrough: counts.indexedThrough, lagMs: ageMs(counts.pendingIndexAt) },
+    jobs: {
+      queued: counts.jobsQueued,
+      waitingDevice: counts.waitingDevice,
+      recoveryRequired: counts.recoveryRequired,
+      unknown: counts.unknownJobs,
+    },
+    effects: { unknown: counts.unknownEffects },
+    devices: { online: counts.online, total: counts.total },
+    routines: { overdue: counts.overdue },
+  };
 };

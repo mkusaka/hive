@@ -218,6 +218,27 @@ export const listDevices = (c: Client, workspaceId: string) =>
 /** No cursor: the bootstrap cursor (§12.3). */
 export const syncChanges = (c: Client, workspaceId: string, cursor?: string) =>
   c.get(inWorkspace("sync/changes", workspaceId, cursor ? { cursor } : {}));
+export const listAudit = (
+  c: Client,
+  workspaceId: string,
+  filter: { kind?: string; since?: string; cursor?: string; actor?: string } = {},
+) =>
+  c.get(
+    inWorkspace(
+      "audit",
+      workspaceId,
+      Object.fromEntries(
+        Object.entries({
+          kinds: filter.kind,
+          since: filter.since,
+          cursor: filter.cursor,
+          actor: filter.actor,
+        }).filter(([, value]) => value !== undefined),
+      ) as Record<string, string>,
+    ),
+  );
+export const getStatus = (c: Client, workspaceId: string) =>
+  c.get(inWorkspace("status", workspaceId));
 
 // ------------------------------------------------- Projects and Tasks (§4)
 

@@ -34,6 +34,8 @@ hive approval resolve <approval-id> (--allow | --deny) [--reason <text>]
 hive approval watch [--timeout <s>]                # prints each new pending approval once, polls every 2 s
 hive effect list [--state <state>] [--run <run-id>]  # external effects, newest first
 hive effect resolve <effect-id> (--succeeded <external-id> [--url <url>] | --failed | --retry)
+hive audit list [--kind <kind,...>] [--since <ISO>] [--cursor <cursor>] [--actor <actor-id>]
+hive status                                           # sync, outbox, search, Jobs, effects, devices, and routines
 hive search <query> [--kinds message,task,memory]   # GET /v1/search; 1-2 characters take the bounded short path
 hive memory write --scope <workspace|channel:<id>|project:<id>|bot:<id>|task:<id>> (--content <text> | --file <path|->)
 hive memory list --scope <...>                         # live memories of the scope, newest first

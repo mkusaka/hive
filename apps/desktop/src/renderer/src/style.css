@@ -246,6 +246,13 @@ button.icon.active {
   line-height: 16px;
   text-align: center;
 }
+.status-dot {
+  width: 7px;
+  height: 7px;
+  margin-left: auto;
+  border-radius: 50%;
+  background: var(--warning);
+}
 .collapsed .count {
   position: absolute;
   top: 0;
@@ -737,6 +744,56 @@ h3 {
 }
 h4 {
   font-weight: 500;
+}
+.audit-filters,
+.audit-list li,
+.actor {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.audit-filters {
+  margin-bottom: 16px;
+}
+.audit-list li {
+  flex-wrap: wrap;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--bg-quaternary);
+}
+.audit-list time {
+  min-width: 180px;
+}
+.actor .avatar {
+  width: 20px;
+  height: 20px;
+  font-size: 10px;
+}
+.audit-list .link {
+  width: auto;
+  padding: 0;
+}
+.status-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+  margin-top: 20px;
+}
+.status-tiles article {
+  padding: 12px;
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--r-lg);
+}
+.status-tiles article.amber {
+  border-color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+}
+.status-tiles h3,
+.status-tiles p {
+  margin: 0 0 6px;
+}
+.status-tiles p {
+  color: var(--text-2);
+  font-size: 13px;
 }
 .split {
   display: grid;
