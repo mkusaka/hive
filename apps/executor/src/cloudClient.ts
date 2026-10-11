@@ -14,6 +14,7 @@ import type {
   RunContext,
   RunObservation,
   SearchResult,
+  SessionStreamKey,
   UploadComplete,
   UploadInit,
   UploadInitialized,
@@ -72,6 +73,8 @@ export type CloudClient = {
   uploadInit(input: UploadInit): Promise<UploadInitialized>;
   uploadPart(uploadId: string, bytes: Uint8Array): Promise<void>;
   uploadComplete(input: UploadComplete): Promise<void>;
+  /** The newest complete snapshot of a native session stream (§13.3), raw JSONL; null when there is none. */
+  getSessionSnapshot(provider: string, session: SessionStreamKey): Promise<Uint8Array | null>;
   /** A client acting as the Run behind `capabilityToken`. */
   forRun(capabilityToken: string): RunApi;
 };
@@ -85,7 +88,7 @@ export const createCloudClient = ({
   token: string;
   fetch?: (input: URL, init: RequestInit) => Promise<Response>;
 }): CloudClient => {
-  const request = async <T>(
+  const send = async (
     method: "GET" | "POST" | "PUT",
     path: string,
     body?: unknown,
@@ -101,9 +104,8 @@ export const createCloudClient = ({
       },
       body: body === undefined ? undefined : raw ? body : JSON.stringify(body),
     });
-    const json: unknown = await res.json().catch(() => null);
     if (!res.ok) {
-      const error = (json ?? {}) as Partial<ApiError>;
+      const error = ((await res.json().catch(() => null)) ?? {}) as Partial<ApiError>;
       throw new CloudError(
         res.status,
         error.code ?? "HTTP",
@@ -111,8 +113,10 @@ export const createCloudClient = ({
         error.reason,
       );
     }
-    return json as T;
+    return res;
   };
+  const request = async <T>(...args: Parameters<typeof send>) =>
+    (await (await send(...args)).json().catch(() => null)) as T;
 
   // A device belongs to exactly one Workspace; learned once from the principal.
   let workspaceId: Promise<string> | undefined;
@@ -172,6 +176,16 @@ export const createCloudClient = ({
     },
     uploadComplete: async (input) => {
       await request("POST", "/v1/executor/uploads/complete", input);
+    },
+    getSessionSnapshot: async (provider, { sessionId, subpath }) => {
+      const query = subpath ? `?${new URLSearchParams({ subpath })}` : "";
+      const path = `/v1/executor/sessions/${encodeURIComponent(provider)}/${encodeURIComponent(sessionId)}${query}`;
+      try {
+        return new Uint8Array(await (await send("GET", path)).arrayBuffer());
+      } catch (error) {
+        if (error instanceof CloudError && error.code === "NOT_FOUND") return null;
+        throw error;
+      }
     },
     forRun: (capabilityToken) => ({
       // A random key per call: each tool call is a new operation (the model retries by calling again).

@@ -7,6 +7,8 @@ import type {
   SDKMessage,
   SDKResultSuccess,
   SDKSystemMessage,
+  SessionStore,
+  SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
 import { describe, expect, it } from "vitest";
 import { claudeAdapter, type QueryFn } from "../src/adapters/claude.ts";
@@ -77,6 +79,19 @@ const launch = (overrides: Partial<LaunchContext> = {}): LaunchContext => ({
   observe: async () => {},
   ...overrides,
 });
+
+/** A SessionStore whose `load` answers `entries`, recording the session ids asked for. */
+const fakeStore = (entries: SessionStoreEntry[] | null) => {
+  const loads: unknown[] = [];
+  const store: SessionStore = {
+    append: async () => {},
+    load: async (key) => {
+      loads.push(key.sessionId);
+      return entries;
+    },
+  };
+  return { store, loads };
+};
 
 describe("claudeAdapter", () => {
   it("runs a Claude turn: observation, transcript, summary and Bot reply", async () => {
@@ -173,6 +188,65 @@ describe("claudeAdapter", () => {
       summary: "claude: stopped",
     });
     expect(signal?.aborted).toBe(true);
+  });
+
+  describe("session store", () => {
+    const earlier = "66666666-6666-4666-8666-666666666666";
+    const withEarlier = launch({ context: { ...context, previousProviderSessionId: earlier } });
+
+    it("resumes an earlier Run's session only when the store can load it", async () => {
+      const dir = await stateDir();
+      const { store, loads } = fakeStore([{ type: "user", uuid: "u1" }]);
+      const { calls, queryFn } = fakeQuery([init, result()]);
+      await (
+        await claudeAdapter({ stateDir: dir, queryFn, sessionStore: store }).start(withEarlier)
+      ).waitForExit();
+      expect(loads).toEqual([earlier]);
+      expect(calls[0]?.options).toMatchObject({
+        resume: earlier,
+        sessionStore: store,
+        sessionStoreFlush: "eager",
+      });
+      // A successor gets the request again (with any replies), not the restart prompt.
+      expect(calls[0]?.prompt).toContain("Request:\nSay hello.");
+    });
+
+    it.each([null, []])("starts fresh when the store loads %j", async (missing) => {
+      const { calls, queryFn } = fakeQuery([init, result()]);
+      const exit = await (
+        await claudeAdapter({
+          stateDir: await stateDir(),
+          queryFn,
+          sessionStore: fakeStore(missing).store,
+        }).start(withEarlier)
+      ).waitForExit();
+      expect(exit.code).toBe(0);
+      expect(calls[0]?.options.resume).toBeUndefined();
+    });
+
+    it("marks the exit summary degraded on mirror_error and journals it", async () => {
+      const dir = await stateDir();
+      const mirrorError = {
+        type: "system",
+        subtype: "mirror_error",
+        error: "ENOSPC",
+        key: { projectKey: "p", sessionId },
+        uuid: "77777777-7777-4777-8777-777777777777",
+        session_id: sessionId,
+      } as SDKMessage;
+      const exit = await (
+        await claudeAdapter({
+          stateDir: dir,
+          queryFn: fakeQuery([init, mirrorError, mirrorError, result()]).queryFn,
+          sessionStore: fakeStore(null).store,
+        }).start(launch())
+      ).waitForExit();
+      expect(exit).toMatchObject({
+        code: 0,
+        summary: "Hello, hive!; session mirror degraded: 2 mirror_error",
+      });
+      expect(await transcriptOf(dir)).toContainEqual(mirrorError);
+    });
   });
 
   describe("reconcile", () => {

@@ -847,6 +847,8 @@ export type RunContext = {
   memories: { id: string; scopeKind: string; content: string; createdAt: string }[];
   /** Up to 5 search hits for the trigger item's body (never the trigger message itself). */
   related: { sourceKind: SearchKind; sourceId: string; title: string; snippet: string }[];
+  /** The native session of the latest earlier Run of this Job that reported one: what a successor resumes (§13.3). */
+  previousProviderSessionId: string | null;
 };
 
 /**
@@ -877,12 +879,24 @@ export const maxTranscriptPartBytes = 8 * 1024 * 1024;
 
 const Sha256Hex = v.pipe(v.string(), v.regex(/^[0-9a-f]{64}$/));
 
+/**
+ * A native provider session stream (§13.3) instead of the Run's transcript. `subpath` is opaque (a sub-agent
+ * transcript); omitted for the main one.
+ */
+export const SessionStreamKey = v.strictObject({
+  sessionId: v.pipe(v.string(), v.regex(/^[A-Za-z0-9_-]{1,128}$/)),
+  subpath: v.optional(v.pipe(v.string(), v.minLength(1), v.maxLength(512))),
+});
+export type SessionStreamKey = v.InferInput<typeof SessionStreamKey>;
+
+/** `session` needs `provider`: it is part of the session key. */
 export const UploadInit = v.strictObject({
   runId: RunId,
   partSeq: v.pipe(v.number(), v.integer(), v.minValue(0)),
   byteSize: v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(maxTranscriptPartBytes)),
   sha256: Sha256Hex,
   provider: v.optional(Name),
+  session: v.optional(SessionStreamKey),
 });
 export type UploadInit = v.InferInput<typeof UploadInit>;
 /** `committed`: the part is already in the manifest with this hash, so the PUT can be skipped. */
@@ -892,6 +906,7 @@ export type UploadInitialized = { uploadId: string; partId: string; committed: b
 export const UploadComplete = v.strictObject({
   runId: RunId,
   lastPartSeq: v.pipe(v.number(), v.integer(), v.minValue(-1)),
+  session: v.optional(SessionStreamKey),
 });
 export type UploadComplete = v.InferInput<typeof UploadComplete>;
 

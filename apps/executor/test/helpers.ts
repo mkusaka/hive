@@ -34,6 +34,7 @@ export const context: RunContext = {
   replies: [],
   memories: [],
   related: [],
+  previousProviderSessionId: null,
 };
 
 /**
@@ -158,6 +159,7 @@ export const fakeCloud = (overrides: Partial<CloudClient> = {}) => {
     },
     uploadPart: async (uploadId) => void calls.push(`put:${uploadId}`),
     uploadComplete: async (input) => void calls.push(`complete:${input.lastPartSeq}`),
+    getSessionSnapshot: async () => null,
     ...overrides,
   };
   return { cloud, calls, submitted, observed };

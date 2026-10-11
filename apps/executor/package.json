@@ -11,6 +11,7 @@
     "./adapters/codex": "./src/adapters/codex.ts",
     "./journal": "./src/journal.ts",
     "./uploader": "./src/uploader.ts",
+    "./sessionStore": "./src/sessionStore.ts",
     "./environments": "./src/environments.ts",
     "./capabilities": "./src/capabilities.ts"
   },

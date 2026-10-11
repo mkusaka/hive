@@ -7,6 +7,9 @@
 // directory, or the environment's checkout root from `<state-dir>/environments.json` (`cwdMode: environment`).
 // `hive_wait_for_reply` ends the Run: once its tool result appears in the stream, the adapter aborts the query (no
 // further model turn) and exits with `waitingFor`, which the runner submits as a `waiting` result (§8.2).
+// With a `sessionStore` (sessionStore.ts) the SDK mirrors the native session to it, and a Run resumes the session an
+// earlier Run of the Job left (`previousProviderSessionId`) only when the store can load it; otherwise it starts
+// fresh. A `mirror_error` is journaled like every message and marks the exit summary degraded.
 import { mkdir, open, readFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -14,6 +17,7 @@ import {
   query,
   type SDKMessage,
   type SDKResultMessage,
+  type SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
 import { runCwd } from "../environments.ts";
 import type { AgentAdapter, LaunchContext, RunningAgent } from "../runner.ts";
@@ -112,11 +116,13 @@ export const claudeAdapter = ({
   queryFn = query,
   maxTurns = 4,
   approvalPollMs,
+  sessionStore,
 }: {
   stateDir: string;
   queryFn?: QueryFn;
   maxTurns?: number;
   approvalPollMs?: number;
+  sessionStore?: SessionStore;
 }): AgentAdapter & { describe(): Promise<Record<string, boolean>> } => ({
   // Honest flags for what this adapter does today (§20.4).
   describe: async () => ({
@@ -134,7 +140,8 @@ export const claudeAdapter = ({
     const previous = await readTranscript(transcript);
     const done = previous.findLast((m): m is SDKResultMessage => m.type === "result");
     if (done) return { requestStop: async () => {}, waitForExit: async () => toExit(done) };
-    const sessionId = previous.find((m) => m.type === "system" && m.subtype === "init")?.session_id;
+    // This Run restarted on this device: resume its own session (the SDK's local files are here).
+    const restarted = previous.find((m) => m.type === "system" && m.subtype === "init")?.session_id;
 
     // Preflight: an environment run needs the environment's checkout on this device.
     const policy = ctx.context.bot.toolPolicy;
@@ -152,6 +159,18 @@ export const claudeAdapter = ({
       return { requestStop: async () => {}, waitForExit: async () => exit };
     }
     const roots = [...new Set([cwd, await realpath(cwd)])];
+    // An earlier Run's session, possibly from another device: only when the store holds it complete.
+    const earlier = ctx.context.previousProviderSessionId;
+    const loaded = earlier
+      ? await sessionStore
+          ?.load({ projectKey: cwd, sessionId: earlier })
+          .catch((error: unknown) => {
+            console.error(`loading session ${earlier} failed; starting fresh`, error);
+            return null;
+          })
+      : null;
+    const sessionId = restarted ?? (loaded?.length ? earlier! : undefined);
+    let mirrorErrors = 0;
 
     const abort = new AbortController();
     let stopReason: string | undefined;
@@ -173,7 +192,7 @@ export const claudeAdapter = ({
       try {
         let result: SDKResultMessage | undefined;
         const messages = queryFn({
-          prompt: sessionId
+          prompt: restarted
             ? "Your previous attempt was interrupted. Give your final answer to the last request."
             : userPrompt(ctx.context),
           options: {
@@ -195,6 +214,8 @@ export const claudeAdapter = ({
             mcpServers: tools.length ? { hive: hiveMcpServer(tools) } : {},
             strictMcpConfig: true,
             maxTurns,
+            // Eager: each batch reaches the fsynced journal as it lands, not only at end of turn.
+            ...(sessionStore ? { sessionStore, sessionStoreFlush: "eager" as const } : {}),
             ...(sessionId ? { resume: sessionId } : {}),
           },
         });
@@ -206,6 +227,10 @@ export const claudeAdapter = ({
             await ctx
               .observe("runtime.run.started", { providerSessionId: message.session_id })
               .catch((error: unknown) => console.error("runtime.run.started failed", error));
+          }
+          if (message.type === "system" && message.subtype === "mirror_error") {
+            mirrorErrors++;
+            console.error(`session mirror error for run ${ctx.runId}: ${message.error}`);
           }
           if (message.type === "result") result = message;
           if (message.type === "assistant") {
@@ -241,7 +266,17 @@ export const claudeAdapter = ({
         await file.close();
       }
     };
-    const exited = run();
+    const exited = run().then((exit) =>
+      mirrorErrors
+        ? {
+            ...exit,
+            summary: truncate(
+              `${exit.summary}; session mirror degraded: ${mirrorErrors} mirror_error`,
+              kib8,
+            ),
+          }
+        : exit,
+    );
     return {
       requestStop: async (reason) => {
         stopReason = reason;

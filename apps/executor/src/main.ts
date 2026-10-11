@@ -9,6 +9,7 @@ import { executorHeartbeat, parseConcurrency } from "./capabilities.ts";
 import { createCloudClient } from "./cloudClient.ts";
 import { fileJournal, transcriptReader } from "./journal.ts";
 import { runLoop } from "./runner.ts";
+import { sessionJournals, sessionStore } from "./sessionStore.ts";
 import { transcriptUploader } from "./uploader.ts";
 
 const { values } = parseArgs({
@@ -52,11 +53,12 @@ const result = await runLoop(
       cloud,
       journal,
       read: transcriptReader(stateDir),
+      sessions: sessionJournals(stateDir),
       provider: values.provider,
     }),
     adapter:
       values.provider === "claude"
-        ? claudeAdapter({ stateDir })
+        ? claudeAdapter({ stateDir, sessionStore: sessionStore({ stateDir, cloud }) })
         : values.provider === "codex"
           ? codexAdapter({ stateDir })
           : fakeAdapter({

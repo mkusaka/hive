@@ -899,23 +899,45 @@ export const runCapabilities = sqliteTable(
 );
 
 /**
- * current state (docs/architecture.md §3.3, §13.2). One raw provider transcript per Run, stored as immutable R2 parts
+ * current state (docs/architecture.md §3.3, §13.2, §13.3). A raw stream stored as immutable R2 parts
  * `workspace/<workspace_id>/transcript/<id>/<part_seq>`. `confirmed_through_seq` is the highest part_seq with every
  * part from 0 committed (null: none). Raw only: the normalized view is derived at read time and never indexed.
+ * `kind = 'run'`: the Run's provider transcript, one per Run. `kind = 'session'`: a snapshot of a native provider
+ * session (`session_id`, `subpath`, '' for the main transcript) as the uploading Run left it; `last_part_seq` is set by
+ * `complete`. A resume loads the newest complete snapshot, so a late upload from an older attempt stays history.
  */
 export const transcriptStreams = sqliteTable(
   "transcript_streams",
   {
     id: text("id").primaryKey(),
     workspaceId: workspaceId(),
-    runId: text("run_id").notNull().unique(),
+    runId: text("run_id").notNull(),
     provider: text("provider").notNull(),
     confirmedThroughSeq: integer("confirmed_through_seq"),
+    // No CHECK: adding one makes drizzle-kit recreate the table.
+    kind: text("kind", { enum: ["run", "session"] })
+      .notNull()
+      .default("run"),
+    sessionId: text("session_id"),
+    subpath: text("subpath").notNull().default(""),
+    lastPartSeq: integer("last_part_seq"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
   (t) => [
     scoped(t),
+    uniqueIndex("transcript_streams_run")
+      .on(t.runId)
+      .where(sql`${t.kind} = 'run'`),
+    uniqueIndex("transcript_streams_session")
+      .on(t.runId, t.sessionId, t.subpath)
+      .where(sql`${t.kind} = 'session'`),
+    index("transcript_streams_session_lookup").on(
+      t.workspaceId,
+      t.provider,
+      t.sessionId,
+      t.subpath,
+    ),
     foreignKey({ columns: [t.workspaceId, t.runId], foreignColumns: [runs.workspaceId, runs.id] }),
   ],
 );

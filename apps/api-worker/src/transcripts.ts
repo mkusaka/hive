@@ -3,7 +3,10 @@
 // then commit the manifest row and the contiguous watermark in one batch) → complete (`persistence = complete`
 // when every part up to the last is confirmed). Users read a normalized, redacted view derived at read time; the
 // raw JSONL is owner-only and never indexed. Unreferenced objects from a failed commit are not collected yet.
+// The same parts model carries native provider session snapshots (§13.3, `kind = 'session'`): one per uploading Run,
+// read back only by an executor (`sessionSnapshot`) to resume the session on another device.
 import {
+  type SessionStreamKey,
   type TranscriptEntry,
   type UploadComplete,
   type UploadInit,
@@ -15,6 +18,7 @@ import { HttpError } from "./errors.ts";
 
 type Uploader = Extract<Principal, { kind: "device" | "run" }>;
 type User = Extract<Principal, { kind: "user" }>;
+type Device = Extract<Principal, { kind: "device" }>;
 
 const notFound = () => new HttpError("NOT_FOUND", "run not found");
 const hex = (bytes: ArrayBuffer) =>
@@ -39,11 +43,23 @@ const uploadableRun = async (db: D1Database, principal: Uploader, runId: string)
   return row.workspace_id;
 };
 
-const streamOf = (db: D1Database, runId: string) =>
-  db
-    .prepare("SELECT id, confirmed_through_seq FROM transcript_streams WHERE run_id = ?")
-    .bind(runId)
-    .first<{ id: string; confirmed_through_seq: number | null }>();
+type Stream = { id: string; confirmed_through_seq: number | null };
+
+/** The Run's transcript stream, or with `session` its snapshot of that native session stream. */
+const streamOf = (db: D1Database, runId: string, session?: SessionStreamKey) =>
+  (session
+    ? db
+        .prepare(
+          `SELECT id, confirmed_through_seq FROM transcript_streams
+            WHERE run_id = ? AND kind = 'session' AND session_id = ? AND subpath = ?`,
+        )
+        .bind(runId, session.sessionId, session.subpath ?? "")
+    : db
+        .prepare(
+          "SELECT id, confirmed_through_seq FROM transcript_streams WHERE run_id = ? AND kind = 'run'",
+        )
+        .bind(runId)
+  ).first<Stream>();
 
 const partOf = (db: D1Database, streamId: string, partSeq: number) =>
   db
@@ -55,20 +71,26 @@ const partOf = (db: D1Database, streamId: string, partSeq: number) =>
 const objectKey = (workspaceId: string, streamId: string, partSeq: number) =>
   `workspace/${workspaceId}/transcript/${streamId}/${partSeq}`;
 
-type UploadToken = { runId: string; partSeq: number; byteSize: number; sha256: string };
+type UploadToken = {
+  runId: string;
+  partSeq: number;
+  byteSize: number;
+  sha256: string;
+  streamId: string;
+};
 
 /**
  * The upload id is the init request itself, encoded: there is no pending-upload state. PUT re-authorizes the
  * principal against its Run and verifies the body against it, so a forged id gains nothing.
  */
 const encodeUpload = (t: UploadToken) =>
-  btoa(JSON.stringify([t.runId, t.partSeq, t.byteSize, t.sha256]))
+  btoa(JSON.stringify([t.runId, t.partSeq, t.byteSize, t.sha256, t.streamId]))
     .replaceAll("+", "-")
     .replaceAll("/", "_")
     .replace(/=+$/, "");
 const decodeUpload = (id: string): UploadToken => {
   try {
-    const [runId, partSeq, byteSize, sha256] = JSON.parse(
+    const [runId, partSeq, byteSize, sha256, streamId] = JSON.parse(
       atob(id.replaceAll("-", "+").replaceAll("_", "/")),
     ) as unknown[];
     if (
@@ -77,9 +99,10 @@ const decodeUpload = (id: string): UploadToken => {
       (partSeq as number) >= 0 &&
       Number.isInteger(byteSize) &&
       typeof sha256 === "string" &&
-      /^[0-9a-f]{64}$/.test(sha256)
+      /^[0-9a-f]{64}$/.test(sha256) &&
+      typeof streamId === "string"
     ) {
-      return { runId, partSeq: partSeq as number, byteSize: byteSize as number, sha256 };
+      return { runId, partSeq: partSeq as number, byteSize: byteSize as number, sha256, streamId };
     }
   } catch {
     // fall through
@@ -101,19 +124,39 @@ export const initUpload = async (
   principal: Uploader,
   input: UploadInit,
 ): Promise<UploadInitialized> => {
+  const { session } = input;
+  if (session && !input.provider) {
+    throw new HttpError("INVALID_INPUT", "a session stream needs its provider");
+  }
   const workspaceId = await uploadableRun(db, principal, input.runId);
-  await db
-    .prepare(
-      `INSERT INTO transcript_streams (id, workspace_id, run_id, provider) VALUES (?, ?, ?, ?)
-       ON CONFLICT (run_id) DO NOTHING`,
-    )
-    .bind(crypto.randomUUID(), workspaceId, input.runId, input.provider ?? "unknown")
-    .run();
-  const stream = (await streamOf(db, input.runId))!;
+  await (
+    session
+      ? db
+          .prepare(
+            `INSERT INTO transcript_streams (id, workspace_id, run_id, provider, kind, session_id, subpath)
+             VALUES (?, ?, ?, ?, 'session', ?, ?)
+             ON CONFLICT (run_id, session_id, subpath) WHERE kind = 'session' DO NOTHING`,
+          )
+          .bind(
+            crypto.randomUUID(),
+            workspaceId,
+            input.runId,
+            input.provider,
+            session.sessionId,
+            session.subpath ?? "",
+          )
+      : db
+          .prepare(
+            `INSERT INTO transcript_streams (id, workspace_id, run_id, provider) VALUES (?, ?, ?, ?)
+             ON CONFLICT (run_id) WHERE kind = 'run' DO NOTHING`,
+          )
+          .bind(crypto.randomUUID(), workspaceId, input.runId, input.provider ?? "unknown")
+  ).run();
+  const stream = (await streamOf(db, input.runId, session))!;
   const part = await partOf(db, stream.id, input.partSeq);
   if (part && part.sha256 !== input.sha256) throw shaConflict();
   return {
-    uploadId: encodeUpload(input),
+    uploadId: encodeUpload({ ...input, streamId: stream.id }),
     partId: `${stream.id}:${input.partSeq}`,
     committed: part !== null,
   };
@@ -138,7 +181,14 @@ export const putPart = async (
 ) => {
   const t = decodeUpload(uploadId);
   const workspaceId = await uploadableRun(db, principal, t.runId);
-  const stream = await streamOf(db, t.runId);
+  const streamById = () =>
+    db
+      .prepare(
+        "SELECT id, confirmed_through_seq FROM transcript_streams WHERE id = ? AND run_id = ?",
+      )
+      .bind(t.streamId, t.runId)
+      .first<Stream>();
+  const stream = await streamById();
   if (!stream) throw new HttpError("NOT_FOUND", "upload not initialized");
   if (body.byteLength !== t.byteSize) {
     throw new HttpError(
@@ -189,7 +239,7 @@ export const putPart = async (
     // Lost a race to an identical or a different body.
     if ((await partOf(db, stream.id, t.partSeq))!.sha256 !== t.sha256) throw shaConflict();
   }
-  const after = (await streamOf(db, t.runId))!;
+  const after = (await streamById())!;
   return {
     partId: `${stream.id}:${t.partSeq}`,
     committed: true,
@@ -207,7 +257,8 @@ export const completeUpload = async (
   input: UploadComplete,
 ) => {
   const workspaceId = await uploadableRun(db, principal, input.runId);
-  const stream = await streamOf(db, input.runId);
+  const stream = await streamOf(db, input.runId, input.session);
+  if (input.session && !stream) throw new HttpError("NOT_FOUND", "upload not initialized");
   const confirmed = stream?.confirmed_through_seq ?? -1;
   if (confirmed < input.lastPartSeq) {
     const { results } = stream
@@ -235,6 +286,13 @@ export const completeUpload = async (
         .first()
     : null;
   if (beyond) throw new HttpError("INVALID_INPUT", "parts exist beyond lastPartSeq");
+  if (input.session) {
+    await db
+      .prepare("UPDATE transcript_streams SET last_part_seq = ?, updated_at = ? WHERE id = ?")
+      .bind(input.lastPartSeq, new Date().toISOString(), stream!.id)
+      .run();
+    return { workspaceId, body: { runId: input.runId, sessionComplete: true } };
+  }
   const run = await db
     .prepare("SELECT persistence FROM runs WHERE id = ?")
     .bind(input.runId)
@@ -270,7 +328,7 @@ export const getRun = async (db: D1Database, user: User, id: string) => {
               r.started_at, r.finished_at, r.created_at, r.result_summary, r.result_error,
               r.provider_session_id IS NOT NULL AS has_session, s.confirmed_through_seq,
               (SELECT COUNT(*) FROM transcript_parts p WHERE p.stream_id = s.id) AS parts
-         FROM runs r LEFT JOIN transcript_streams s ON s.run_id = r.id
+         FROM runs r LEFT JOIN transcript_streams s ON s.run_id = r.id AND s.kind = 'run'
         WHERE r.id = ? AND r.workspace_id IN (${placeholders(user.workspaceIds)})`,
     )
     .bind(id, ...user.workspaceIds)
@@ -318,7 +376,7 @@ const transcriptAccess = async (
                         JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
                        WHERE j.workspace_id = r.workspace_id AND j.id = r.job_id AND cv.kind = 'channel'
                          AND a.user_id = ?1) AS member
-         FROM runs r LEFT JOIN transcript_streams s ON s.run_id = r.id
+         FROM runs r LEFT JOIN transcript_streams s ON s.run_id = r.id AND s.kind = 'run'
         WHERE r.id = ?2 AND r.workspace_id IN (SELECT value FROM json_each(?3))`,
     )
     .bind(user.userId, runId, JSON.stringify(user.workspaceIds))
@@ -607,10 +665,41 @@ export const getTranscript = async (
 /** Owner only: the confirmed raw parts concatenated, one part in memory at a time. Never indexed (§13.2). */
 export const rawTranscript = async (db: D1Database, r2: R2Bucket, user: User, runId: string) => {
   const access = await transcriptAccess(db, user, runId, "owner");
-  const parts =
+  return concatenated(
+    r2,
     access.stream_id && access.confirmed_through_seq !== null
       ? await confirmedParts(db, access.stream_id, access.confirmed_through_seq)
-      : [];
+      : [],
+  );
+};
+
+/**
+ * For an executor of the Workspace (any device: the resume may run on another PC): the newest complete snapshot of a
+ * native session stream, raw. Complete means `complete` was ACKed and every part through `last_part_seq` is
+ * confirmed; anything else is a 404, so the caller starts fresh instead of resuming a partial session.
+ */
+export const sessionSnapshot = async (
+  db: D1Database,
+  r2: R2Bucket,
+  device: Device,
+  provider: string,
+  session: SessionStreamKey,
+) => {
+  const stream = await db
+    .prepare(
+      `SELECT s.id, s.last_part_seq FROM transcript_streams s
+         JOIN runs r ON r.workspace_id = s.workspace_id AND r.id = s.run_id
+        WHERE s.workspace_id = ? AND s.kind = 'session' AND s.provider = ? AND s.session_id = ? AND s.subpath = ?
+          AND s.last_part_seq IS NOT NULL AND s.confirmed_through_seq >= s.last_part_seq
+        ORDER BY r.created_at DESC, r.execution_generation DESC LIMIT 1`,
+    )
+    .bind(device.workspaceIds[0], provider, session.sessionId, session.subpath ?? "")
+    .first<{ id: string; last_part_seq: number }>();
+  if (!stream) throw new HttpError("NOT_FOUND", "no complete session snapshot");
+  return concatenated(r2, await confirmedParts(db, stream.id, stream.last_part_seq));
+};
+
+const concatenated = (r2: R2Bucket, parts: { part_seq: number; r2_key: string }[]) => {
   let next = 0;
   return new ReadableStream<Uint8Array>({
     pull: async (controller) => {

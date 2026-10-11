@@ -516,7 +516,7 @@ const fencedRun = async (
 /**
  * Run context (SDK-01): Bot instructions, Task, recent Conversation and the trigger item's body (with its sender
  * Bot for a bot-to-bot message), or for a batch Job every member's body (its Conversation is the batch lane's), plus
- * the replies to requests the Job sent (§8.2).
+ * the replies to requests the Job sent (§8.2), and the native session an earlier Run of the Job left (§13.3).
  */
 export const getRunContext = async (
   db: D1Database,
@@ -677,7 +677,18 @@ export const getRunContext = async (
         snippet,
       }))
     : [];
+  // The native session to resume (§13.3): the latest earlier root Run of this Job that reported one.
+  const previous = await db
+    .prepare(
+      `SELECT provider_session_id FROM runs
+        WHERE workspace_id = ? AND job_id = ? AND kind = 'root' AND execution_generation < ?
+          AND provider_session_id IS NOT NULL
+        ORDER BY execution_generation DESC LIMIT 1`,
+    )
+    .bind(workspaceId, input.jobId, input.executionGeneration)
+    .first<{ provider_session_id: string }>();
   return {
+    previousProviderSessionId: previous?.provider_session_id ?? null,
     bot: {
       id: row.bot_id,
       name: row.name,

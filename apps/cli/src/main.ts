@@ -11,6 +11,7 @@ import { saveEnvironment } from "@hive/executor/environments";
 import { fakeAdapter } from "@hive/executor/adapters/fake";
 import { fileJournal, transcriptReader } from "@hive/executor/journal";
 import { runLoop } from "@hive/executor/runner";
+import { sessionJournals, sessionStore } from "@hive/executor/sessionStore";
 import { transcriptUploader } from "@hive/executor/uploader";
 import { type Credentials, run } from "./cli.ts";
 
@@ -72,11 +73,15 @@ process.exitCode = await run(process.argv.slice(2), {
           cloud,
           journal,
           read: transcriptReader(executorDir),
+          sessions: sessionJournals(executorDir),
           provider,
         }),
         adapter:
           provider === "claude"
-            ? claudeAdapter({ stateDir: executorDir })
+            ? claudeAdapter({
+                stateDir: executorDir,
+                sessionStore: sessionStore({ stateDir: executorDir, cloud }),
+              })
             : provider === "codex"
               ? codexAdapter({ stateDir: executorDir })
               : fakeAdapter({

@@ -2,7 +2,11 @@
 // transcript is split into parts, each sent as init → PUT → (cloud verifies and commits the manifest), then
 // `complete` with the last part seq. `uploaded` is journaled only after that ACK, never before. The local file is
 // kept (no retention sweep yet). Web-standard APIs only: the file read is injected.
+// The Run's native session journals (sessionStore.ts, §13.3) go the same way, each as a full snapshot stream of that
+// Run, before `uploaded`. ponytail: every resume re-uploads the whole session (O(n²) bytes over many resumes); upload
+// only the tail as a delta stream if that bites. Eager per-batch upload during the Run is not done.
 /* oxlint-disable no-await-in-loop */
+import type { SessionStreamKey } from "@hive/contracts";
 import type { CloudClient } from "./cloudClient.ts";
 import type { Journal } from "./runner.ts";
 
@@ -40,6 +44,7 @@ export const uploadTranscript = async (
   runId: string,
   bytes: Bytes,
   provider: string,
+  session?: SessionStreamKey,
 ) => {
   const parts = splitParts(bytes);
   for (const [partSeq, part] of parts.entries()) {
@@ -49,11 +54,12 @@ export const uploadTranscript = async (
       byteSize: part.length,
       sha256: await sha256(part),
       provider,
+      ...(session ? { session } : {}),
     });
     if (!committed) await cloud.uploadPart(uploadId, part);
   }
   const lastPartSeq = parts.length - 1;
-  await cloud.uploadComplete({ runId, lastPartSeq });
+  await cloud.uploadComplete({ runId, lastPartSeq, ...(session ? { session } : {}) });
   return lastPartSeq;
 };
 
@@ -67,6 +73,7 @@ export const transcriptUploader = ({
   cloud,
   journal,
   read,
+  sessions = async () => [],
   provider,
   attempts = 3,
   backoffMs = 1000,
@@ -75,6 +82,8 @@ export const transcriptUploader = ({
   cloud: CloudClient;
   journal: Journal;
   read(runId: string): Promise<Bytes | null>;
+  /** The Run's native session journals; none by default. */
+  sessions?(runId: string): Promise<{ session: SessionStreamKey; bytes: Bytes }[]>;
   provider: string;
   attempts?: number;
   backoffMs?: number;
@@ -85,6 +94,10 @@ export const transcriptUploader = ({
       try {
         const bytes = (await read(runId)) ?? new Uint8Array();
         const lastPartSeq = await uploadTranscript(cloud, runId, bytes, provider);
+        for (const s of await sessions(runId)) {
+          if (s.bytes.length > 0)
+            await uploadTranscript(cloud, runId, s.bytes, provider, s.session);
+        }
         await journal.append({ kind: "uploaded", runId, lastPartSeq });
         return true;
       } catch (error) {

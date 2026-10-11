@@ -756,6 +756,13 @@ SDK append
 - working directory / projectKey, sidecars, plugin settings and file checkpointing combinations are part of the
   Phase 0 compatibility tests. Copying files is not assumed to restore a session.
 
+Implemented as (SESSION-01): the journal is a fsynced JSONL file per stream under `<state-dir>/sessions/`, not SQLite.
+The stream key is `sessionId + subpath`; `projectKey` is ignored because the SDK derives it from the cwd, which is a
+per-run scratch directory. The uploader mirrors the journal after the Run, not per batch. In the cloud each uploading
+Run stores its own complete snapshot (`transcript_streams.kind = 'session'`); `load` takes the newest complete one,
+so a late upload from an older attempt is history without a write lease. A Run resumes an earlier Run's session only
+when `load` returns it; otherwise it starts fresh.
+
 ### 13.4 Codex adapter (§16.4)
 
 Codex app-server speaks a local stdio JSON protocol: initialize on connect, map thread / turn, notifications and

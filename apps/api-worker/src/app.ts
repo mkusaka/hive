@@ -4,6 +4,7 @@ import {
   parse,
   RunObservation,
   type RunPrincipal,
+  SessionStreamKey,
   UploadComplete,
   UploadInit,
 } from "@hive/contracts";
@@ -62,6 +63,7 @@ import {
   initUpload,
   putPart,
   rawTranscript,
+  sessionSnapshot,
 } from "./transcripts.ts";
 
 export type Bindings = {
@@ -254,6 +256,19 @@ export const createApp = ({
     const { workspaceId, body } = await completeUpload(c.env.DB, uploader(c), parsed.value);
     hint(c, { workspaceId, scopes: [`workspace:${workspaceId}`] });
     return c.json(body);
+  });
+  // Native session snapshot (§13.3) for a resume, from any device of the Workspace; 404 when none is complete.
+  app.get("/v1/executor/sessions/:provider/:sessionId", async (c) => {
+    const parsed = parse(SessionStreamKey, {
+      sessionId: c.req.param("sessionId"),
+      subpath: c.req.query("subpath"),
+    });
+    if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
+    return c.body(
+      await sessionSnapshot(c.env.DB, c.env.R2, device(c), c.req.param("provider"), parsed.value),
+      200,
+      { "Content-Type": "application/x-ndjson; charset=utf-8" },
+    );
   });
   app.put("/v1/executor/uploads/:uploadId", async (c) => {
     const principal = uploader(c);
