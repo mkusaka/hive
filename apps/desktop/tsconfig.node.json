@@ -11,5 +11,6 @@
     "src/renderer/src/format.ts",
     "test",
     "*.ts"
-  ]
+  ],
+  "exclude": ["test/ui"]
 }

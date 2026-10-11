@@ -137,6 +137,13 @@ refetch sets by scope, paging, 410 re-bootstrap, failed pull), `test/format.test
 rejection, routine commands incl. delete, ApiError mapping, Access header injection) and `test/executor.test.ts` (executor IPC argument rejection,
 unregistered device, error mapping; the service module is mocked).
 
+Renderer tests live in `test/ui/*.test.tsx` (happy-dom via a per-file `// @vitest-environment happy-dom`,
+@testing-library/react and user-event). `fakeHive.ts` replaces `window.hive` (the IPC surface, `src/shared/api.ts`):
+GET paths answer from `fixtures.ts` (a body or a function of the query, unknown paths `NOT_FOUND`), commands and
+executor calls are recorded, `emit` pushes Realtime events; `renderApp()` renders `<App />` over the fixtures. One
+file per view: sidebar, chat, Bot panel, Channel panel, and the Inbox / Activity / Approvals / Search / Memory /
+Status views. Every change to `src/renderer` adds or updates a test here.
+
 ## Known gaps
 
 - OAuth login is not run against a real Access tenant (G-02). A grant that expires while the window is open shows
