@@ -18,26 +18,18 @@ export const deviceRegister = (
 export const channelCreate = (c: Client, e: Envelope, name: string) =>
   c.command(e, { type: "channel.create", name });
 
-/** `toolPolicy`: @hive/contracts ToolPolicy; `environment`: the placement's environment name (§10.1). */
+/** `toolPolicy` / `placementPolicy`: @hive/contracts ToolPolicy / PlacementPolicy (§10.2). */
 export const botCreate = (
   c: Client,
   e: Envelope,
   name: string,
-  allowedDeviceIds: string[] = [],
   instructions?: string,
-  extra: { toolPolicy?: Json; environment?: string } = {},
+  extra: { toolPolicy?: Json; placementPolicy?: Json } = {},
 ) =>
   c.command(e, {
     type: "bot.create",
     name,
-    ...(allowedDeviceIds.length > 0 || extra.environment
-      ? {
-          placementPolicy: {
-            allowedDeviceIds,
-            ...(extra.environment ? { environmentId: extra.environment } : {}),
-          },
-        }
-      : {}),
+    ...(extra.placementPolicy ? { placementPolicy: extra.placementPolicy } : {}),
     ...(instructions === undefined ? {} : { instructions }),
     ...(extra.toolPolicy ? { toolPolicy: extra.toolPolicy } : {}),
   });
@@ -47,7 +39,7 @@ export const botUpdate = async (
   c: Client,
   e: Envelope,
   botId: string,
-  change: { instructions?: string; toolPolicy?: Json },
+  change: { instructions?: string; toolPolicy?: Json; placementPolicy?: Json },
 ) => {
   const { bots } = (await listBots(c, e.workspaceId)) as {
     bots: { id: string; revision: number }[];

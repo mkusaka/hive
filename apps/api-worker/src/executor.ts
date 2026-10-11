@@ -2,6 +2,7 @@
 import {
   commandEnvelope,
   ExecutorCommand,
+  type ExecutorHeartbeat,
   type ExecutorRun,
   type JobClaimed,
   type JobClaim,
@@ -22,13 +23,14 @@ import {
   finishRun,
   insertMessage,
   renewLease,
-  resumeWaitingJobs,
+  setJobsWaitingDevice,
 } from "@hive/db";
 import type * as v from "valibot";
 import { hashSecret, newDeviceSecret } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
 import { capabilityExpiresAt, insertCapability } from "./auth/run.ts";
 import { HttpError } from "./errors.ts";
+import { constraintReasons, type PlacementDevice, refusal, shouldWait } from "./placement.ts";
 import { indexLater, relatedQuery, searchDocuments } from "./search.ts";
 
 export const ExecutorEnvelope = commandEnvelope(ExecutorCommand);
@@ -47,34 +49,54 @@ const memoryContextBytes = 8 * 1024;
 const activeRunStates = new Set(["starting", "running", "waiting_approval", "stopping"]);
 const activeRunStatesSql = `(${[...activeRunStates].map((s) => `'${s}'`).join(", ")})`;
 
-/**
- * Placement (§10.2) as a safety constraint: a non-empty `allowedDeviceIds` is always intersected, whatever
- * the mode; an empty list means any device in the Workspace. An `environmentId` needs that environment registered
- * on the device (§10.1, `environments` = the device's environment names).
- */
-const eligible = (placement: PlacementPolicy, deviceId: string, environments: Set<string>) =>
-  (placement.allowedDeviceIds.length === 0 ||
-    (placement.allowedDeviceIds as string[]).includes(deviceId)) &&
-  (placement.environmentId === undefined || environments.has(placement.environmentId));
-
-const deviceEnvironments = async (db: D1Database, deviceId: string) => {
+/** The Workspace's non-revoked devices as placement sees them (placement.ts). */
+export const placementDevices = async (db: D1Database, workspaceId: string) => {
   const { results } = await db
-    .prepare("SELECT name FROM device_environments WHERE device_id = ?")
-    .bind(deviceId)
-    .all<{ name: string }>();
-  return new Set(results.map((r) => r.name));
+    .prepare(
+      `SELECT d.id, d.last_heartbeat_at, d.capabilities, d.capacity_background,
+              (SELECT json_group_array(e.name) FROM device_environments e
+                WHERE e.workspace_id = d.workspace_id AND e.device_id = d.id) AS environments,
+              (SELECT COUNT(*) FROM runs r
+                WHERE r.workspace_id = d.workspace_id AND r.device_id = d.id AND r.kind = 'root'
+                  AND r.state IN ${activeRunStatesSql}) AS active
+         FROM devices d WHERE d.workspace_id = ? AND d.revoked_at IS NULL`,
+    )
+    .bind(workspaceId)
+    .all<{
+      id: string;
+      last_heartbeat_at: string | null;
+      capabilities: string;
+      capacity_background: number;
+      environments: string;
+      active: number;
+    }>();
+  return results.map((r): PlacementDevice => ({
+    id: r.id,
+    lastHeartbeatAt: r.last_heartbeat_at,
+    capabilities: JSON.parse(r.capabilities) as string[],
+    environments: JSON.parse(r.environments) as string[],
+    capacity: r.capacity_background,
+    active: r.active,
+  }));
+};
+
+/** The offer rule (placement.ts) for the calling device; null when it may take the Job. */
+const refusalFor = (placement: PlacementPolicy, devices: PlacementDevice[], deviceId: string) => {
+  const self = devices.find((d) => d.id === deviceId);
+  return self ? refusal(placement, devices, self, Date.now()) : "not_allowed";
 };
 
 type JobRow = {
   id: string;
   bot_id: string;
+  state: string;
   revision: number;
   trigger_key: string;
   placement: string;
   task_id: string | null;
   created_at: string;
 };
-const jobColumns = "id, bot_id, revision, trigger_key, placement, task_id, created_at";
+const jobColumns = "id, bot_id, state, revision, trigger_key, placement, task_id, created_at";
 
 const toQueuedJob = (row: JobRow): QueuedJob => ({
   id: row.id,
@@ -85,8 +107,16 @@ const toQueuedJob = (row: JobRow): QueuedJob => ({
   createdAt: row.created_at,
 });
 
-const notEligible = () =>
-  new HttpError("FORBIDDEN", "device is not eligible for this job", false, "not_eligible");
+/** `at_capacity` is a 409 the device may retry; every other refusal is a 403 `not_eligible` naming the rule. */
+const refused = (reason: string) =>
+  reason === "at_capacity"
+    ? new HttpError("RESOURCE_BUSY", "device is at capacity", true, "at_capacity")
+    : new HttpError(
+        "FORBIDDEN",
+        `device is not eligible for this job: ${reason}`,
+        false,
+        "not_eligible",
+      );
 
 const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env) => {
   const { workspaceId, command } = env;
@@ -96,8 +126,15 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
     .first<JobRow>();
   if (!row) throw new HttpError("NOT_FOUND", "job not found");
   const job = toQueuedJob(row);
-  if (!eligible(job.placement, device.deviceId, await deviceEnvironments(db, device.deviceId))) {
-    throw notEligible();
+  // Re-validated here (§9.2 step 3) so a stale list cannot bypass the offer rule. Only a claimable Job: a replay of
+  // a claim that went through must reach its receipt even though the device now holds that Run.
+  if (row.state === "queued" || row.state === "waiting_device") {
+    const reason = refusalFor(
+      job.placement,
+      await placementDevices(db, workspaceId),
+      device.deviceId,
+    );
+    if (reason) throw refused(reason);
   }
   // The Run capability (§18.2) is committed with the claim. Task writes need a Task Job.
   const secret = newDeviceSecret();
@@ -131,6 +168,7 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
     ],
   });
   if (!result.ok) {
+    if (result.reason === "at_capacity") throw refused(result.reason);
     if (result.reason === "resource_busy") {
       throw new HttpError(
         "RESOURCE_BUSY",
@@ -415,21 +453,23 @@ export const runExecutorCommand = (db: D1Database, device: Device, envelope: Env
   return (handlers[envelope.command.type] as Handler<Command>)(db, device, envelope);
 };
 
-// ponytail: placement is filtered after LIMIT, so a page can hold fewer than `limit` eligible Jobs;
-// filter in SQL (json_each) or page with a cursor if devices get pinned out of many Jobs.
+// ponytail: placement is filtered after LIMIT, so a page can hold fewer than `limit` Jobs this device may take;
+// page with a cursor if devices get ranked out of many Jobs.
+/** Queued Jobs offered to this device now (placement.ts): none while it is at capacity. */
 export const listQueuedJobs = async (db: D1Database, device: Device, limit: number) => {
+  const workspaceId = device.workspaceIds[0]!;
   const { results } = await db
     .prepare(
       `SELECT ${jobColumns} FROM jobs WHERE workspace_id = ? AND state = 'queued'
         ORDER BY created_at, id LIMIT ?`,
     )
-    .bind(device.workspaceIds[0], limit)
+    .bind(workspaceId, limit)
     .all<JobRow>();
-  const environments = await deviceEnvironments(db, device.deviceId);
+  const devices = await placementDevices(db, workspaceId);
   return {
     jobs: results
       .map(toQueuedJob)
-      .filter((job) => eligible(job.placement, device.deviceId, environments)),
+      .filter((job) => refusalFor(job.placement, devices, device.deviceId) === null),
   };
 };
 
@@ -725,13 +765,69 @@ export const recordObservation = async (db: D1Database, device: Device, input: R
   return { status: 200 as const, body: { ok: true } };
 };
 
-/** Also returns the device's `waiting_device` Jobs to `queued` (AT-12), before the executor lists them. */
-export const heartbeat = async (db: D1Database, device: Device) => {
+/**
+ * Stores the reported capabilities / capacity (an omitted field keeps its value) and returns the `waiting_device` Jobs
+ * this device meets the constraints of to `queued` (AT-12), before the executor lists them.
+ */
+export const heartbeat = async (db: D1Database, device: Device, body: ExecutorHeartbeat) => {
   const now = new Date().toISOString();
+  const workspaceId = device.workspaceIds[0]!;
   await db
-    .prepare("UPDATE devices SET last_heartbeat_at = ?, updated_at = ? WHERE id = ?")
-    .bind(now, now, device.deviceId)
+    .prepare(
+      `UPDATE devices SET last_heartbeat_at = ?, updated_at = ?,
+         capabilities = COALESCE(?, capabilities), capacity_background = COALESCE(?, capacity_background)
+        WHERE id = ?`,
+    )
+    .bind(
+      now,
+      now,
+      body.capabilities ? JSON.stringify(body.capabilities) : null,
+      body.capacity?.background ?? null,
+      device.deviceId,
+    )
     .run();
-  await resumeWaitingJobs(db, { workspaceId: device.workspaceIds[0]!, deviceId: device.deviceId });
+  const { results } = await db
+    .prepare(
+      "SELECT id, placement FROM jobs WHERE workspace_id = ? AND state = 'waiting_device' LIMIT 200",
+    )
+    .bind(workspaceId)
+    .all<{ id: string; placement: string }>();
+  if (results.length > 0) {
+    const self = (await placementDevices(db, workspaceId)).find((d) => d.id === device.deviceId);
+    const jobIds = results
+      .filter(
+        (j) =>
+          self && constraintReasons(JSON.parse(j.placement) as PlacementPolicy, self).length === 0,
+      )
+      .map((j) => j.id);
+    await setJobsWaitingDevice(db, { workspaceId, jobIds, waiting: false });
+  }
   return { lastHeartbeatAt: now };
+};
+
+/**
+ * Pump side (§10.4, AT-30, AT-22): queued Jobs that no online device can run (placement.ts `shouldWait`) go
+ * `waiting_device`. Returns the Workspaces that changed.
+ */
+// ponytail: at most 200 queued Jobs per sweep; page through them if queues get deep.
+export const parkWaitingJobs = async (db: D1Database) => {
+  const { results } = await db
+    .prepare(
+      "SELECT workspace_id, id, placement FROM jobs WHERE state = 'queued' ORDER BY created_at LIMIT 200",
+    )
+    .all<{ workspace_id: string; id: string; placement: string }>();
+  const byWorkspace = Map.groupBy(results, (j) => j.workspace_id);
+  const changed: string[] = [];
+  const now = Date.now();
+  for (const [workspaceId, jobs] of byWorkspace) {
+    // oxlint-disable-next-line no-await-in-loop -- one small query per Workspace with queued Jobs
+    const devices = await placementDevices(db, workspaceId);
+    const jobIds = jobs
+      .filter((j) => shouldWait(JSON.parse(j.placement) as PlacementPolicy, devices, now))
+      .map((j) => j.id);
+    // oxlint-disable-next-line no-await-in-loop
+    if (await setJobsWaitingDevice(db, { workspaceId, jobIds, waiting: true }))
+      changed.push(workspaceId);
+  }
+  return changed;
 };

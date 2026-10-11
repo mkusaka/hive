@@ -45,8 +45,11 @@ D1 schema, migrations and the atomic repository for the Phase 1 slice
 - Recovery (§10.4): `expireLeases` moves active Runs whose lease expired to `unknown` (reservations kept,
   `result_error` `lease_expired` or `lease_expired_before_start` when `runs.started_at` is null) and their Jobs to
   `recovery_required`; `confirmRunStopped` turns a fenced `unknown` Run and its Execution `interrupted` and releases
-  its reservations; `parkOfflineJobs` / `resumeWaitingJobs` move Jobs between `queued` and `waiting_device` by their
-  allowed devices' heartbeats (45 s), with change rows in the same batch. `claimJob` accepts `waiting_device` Jobs;
+  its reservations; `setJobsWaitingDevice` moves the Jobs the caller names (apps/api-worker placement) between
+  `queued` and `waiting_device`, with change rows in the same batch. `claimJob` accepts `waiting_device` Jobs and
+  fails with `at_capacity` (an `atomic_guards` row inside the batch) when the device's active root Runs would exceed
+  `devices.capacity_background`; `devices.capabilities` (JSON array) holds what the heartbeat reported.
+  Migration 0014 is hand-written (`drizzle-kit generate --custom`) because it renames the unused `capacity` column.
   `finishRun` accepts `cancelled` (Execution `interrupted`). `jobs.cancel_requested_at` records `job.cancel`.
 - Routines (§17.2): `routines` (schedule JSON, `schedule_revision`, `misfire` `skip / coalesce`, `next_fire_at`,
   `enabled`, `revision`) and immutable `routine_occurrences` (UNIQUE (routine_id, schedule_revision, scheduled_at),

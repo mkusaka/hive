@@ -241,7 +241,11 @@ describe("waiting_device (AT-12, AT-30)", () => {
     const { botId } = await s.ok({
       type: "bot.create",
       name: "pinned",
-      placementPolicy: { mode: "pinned", allowedDeviceIds: [pc2.deviceId] },
+      placementPolicy: {
+        mode: "pinned",
+        allowedDeviceIds: [pc2.deviceId],
+        preferredDeviceIds: [pc2.deviceId],
+      },
     });
     const { jobId } = await queuedJob(s, botId as string);
     const job = async () => (await s.user.get(`/v1/jobs/${jobId}`)).json<Json>();

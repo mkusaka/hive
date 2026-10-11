@@ -4,6 +4,7 @@ import type {
   ApiError,
   ApprovalStatus,
   ExecutorCommand,
+  ExecutorHeartbeat,
   ExecutorRun,
   JobClaimed,
   LeaseRenewed,
@@ -43,7 +44,8 @@ export type RunApi = {
 };
 
 export type CloudClient = {
-  heartbeat(): Promise<void>;
+  /** Also reports capabilities / capacity (§10.1); an omitted field keeps the stored value. */
+  heartbeat(body?: ExecutorHeartbeat): Promise<void>;
   listQueuedJobs(limit: number): Promise<QueuedJob[]>;
   claim(input: { jobId: string; expectedRevision: number }): Promise<JobClaimed>;
   renewLease(input: { runId: string; executionGeneration: number }): Promise<LeaseRenewed>;
@@ -131,8 +133,8 @@ export const createCloudClient = ({
     });
 
   return {
-    heartbeat: async () => {
-      await request("POST", "/v1/executor/heartbeat", {});
+    heartbeat: async (body = {}) => {
+      await request("POST", "/v1/executor/heartbeat", body);
     },
     listQueuedJobs: async (limit) =>
       (await request<{ jobs: QueuedJob[] }>("GET", `/v1/executor/jobs?state=queued&limit=${limit}`))

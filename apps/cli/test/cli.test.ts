@@ -466,7 +466,7 @@ describe("tools and approvals", () => {
     expect(commandOf(h.calls[0]!)).toEqual({
       type: "bot.create",
       name: "b",
-      placementPolicy: { allowedDeviceIds: [], environmentId: "backend" },
+      placementPolicy: { environmentId: "backend" },
       toolPolicy: { tools: { Read: "allow", Bash: "ask" }, cwdMode: "environment" },
     });
     expect(await h.hive("bot", "update", "bot-1", "--tools", "Bash=ask")).toBe(0);
@@ -486,6 +486,72 @@ describe("tools and approvals", () => {
     });
     expect(await h.hive("bot", "update", "bot-1")).toBe(2);
     expect(await h.hive("bot", "create", "--name", "b", "--tools", "Bash")).toBe(2);
+  });
+
+  it("bot create / update placement flags; update merges over the Bot's current placement", async () => {
+    const current = {
+      mode: "preferred",
+      allowedDeviceIds: ["pc1", "pc2"],
+      preferredDeviceIds: ["pc1", "pc2"],
+      fallbackOnUnavailable: true,
+      overflowToFallback: false,
+      requiredCapabilities: [],
+      recovery: "manual",
+    };
+    const h = harness((call) =>
+      call.method === "GET"
+        ? Response.json({
+            bots: [{ id: "bot-1", revision: 2, toolPolicy: {}, placementPolicy: current }],
+          })
+        : Response.json({ ok: true }),
+    );
+    const create = [
+      "bot",
+      "create",
+      "--name",
+      "b",
+      "--mode",
+      "preferred",
+      "--preferred",
+      "pc1,pc2",
+      "--allowed",
+      "pc1,pc2",
+      "--overflow",
+      "--no-fallback",
+      "--capabilities",
+      "claude,bash",
+    ];
+    expect(await h.hive(...create)).toBe(0);
+    expect(commandOf(h.calls[0]!)).toEqual({
+      type: "bot.create",
+      name: "b",
+      placementPolicy: {
+        mode: "preferred",
+        allowedDeviceIds: ["pc1", "pc2"],
+        preferredDeviceIds: ["pc1", "pc2"],
+        requiredCapabilities: ["claude", "bash"],
+        overflowToFallback: true,
+        fallbackOnUnavailable: false,
+      },
+    });
+    expect(await h.hive("bot", "update", "bot-1", "--overflow", "--capabilities", "codex")).toBe(0);
+    expect(commandOf(h.calls.at(-1)!)).toEqual({
+      type: "bot.update",
+      botId: "bot-1",
+      expectedRevision: 2,
+      placementPolicy: { ...current, overflowToFallback: true, requiredCapabilities: ["codex"] },
+    });
+  });
+
+  it("executor run passes --concurrency through and rejects a bad value", async () => {
+    const h = harness(undefined, { creds: { deviceToken: "d-1.secret" } });
+    const seen: number[] = [];
+    h.deps.runExecutor = async (_cloud, _once, _provider, concurrency) =>
+      void seen.push(concurrency);
+    expect(await h.hive("executor", "run", "--once")).toBe(0);
+    expect(await h.hive("executor", "run", "--once", "--concurrency", "3")).toBe(0);
+    expect(await h.hive("executor", "run", "--concurrency", "0")).toBe(2);
+    expect(seen).toEqual([1, 3]);
   });
 
   it("device env add maps the path locally and registers name + repository in the cloud", async () => {

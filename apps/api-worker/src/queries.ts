@@ -1,7 +1,9 @@
 // Read routes for a user principal, scoped to the user's Workspaces (docs/architecture.md §22.2).
-import type { ApprovalStatus } from "@hive/contracts";
+import type { ApprovalStatus, PlacementPolicy } from "@hive/contracts";
 import { displayState } from "@hive/db";
 import { HttpError } from "./errors.ts";
+import { placementDevices } from "./executor.ts";
+import { deviceReasons } from "./placement.ts";
 
 const notFound = (what: string) => new HttpError("NOT_FOUND", `${what} not found`);
 const placeholders = (ids: string[]) => ids.map(() => "?").join(", ");
@@ -40,6 +42,26 @@ export const getOperation = async (db: D1Database, userId: string, wsIds: string
   return { ...base, routingStatus: item.deliveryId ? "routed" : "pending", inboxItem, jobId };
 };
 
+/**
+ * Why a queued / `waiting_device` Job has no device that can take it now (AT-22): every device with the reasons it
+ * cannot (placement.ts). Null while some device can, and for any other state.
+ */
+const waitingReason = async (
+  db: D1Database,
+  job: { workspaceId: string; state: string },
+  placement: PlacementPolicy,
+) => {
+  if (job.state !== "queued" && job.state !== "waiting_device") return null;
+  const now = Date.now();
+  const devices = (await placementDevices(db, job.workspaceId)).map((d) => ({
+    deviceId: d.id,
+    reasons: deviceReasons(placement, d, now),
+  }));
+  return devices.every((d) => d.reasons.length > 0)
+    ? { code: "no_eligible_device" as const, devices }
+    : null;
+};
+
 /** The Job with its root Runs (oldest first): recovery needs every attempt's state and device (§22.2). */
 export const getJob = async (db: D1Database, wsIds: string[], id: string) => {
   if (wsIds.length === 0) throw notFound("job");
@@ -51,8 +73,9 @@ export const getJob = async (db: D1Database, wsIds: string[], id: string) => {
          FROM jobs WHERE id = ? AND workspace_id IN (${placeholders(wsIds)})`,
     )
     .bind(id, ...wsIds)
-    .first<{ placement: string; workspaceId: string }>();
+    .first<{ placement: string; workspaceId: string; state: string }>();
   if (!job) throw notFound("job");
+  const placement = JSON.parse(job.placement) as PlacementPolicy;
   const { results: runs } = await db
     .prepare(
       `SELECT id, state, execution_generation AS generation, lease_expires_at AS leaseExpiresAt,
@@ -61,7 +84,7 @@ export const getJob = async (db: D1Database, wsIds: string[], id: string) => {
     )
     .bind(job.workspaceId, id)
     .all();
-  return { ...job, placement: JSON.parse(job.placement) as unknown, runs };
+  return { ...job, placement, runs, waitingReason: await waitingReason(db, job, placement) };
 };
 
 // ponytail: first 100 items, no cursor yet; add `limit / cursor` (§22.2) with the CLI.
@@ -153,12 +176,14 @@ export const listBotConversations = async (db: D1Database, workspaceId: string) 
 export const listDevices = async (db: D1Database, workspaceId: string) => {
   const { results } = await db
     .prepare(
-      `SELECT id, name, os, agent_version AS agentVersion, owner_user_id AS ownerUserId,
-              last_heartbeat_at AS lastHeartbeatAt, revoked_at AS revokedAt, created_at AS createdAt
+      `SELECT id, name, os, agent_version AS agentVersion, owner_user_id AS ownerUserId, capabilities,
+              capacity_background AS capacityBackground, last_heartbeat_at AS lastHeartbeatAt,
+              revoked_at AS revokedAt, created_at AS createdAt
          FROM devices WHERE workspace_id = ? ORDER BY created_at, id LIMIT 500`,
     )
     .bind(workspaceId)
-    .all();
+    .all<{ capabilities: unknown }>();
+  for (const d of results) d.capabilities = JSON.parse(d.capabilities as string);
   return { devices: results };
 };
 

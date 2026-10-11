@@ -140,8 +140,10 @@ describe("device environments", () => {
         .first(),
     ).toEqual({ repository: "https://github.com/example/backend.git" });
 
+    // No device had the environment, so the pump parked the Job (`waiting_device`); the heartbeat requeues it.
+    await device.post("/v1/executor/heartbeat", {});
     expect(await listed()).toContain(jobId);
-    const won = await device.command(claim(jobId));
+    const won = await device.command(claim(jobId, 3));
     expect(won.status).toBe(200);
     const run = await won.json<Claimed>();
     const context = await (

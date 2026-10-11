@@ -183,7 +183,15 @@ export const App = () => {
         {(
           ["channel", "inbox", "activity", "approvals", "search", "memory", "devices"] as const
         ).map((v) => (
-          <button key={v} className={v === view ? "active" : ""} onClick={() => setView(v)}>
+          <button
+            key={v}
+            className={v === view ? "active" : ""}
+            onClick={() => {
+              setView(v);
+              // Heartbeats write no change rows, so online state is refetched when the view opens.
+              if (v === "devices") void refetch(new Set(["devices"]), ws);
+            }}
+          >
             {v[0]!.toUpperCase() + v.slice(1)}
             {v === "approvals" && approvals.length > 0 && (
               <span className="count" aria-label={`${approvals.length} pending`}>
@@ -305,19 +313,31 @@ export const App = () => {
                 <tr>
                   <th>Name</th>
                   <th>OS</th>
+                  <th>Status</th>
+                  <th>Capabilities</th>
+                  <th>Capacity</th>
                   <th>Last heartbeat</th>
                   <th>Revoked</th>
                 </tr>
               </thead>
               <tbody>
-                {devices.map((d) => (
-                  <tr key={d.id}>
-                    <td>{text(d.name)}</td>
-                    <td>{text(d.os)}</td>
-                    <td>{text(d.lastHeartbeatAt)}</td>
-                    <td>{text(d.revokedAt)}</td>
-                  </tr>
-                ))}
+                {devices.map((d) => {
+                  // Online = heartbeat within 45 s, as placement counts it (api-worker placement.ts).
+                  const online =
+                    typeof d.lastHeartbeatAt === "string" &&
+                    Date.now() - Date.parse(d.lastHeartbeatAt) <= 45_000;
+                  return (
+                    <tr key={d.id}>
+                      <td>{text(d.name)}</td>
+                      <td>{text(d.os)}</td>
+                      <td className={online ? "ok" : "warn"}>{online ? "online" : "offline"}</td>
+                      <td>{Array.isArray(d.capabilities) ? d.capabilities.join(", ") : "—"}</td>
+                      <td>{text(d.capacityBackground)}</td>
+                      <td>{text(d.lastHeartbeatAt)}</td>
+                      <td>{text(d.revokedAt)}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </section>

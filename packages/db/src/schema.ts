@@ -111,7 +111,9 @@ export const devices = sqliteTable(
     name: text("name").notNull(),
     os: text("os").notNull(),
     agentVersion: text("agent_version").notNull(),
-    capacity: integer("capacity").notNull().default(1),
+    // Reported by the executor's heartbeat (§10.1): what it can run and how many background root Runs at once.
+    capabilities: text("capabilities", { mode: "json" }).$type<string[]>().notNull().default([]),
+    capacityBackground: integer("capacity_background").notNull().default(1),
     lastHeartbeatAt: text("last_heartbeat_at"),
     revokedAt: text("revoked_at"),
     createdAt: createdAt(),

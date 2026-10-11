@@ -114,11 +114,18 @@ export type Claim = {
   leaseExpiresAt: string;
 };
 export type ClaimFailure =
-  | { ok: false; reason: "stale_revision" | "resource_busy" }
+  | { ok: false; reason: "stale_revision" | "resource_busy" | "at_capacity" }
   | { ok: false; reason: "already_claimed"; jobState: string };
 export type ClaimResult = ({ ok: true; replayed: boolean } & Claim) | ClaimFailure;
 
-/** job.claim (§9.2 step 4): Job CAS, root Run, Execution, reservations, change rows and receipt in one batch. */
+/** The device's active root Runs (`runs.device_id`); its background capacity is `devices.capacity_background`. */
+const activeRootRunsSql = `SELECT COUNT(*) FROM runs
+  WHERE workspace_id = ? AND device_id = ? AND kind = 'root' AND state IN ${activeRunStates}`;
+
+/**
+ * job.claim (§9.2 step 4): Job CAS, root Run, Execution, reservations, change rows and receipt in one batch. The
+ * device's background capacity is checked inside the batch (after the new Run), so concurrent claims cannot exceed it.
+ */
 export const claimJob = async (db: D1Database, input: ClaimInput): Promise<ClaimResult> => {
   const { workspaceId, jobId, deviceId, operationId } = input;
   const key = {
@@ -146,6 +153,7 @@ export const claimJob = async (db: D1Database, input: ClaimInput): Promise<Claim
     leaseExpiresAt: iso(now + input.leaseSeconds * 1000),
   };
   const [setGuard, clearGuard] = guard(db, operationId);
+  const capacityGuard = `${operationId}:capacity`;
   try {
     const { response, replayed } = await withOperationReceipt(db, key, () => ({
       status: 201,
@@ -165,6 +173,13 @@ export const claimJob = async (db: D1Database, input: ClaimInput): Promise<Claim
              VALUES (?, ?, ?, 'root', ?, ?, 'starting', ?)`,
           )
           .bind(claim.runId, workspaceId, jobId, deviceId, claim.generation, claim.leaseExpiresAt),
+        db
+          .prepare(
+            `INSERT INTO atomic_guards (operation_id, ok)
+             VALUES (?, (${activeRootRunsSql}) <= (SELECT capacity_background FROM devices WHERE workspace_id = ? AND id = ?))`,
+          )
+          .bind(capacityGuard, workspaceId, deviceId, workspaceId, deviceId),
+        db.prepare("DELETE FROM atomic_guards WHERE operation_id = ?").bind(capacityGuard),
         // A Task Job's Execution records the Task and its current scope revision (§3.1).
         db
           .prepare(
@@ -221,16 +236,24 @@ const diagnoseClaimFailure = async (
     return { ok: false, reason: "already_claimed", jobState: job.state };
   }
   if (job.revision !== input.expectedRevision) return { ok: false, reason: "stale_revision" };
-  if (input.resourceKeys.length === 0) return null;
-  const busy = await db
+  if (input.resourceKeys.length > 0) {
+    const busy = await db
+      .prepare(
+        `SELECT 1 FROM resource_reservations
+          WHERE workspace_id = ? AND released_at IS NULL
+            AND resource_key IN (${input.resourceKeys.map(() => "?").join(", ")})`,
+      )
+      .bind(input.workspaceId, ...input.resourceKeys)
+      .first();
+    if (busy) return { ok: false, reason: "resource_busy" };
+  }
+  const full = await db
     .prepare(
-      `SELECT 1 FROM resource_reservations
-        WHERE workspace_id = ? AND released_at IS NULL
-          AND resource_key IN (${input.resourceKeys.map(() => "?").join(", ")})`,
+      `SELECT 1 FROM devices WHERE workspace_id = ? AND id = ? AND (${activeRootRunsSql}) >= capacity_background`,
     )
-    .bind(input.workspaceId, ...input.resourceKeys)
+    .bind(input.workspaceId, input.deviceId, input.workspaceId, input.deviceId)
     .first();
-  return busy ? { ok: false, reason: "resource_busy" } : null;
+  return full ? { ok: false, reason: "at_capacity" } : null;
 };
 
 // ------------------------------------------------------- Lease and finish
@@ -567,59 +590,31 @@ export const expireApprovals = async (db: D1Database, limit = 50) => {
   return [...new Set(results.map((a) => a.workspace_id))];
 };
 
-// A device is online when it heartbeated within this window: 3 × the 15 s heartbeat (docs/roadmap.md §1).
-const onlineSeconds = 45;
-// `placement` names devices; an empty `allowedDeviceIds` (any device) never waits here.
-const allOfflineSql = `json_array_length(placement, '$.allowedDeviceIds') > 0
-  AND NOT EXISTS (SELECT 1 FROM devices d, json_each(jobs.placement, '$.allowedDeviceIds') a
-                   WHERE d.workspace_id = jobs.workspace_id AND d.id = a.value AND d.revoked_at IS NULL
-                     AND d.last_heartbeat_at >= ?)`;
-
 /**
- * Queued Jobs whose allowed devices are all offline go `waiting_device` (§10.4, AT-30), with their change rows in the
- * same batch. A heartbeat flips them back (`resumeWaitingJobs`).
+ * Moves the given Jobs between `queued` and `waiting_device` (§10.4, AT-30) with their change rows in one batch. Which
+ * Jobs wait is decided by the caller's placement rule (apps/api-worker placement.ts); a Job no longer in the source
+ * state is skipped. Returns how many moved.
  */
-export const parkOfflineJobs = async (db: D1Database) => {
-  const now = iso();
-  const since = iso(Date.now() - onlineSeconds * 1000);
-  const parked = await db.batch<{ workspace_id: string }>([
-    db
-      .prepare(
-        `INSERT INTO change_log (workspace_id, entity_kind, entity_id, op, revision, scope)
-         SELECT workspace_id, 'job', id, 'upsert', revision + 1, 'workspace:' || workspace_id FROM jobs
-          WHERE state = 'queued' AND ${allOfflineSql}
-         RETURNING workspace_id`,
-      )
-      .bind(since),
-    db
-      .prepare(
-        `UPDATE jobs SET state = 'waiting_device', revision = revision + 1, updated_at = ?
-          WHERE state = 'queued' AND ${allOfflineSql}`,
-      )
-      .bind(now, since),
-  ]);
-  return [...new Set(parked[0]!.results.map((r) => r.workspace_id))];
-};
-
-/** Heartbeat side (AT-12): `waiting_device` Jobs this device may run go back to `queued`. Returns how many. */
-export const resumeWaitingJobs = async (
+export const setJobsWaitingDevice = async (
   db: D1Database,
-  input: { workspaceId: string; deviceId: string },
+  input: { workspaceId: string; jobIds: string[]; waiting: boolean },
 ) => {
-  const mine = `workspace_id = ? AND state = 'waiting_device'
-    AND EXISTS (SELECT 1 FROM json_each(jobs.placement, '$.allowedDeviceIds') WHERE value = ?)`;
+  if (input.jobIds.length === 0) return 0;
+  const [from, to] = input.waiting ? ["queued", "waiting_device"] : ["waiting_device", "queued"];
+  const where = `workspace_id = ? AND state = '${from}' AND id IN (SELECT value FROM json_each(?))`;
+  const ids = JSON.stringify(input.jobIds);
   const [changes] = await db.batch([
     db
       .prepare(
         `INSERT INTO change_log (workspace_id, entity_kind, entity_id, op, revision, scope)
-         SELECT workspace_id, 'job', id, 'upsert', revision + 1, 'workspace:' || workspace_id FROM jobs WHERE ${mine}`,
+         SELECT workspace_id, 'job', id, 'upsert', revision + 1, 'workspace:' || workspace_id FROM jobs WHERE ${where}`,
       )
-      .bind(input.workspaceId, input.deviceId),
+      .bind(input.workspaceId, ids),
     db
       .prepare(
-        `UPDATE jobs SET state = 'queued', revision = revision + 1, updated_at = ? WHERE ${mine}`,
+        `UPDATE jobs SET state = '${to}', revision = revision + 1, updated_at = ? WHERE ${where}`,
       )
-      .bind(iso(), input.workspaceId, input.deviceId),
+      .bind(iso(), input.workspaceId, ids),
   ]);
   return changes!.meta.changes;
 };

@@ -5,50 +5,50 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 
 ## Routes
 
-| Route                                                           | Auth                                   | Purpose                                                                                                                                                    |
-| --------------------------------------------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /healthz`                                                  | none                                   | Liveness                                                                                                                                                   |
-| `GET /v1/me`                                                    | Access assertion (user)                | Returns the user principal (CLI login check)                                                                                                               |
-| `POST /v1/commands`                                             | Access assertion (user)                | Command intake (see below)                                                                                                                                 |
-| `GET /v1/operations/:id`                                        | Access assertion (user)                | Receipt of the user's command; for `agent.send` also the inbox item, routing status and Job id                                                             |
-| `GET /v1/jobs/:id`                                              | Access assertion (user)                | A Job in one of the user's Workspaces, with `cancelRequestedAt` and its root `runs`                                                                        |
-| `GET /v1/runs/:id`                                              | Access assertion (user)                | A Run of the user's Workspaces: state, generation, device, `persistence`, started / finished, result, `hasProviderSession`, transcript parts and watermark |
-| `GET /v1/runs/:id/transcript?cursor=`                           | Access assertion (user)                | Normalized, redacted transcript, one confirmed part per page; channel member or owner (404 otherwise); see Transcripts                                     |
-| `GET /v1/transcripts/:runId/raw`                                | Access assertion (user, owner)         | The confirmed raw JSONL parts concatenated (`application/x-ndjson`); never indexed                                                                         |
-| `GET /v1/inbox?botId=`                                          | Access assertion (user)                | The Bot's inbox items (first 100, no cursor yet)                                                                                                           |
-| `GET /v1/channels?workspaceId=`                                 | Access assertion (user)                | Channels the user is a member of, with the main `conversationId` (max 500)                                                                                 |
-| `GET /v1/channels/:id/messages`                                 | Access assertion (user)                | Newest-first messages of a member channel (limit 1..200, default 50; 404 if not a member)                                                                  |
-| `GET /v1/bots?workspaceId=`                                     | Access assertion (user)                | Bots of the Workspace (max 500)                                                                                                                            |
-| `GET /v1/bot-conversations?workspaceId=`                        | Access assertion (user)                | `bot_pair` conversations with both Bots and their last 20 messages (max 100); see Bot messaging                                                            |
-| `GET /v1/devices?workspaceId=`                                  | Access assertion (user)                | Devices of the Workspace, no credentials (max 500)                                                                                                         |
-| `GET /v1/jobs?limit=&state=`                                    | Access assertion (user)                | Newest-first Jobs (limit 1..200, default 50), optionally of one state                                                                                      |
-| `GET /v1/routines?workspaceId=`                                 | Access assertion (user)                | Routines of the Workspace with their schedule (max 500); see Routines below                                                                                |
-| `GET /v1/projects?workspaceId=`                                 | Access assertion (user)                | Projects of the Workspace (max 500)                                                                                                                        |
-| `GET /v1/tasks?workspaceId=&projectKey=&status=`                | Access assertion (user)                | Tasks with computed `display` and `prerequisites` (max 500); see Work below                                                                                |
-| `GET /v1/tasks/:id`                                             | Access assertion (user)                | A Task with prerequisites, dependents, Results and Jobs                                                                                                    |
-| `GET /v1/subscriptions?workspaceId=`                            | Access assertion (user)                | Subscriptions of the Workspace with their spec (max 500); see Subscriptions below                                                                          |
-| `GET /v1/approvals?workspaceId=&state=`                         | Access assertion (user)                | Newest-first approvals (max 100), optionally one state; see Tools and approvals                                                                            |
-| `GET /v1/search?workspaceId=&q=&kinds=&limit=&cursor=`          | Access assertion (user)                | Full-text search over permitted scopes (limit 1..100, default 20); see Search and memory                                                                   |
-| `GET /v1/memories?workspaceId=&scopeKind=&scopeId=`             | Access assertion (user)                | Live memories of one scope, newest first (max 200; channel needs membership)                                                                               |
-| `POST /v1/admin/search/rebuild?workspaceId=`                    | Access assertion (user, owner)         | Drops the Workspace's search documents and re-enqueues every source (AT-38)                                                                                |
-| `GET /v1/sync/changes?cursor=`                                  | Access assertion (user)                | Permitted changes after the cursor (limit 1..500, default 100); see Sync below                                                                             |
-| `GET /v1/realtime?workspaceId=`                                 | Access assertion, or device Bearer     | WebSocket upgrade to the Workspace's Realtime DO; see Realtime below                                                                                       |
-| `POST /v1/run/commands`                                         | `Authorization: Bearer cap.<run>.<s>`  | Run command intake for the in-run hive tools; see Bot messaging                                                                                            |
-| `GET /v1/run/me`                                                | `Authorization: Bearer cap.<run>.<s>`  | The Run principal (`RunPrincipal`)                                                                                                                         |
-| `GET /v1/run/tasks/:id`                                         | `Authorization: Bearer cap.<run>.<s>`  | A Task of the Run's own Task's Project (`task.read`; 403 otherwise)                                                                                        |
-| `GET /v1/run/approvals/:id`                                     | `Authorization: Bearer cap.<run>.<s>`  | The Run's own approval at its generation (`ApprovalStatus`), polled by the executor                                                                        |
-| `GET /v1/run/search?q=&kinds=&limit=`                           | `Authorization: Bearer cap.<run>.<s>`  | Search within the Run's scopes (`search.read`; limit 1..50, default 10)                                                                                    |
-| `GET /v1/executor/me`                                           | `Authorization: Bearer <device-token>` | Returns the device principal                                                                                                                               |
-| `POST /v1/executor/pump`                                        | `Authorization: Bearer <device-token>` | Runs the outbox pump and time-driven work once; returns counts (see Outbox pump)                                                                           |
-| `POST /v1/executor/commands`                                    | `Authorization: Bearer <device-token>` | Executor command intake (see below)                                                                                                                        |
-| `POST /v1/executor/heartbeat`                                   | `Authorization: Bearer <device-token>` | Sets `devices.last_heartbeat_at` and requeues its `waiting_device` Jobs (no receipt)                                                                       |
-| `GET /v1/executor/jobs?state=queued&limit=`                     | `Authorization: Bearer <device-token>` | Queued Jobs in the device's Workspace it is eligible for (limit 1..100, default 50)                                                                        |
-| `GET /v1/executor/runs/:id`                                     | `Authorization: Bearer <device-token>` | The device's own Run: state, generation, `active` (startup reconcile)                                                                                      |
-| `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=` | `Authorization: Bearer <device-token>` | Run context for the adapter's prompt (see Executor commands)                                                                                               |
-| `POST /v1/executor/observations`                                | `Authorization: Bearer <device-token>` | Runtime observations: `runtime.run.started`, `runtime.run.stopped`                                                                                         |
-| `POST /v1/executor/uploads/init`                                | device token or `cap.`                 | Authorizes one transcript part `{runId, partSeq, byteSize, sha256, provider?}`; see Transcripts                                                            |
-| `PUT /v1/executor/uploads/:uploadId`                            | device token or `cap.`                 | Raw part body (≤ 8 MiB): verify, store in R2, commit the manifest                                                                                          |
-| `POST /v1/executor/uploads/complete`                            | device token or `cap.`                 | `{runId, lastPartSeq}` → `persistence: complete`, or 409 `gap`                                                                                             |
+| Route                                                           | Auth                                   | Purpose                                                                                                                                                        |
+| --------------------------------------------------------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /healthz`                                                  | none                                   | Liveness                                                                                                                                                       |
+| `GET /v1/me`                                                    | Access assertion (user)                | Returns the user principal (CLI login check)                                                                                                                   |
+| `POST /v1/commands`                                             | Access assertion (user)                | Command intake (see below)                                                                                                                                     |
+| `GET /v1/operations/:id`                                        | Access assertion (user)                | Receipt of the user's command; for `agent.send` also the inbox item, routing status and Job id                                                                 |
+| `GET /v1/jobs/:id`                                              | Access assertion (user)                | A Job in one of the user's Workspaces, with `cancelRequestedAt` and its root `runs`                                                                            |
+| `GET /v1/runs/:id`                                              | Access assertion (user)                | A Run of the user's Workspaces: state, generation, device, `persistence`, started / finished, result, `hasProviderSession`, transcript parts and watermark     |
+| `GET /v1/runs/:id/transcript?cursor=`                           | Access assertion (user)                | Normalized, redacted transcript, one confirmed part per page; channel member or owner (404 otherwise); see Transcripts                                         |
+| `GET /v1/transcripts/:runId/raw`                                | Access assertion (user, owner)         | The confirmed raw JSONL parts concatenated (`application/x-ndjson`); never indexed                                                                             |
+| `GET /v1/inbox?botId=`                                          | Access assertion (user)                | The Bot's inbox items (first 100, no cursor yet)                                                                                                               |
+| `GET /v1/channels?workspaceId=`                                 | Access assertion (user)                | Channels the user is a member of, with the main `conversationId` (max 500)                                                                                     |
+| `GET /v1/channels/:id/messages`                                 | Access assertion (user)                | Newest-first messages of a member channel (limit 1..200, default 50; 404 if not a member)                                                                      |
+| `GET /v1/bots?workspaceId=`                                     | Access assertion (user)                | Bots of the Workspace (max 500)                                                                                                                                |
+| `GET /v1/bot-conversations?workspaceId=`                        | Access assertion (user)                | `bot_pair` conversations with both Bots and their last 20 messages (max 100); see Bot messaging                                                                |
+| `GET /v1/devices?workspaceId=`                                  | Access assertion (user)                | Devices of the Workspace, no credentials (max 500)                                                                                                             |
+| `GET /v1/jobs?limit=&state=`                                    | Access assertion (user)                | Newest-first Jobs (limit 1..200, default 50), optionally of one state                                                                                          |
+| `GET /v1/routines?workspaceId=`                                 | Access assertion (user)                | Routines of the Workspace with their schedule (max 500); see Routines below                                                                                    |
+| `GET /v1/projects?workspaceId=`                                 | Access assertion (user)                | Projects of the Workspace (max 500)                                                                                                                            |
+| `GET /v1/tasks?workspaceId=&projectKey=&status=`                | Access assertion (user)                | Tasks with computed `display` and `prerequisites` (max 500); see Work below                                                                                    |
+| `GET /v1/tasks/:id`                                             | Access assertion (user)                | A Task with prerequisites, dependents, Results and Jobs                                                                                                        |
+| `GET /v1/subscriptions?workspaceId=`                            | Access assertion (user)                | Subscriptions of the Workspace with their spec (max 500); see Subscriptions below                                                                              |
+| `GET /v1/approvals?workspaceId=&state=`                         | Access assertion (user)                | Newest-first approvals (max 100), optionally one state; see Tools and approvals                                                                                |
+| `GET /v1/search?workspaceId=&q=&kinds=&limit=&cursor=`          | Access assertion (user)                | Full-text search over permitted scopes (limit 1..100, default 20); see Search and memory                                                                       |
+| `GET /v1/memories?workspaceId=&scopeKind=&scopeId=`             | Access assertion (user)                | Live memories of one scope, newest first (max 200; channel needs membership)                                                                                   |
+| `POST /v1/admin/search/rebuild?workspaceId=`                    | Access assertion (user, owner)         | Drops the Workspace's search documents and re-enqueues every source (AT-38)                                                                                    |
+| `GET /v1/sync/changes?cursor=`                                  | Access assertion (user)                | Permitted changes after the cursor (limit 1..500, default 100); see Sync below                                                                                 |
+| `GET /v1/realtime?workspaceId=`                                 | Access assertion, or device Bearer     | WebSocket upgrade to the Workspace's Realtime DO; see Realtime below                                                                                           |
+| `POST /v1/run/commands`                                         | `Authorization: Bearer cap.<run>.<s>`  | Run command intake for the in-run hive tools; see Bot messaging                                                                                                |
+| `GET /v1/run/me`                                                | `Authorization: Bearer cap.<run>.<s>`  | The Run principal (`RunPrincipal`)                                                                                                                             |
+| `GET /v1/run/tasks/:id`                                         | `Authorization: Bearer cap.<run>.<s>`  | A Task of the Run's own Task's Project (`task.read`; 403 otherwise)                                                                                            |
+| `GET /v1/run/approvals/:id`                                     | `Authorization: Bearer cap.<run>.<s>`  | The Run's own approval at its generation (`ApprovalStatus`), polled by the executor                                                                            |
+| `GET /v1/run/search?q=&kinds=&limit=`                           | `Authorization: Bearer cap.<run>.<s>`  | Search within the Run's scopes (`search.read`; limit 1..50, default 10)                                                                                        |
+| `GET /v1/executor/me`                                           | `Authorization: Bearer <device-token>` | Returns the device principal                                                                                                                                   |
+| `POST /v1/executor/pump`                                        | `Authorization: Bearer <device-token>` | Runs the outbox pump and time-driven work once; returns counts (see Outbox pump)                                                                               |
+| `POST /v1/executor/commands`                                    | `Authorization: Bearer <device-token>` | Executor command intake (see below)                                                                                                                            |
+| `POST /v1/executor/heartbeat`                                   | `Authorization: Bearer <device-token>` | Body `{capabilities?, capacity?: {background}}`; sets `last_heartbeat_at`, stores what is given and requeues the `waiting_device` Jobs it can run (no receipt) |
+| `GET /v1/executor/jobs?state=queued&limit=`                     | `Authorization: Bearer <device-token>` | Queued Jobs in the device's Workspace offered to it now by the placement rule (limit 1..100, default 50)                                                       |
+| `GET /v1/executor/runs/:id`                                     | `Authorization: Bearer <device-token>` | The device's own Run: state, generation, `active` (startup reconcile)                                                                                          |
+| `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=` | `Authorization: Bearer <device-token>` | Run context for the adapter's prompt (see Executor commands)                                                                                                   |
+| `POST /v1/executor/observations`                                | `Authorization: Bearer <device-token>` | Runtime observations: `runtime.run.started`, `runtime.run.stopped`                                                                                             |
+| `POST /v1/executor/uploads/init`                                | device token or `cap.`                 | Authorizes one transcript part `{runId, partSeq, byteSize, sha256, provider?}`; see Transcripts                                                                |
+| `PUT /v1/executor/uploads/:uploadId`                            | device token or `cap.`                 | Raw part body (≤ 8 MiB): verify, store in R2, commit the manifest                                                                                              |
+| `POST /v1/executor/uploads/complete`                            | device token or `cap.`                 | `{runId, lastPartSeq}` → `persistence: complete`, or 409 `gap`                                                                                                 |
 
 - **User auth.** `Cf-Access-Jwt-Assertion` is verified with `jose` against
   `https://<ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs` (issuer `https://<ACCESS_TEAM_DOMAIN>`, audience
@@ -88,7 +88,8 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 `idempotencyKey` is the receipt key passed to `claimJob` / `finishRun`.
 
 - **`job.claim {jobId, expectedRevision, resourceKeys?}`.** The Job must be in the device's Workspace (404) and the
-  placement must allow the device (403 `FORBIDDEN`, `reason: "not_eligible"`). Then `claimJob` commits the Job CAS,
+  placement must offer it to the device now (403 `FORBIDDEN`, `reason: "not_eligible"`, the message names the
+  placement reason; 409 `RESOURCE_BUSY` `at_capacity` when the device is full). Then `claimJob` commits the Job CAS,
   root Run, Execution, reservations and receipt in one batch with a 90 s lease. `resourceKeys` defaults to
   `["bot:<botId>"]`, so one Bot runs one root Run at a time (a simplification of §7.3's per-binding concurrency).
   Returns `{runId, executionId, executionGeneration, leaseExpiresAt, capability, job: {id, botId, inboxItemId,
@@ -97,9 +98,18 @@ placement}}` (capability: see Bot messaging).
   the error body carries `reason`. Job state is checked by the CAS, not before it, so a replay of a successful claim
   returns the stored response. A `waiting_device` Job is claimable like a `queued` one (the claiming device is
   evidently online).
-- **Eligibility.** A non-empty `allowedDeviceIds` is always intersected, whatever the `mode` (§10.2: safety
-  constraints are intersected); an empty list means any device of the Workspace. `GET /v1/executor/jobs` applies
-  the same filter in code. Revoked devices are already rejected by device auth.
+- **Placement** (`src/placement.ts`, pure; §9.2 step 1, §10.2). Constraints, always intersected: the device is in a
+  non-empty `allowedDeviceIds`, `pinned` runs only on its single `preferredDeviceIds` entry, the `environmentId` is
+  registered on the device and `requiredCapabilities` ⊆ the heartbeat's `capabilities` (reasons `not_allowed`,
+  `environment_missing`, `capability_missing`). Rank: `preferredDeviceIds` in order, every other device after them
+  (equal); `any` ranks none. Offer rule: a device that meets the constraints and has a free slot may take the Job
+  unless a higher-ranked device that meets them blocks it: online with a free slot always does
+  (`higher_ranked_online`), online and full does unless `overflowToFallback`, offline (no heartbeat within 45 s)
+  does unless `fallbackOnUnavailable` (`fallback_disabled`). Capacity: the device's active root Runs (starting /
+  running / waiting_approval / stopping) against `devices.capacity_background` (`at_capacity`). `GET
+/v1/executor/jobs` filters by the rule and `job.claim` re-validates it (§9.2 step 3) for a `queued` /
+  `waiting_device` Job; `claimJob` checks capacity again inside its batch. There is no offers table: the
+  deterministic rank is the offer. Revoked devices are rejected by device auth and left out of the rank.
 - **`run.lease.renew {runId, executionGeneration}`.** Fenced by run + device + generation (`renewLease`); a stale
   fence is 409 `STALE_GENERATION`. No receipt: renewing twice is harmless. Returns `{leaseExpiresAt,
 cancelRequested}`; `cancelRequested` is true once a user sent `job.cancel` for the Job.
@@ -151,11 +161,13 @@ docs/architecture.md §9.1, §9.3, §10.4. Lease expiry is not proof of a stop, 
   gets `cancel_requested_at` and stays `active` until the executor sees `cancelRequested` on renewal, stops the agent
   and submits `failed` (finished as `cancelled`, see `run.result.submit`). Other states are 409 (a
   `recovery_required` Job goes through `job.resolve`). Both commands are revision CASes with a receipt.
-- **`waiting_device`** (pump, `parkOfflineJobs`): a `queued` Job whose non-empty `allowedDeviceIds` are all offline
-  (no heartbeat within 45 s = 3 × 15 s, or revoked) becomes `waiting_device` (AT-30). A heartbeat of one of those
-  devices returns it to `queued` (`resumeWaitingJobs`, one batch with the change rows). Both bump the revision, so
-  the executor claims with the revision it just listed. A Job with an empty `allowedDeviceIds` (any device) is never
-  parked.
+- **`waiting_device`** (pump, `parkWaitingJobs`): a `queued` Job with a constraint (allowed devices, pinned,
+  environment or capabilities) that no online device meets becomes `waiting_device` (AT-30, AT-22). A heartbeat of a
+  device that meets the constraints returns it to `queued` (`setJobsWaitingDevice`, one batch with the change
+  rows). Both bump the revision, so the executor claims with the revision it just listed. A Job without constraints
+  is never parked, and a busy online device does not park one. `GET /v1/jobs/:id` carries `waitingReason`: for a
+  `queued` / `waiting_device` Job no device can take now, `{code: "no_eligible_device", devices: [{deviceId,
+reasons}]}` (constraint reasons plus `offline` / `at_capacity`), otherwise null.
 
 ## Routines
 
@@ -494,8 +506,12 @@ Raw provider transcripts in R2 with a D1 manifest (docs/architecture.md §3.3, �
   of different content for one uncommitted seq can overwrite each other's object (the executor never does that).
   The watermark is recomputed over all parts per commit. `GET /v1/runs/:id` has no Channel ACL (Workspace
   membership only). Normalized entries carry no timestamp (SDK messages have none).
-- **Executor.** No process supervisor (the fake adapter runs in-process), no artifact upload, and there is no scheduler / offer or notification: executors poll `GET /v1/executor/jobs`. A page of that list is filtered after `LIMIT`, so it
-  may hold fewer than `limit` eligible Jobs.
+- **Executor.** No process supervisor (the fake adapter runs in-process), no artifact upload, and there is no scheduler / offers table or notification: executors poll `GET /v1/executor/jobs`. A page of that list is filtered after `LIMIT`, so it
+  may hold fewer than `limit` eligible Jobs. The pump parks at most 200 queued Jobs per sweep and a heartbeat resumes
+  at most 200.
+- **Placement.** No provider auth-profile shared budget (§10.2), no interactive vs background lanes (§7.3: only
+  `capacity_background` exists and every root Run counts against it), no per-Bot concurrency beyond the `bot:<id>`
+  reservation, and no `safe_auto` failover.
 - **Sync / realtime.** No scope revocation: no command removes a member, so nothing bumps `auth_epoch` or closes
   sockets whose scopes shrank (§12.4); add it with the member commands. Socket scopes are computed once at
   upgrade, so a channel joined later needs a reconnect, and they live in the socket attachment (16 KiB cap, about

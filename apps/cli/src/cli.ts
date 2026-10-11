@@ -1,6 +1,7 @@
 // `hive` argv dispatcher (docs/architecture.md §23). I/O, credentials and the executor journal are injected
 // by main.ts, so tests drive `run` with fakes.
 import { type ParseArgsOptionsConfig, parseArgs } from "node:util";
+import { parseConcurrency } from "@hive/executor/capabilities";
 import { type CloudClient, createCloudClient } from "@hive/executor/cloudClient";
 import { CliError, type Client, createClient, type Fetch, invalid } from "./client.ts";
 import * as cmd from "./commands.ts";
@@ -21,7 +22,13 @@ export type Deps = {
   readInput(path: string): Promise<string>;
   stdout(line: string): void;
   stderr(line: string): void;
-  runExecutor(cloud: CloudClient, once: boolean, provider: Provider): Promise<unknown>;
+  /** `concurrency`: background Runs at once, also reported as the device's capacity. */
+  runExecutor(
+    cloud: CloudClient,
+    once: boolean,
+    provider: Provider,
+    concurrency: number,
+  ): Promise<unknown>;
   /**
    * Maps an environment name to a local checkout root in the executor's `environments.json` (§10.1). Rejects a path
    * that is not an existing directory; returns the absolute path stored.
@@ -91,6 +98,49 @@ const toolPolicy = (values: Values, current?: cmd.Json) => {
   return { tools: parsed, cwdMode: cwdMode ?? current?.cwdMode ?? "run_scratch" };
 };
 
+const list = (value: unknown) =>
+  typeof value === "string"
+    ? value
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : undefined;
+
+const bool = { type: "boolean" } as const;
+const placementOptions: ParseArgsOptionsConfig = {
+  "allowed-device": { type: "string", multiple: true },
+  allowed: str,
+  preferred: str,
+  mode: str,
+  capabilities: str,
+  environment: str,
+  overflow: bool,
+  "no-overflow": bool,
+  fallback: bool,
+  "no-fallback": bool,
+};
+const placementUsage =
+  "[--mode any|preferred|pinned] [--preferred <id,...>] [--allowed <id,...>] [--allowed-device <id>]... [--overflow|--no-overflow] [--fallback|--no-fallback] [--capabilities <name,...>] [--environment <name>]";
+
+/** Placement flags (§10.2) merged over `current`; undefined when none is given. The server validates the result. */
+const placementPolicy = (values: Values, current: cmd.Json = {}) => {
+  const allowed = [
+    ...((values["allowed-device"] as string[] | undefined) ?? []),
+    ...(list(values.allowed) ?? []),
+  ];
+  const either = (on: string, off: string) => (values[on] ? true : values[off] ? false : undefined);
+  const change = Object.entries({
+    mode: values.mode,
+    allowedDeviceIds: allowed.length > 0 ? allowed : undefined,
+    preferredDeviceIds: list(values.preferred),
+    requiredCapabilities: list(values.capabilities),
+    environmentId: values.environment,
+    overflowToFallback: either("overflow", "no-overflow"),
+    fallbackOnUnavailable: either("fallback", "no-fallback"),
+  }).filter(([, value]) => value !== undefined);
+  return change.length === 0 ? undefined : { ...current, ...Object.fromEntries(change) };
+};
+
 const instructionsOf = async (c: Ctx) => {
   const { instructions, "instructions-file": file } = c.values;
   if (instructions !== undefined && file !== undefined)
@@ -135,58 +185,58 @@ const specs: Record<string, Spec> = {
       c.print(await cmd.channelCreate(c.client(), c.envelope(), need(c.values, "name"))),
   },
   "bot create": {
-    usage:
-      "--name <name> [--allowed-device <device-id>]... [--instructions <text> | --instructions-file <path|->] [--tools <Tool=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] [--environment <name>]",
+    usage: `--name <name> [--instructions <text> | --instructions-file <path|->] [--tools <Tool=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] ${placementUsage}`,
     options: {
       name: str,
-      "allowed-device": { type: "string", multiple: true },
       instructions: str,
       "instructions-file": str,
       tools: str,
       "cwd-mode": str,
-      environment: str,
+      ...placementOptions,
     },
     run: async (c) => {
       const instructions = await instructionsOf(c);
       c.print(
-        await cmd.botCreate(
-          c.client(),
-          c.envelope(),
-          need(c.values, "name"),
-          c.values["allowed-device"] as string[] | undefined,
-          instructions,
-          {
-            toolPolicy: toolPolicy(c.values),
-            environment: c.values.environment as string | undefined,
-          },
-        ),
+        await cmd.botCreate(c.client(), c.envelope(), need(c.values, "name"), instructions, {
+          toolPolicy: toolPolicy(c.values),
+          placementPolicy: placementPolicy(c.values),
+        }),
       );
     },
   },
   "bot update": {
-    usage:
-      "<bot-id> [--instructions <text> | --instructions-file <path|->] [--tools <Tool=allow|ask|deny,...>] [--cwd-mode run_scratch|environment]",
+    usage: `<bot-id> [--instructions <text> | --instructions-file <path|->] [--tools <Tool=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] ${placementUsage}`,
     args: 1,
-    options: { instructions: str, "instructions-file": str, tools: str, "cwd-mode": str },
+    options: {
+      instructions: str,
+      "instructions-file": str,
+      tools: str,
+      "cwd-mode": str,
+      ...placementOptions,
+    },
     run: async (c) => {
       const instructions = await instructionsOf(c);
       const botId = c.args[0]!;
-      // `--tools` replaces the tool list; an omitted part keeps the Bot's current one.
+      // `--tools` replaces the tool list; an omitted part (and every placement field not given) keeps the Bot's own.
       const current =
-        c.values.tools === undefined && c.values["cwd-mode"] === undefined
+        toolPolicy(c.values) === undefined && placementPolicy(c.values) === undefined
           ? undefined
           : (
               (await cmd.listBots(c.client(), c.workspace())) as {
-                bots: { id: string; toolPolicy: cmd.Json }[];
+                bots: { id: string; toolPolicy: cmd.Json; placementPolicy: cmd.Json }[];
               }
-            ).bots.find((b) => b.id === botId)?.toolPolicy;
-      const policy = toolPolicy(c.values, current);
-      if (instructions === undefined && policy === undefined)
-        throw invalid("nothing to update: give --instructions(-file), --tools or --cwd-mode");
+            ).bots.find((b) => b.id === botId);
+      const policy = toolPolicy(c.values, current?.toolPolicy);
+      const placement = placementPolicy(c.values, current?.placementPolicy);
+      if (instructions === undefined && policy === undefined && placement === undefined)
+        throw invalid(
+          "nothing to update: give --instructions(-file), --tools, --cwd-mode or placement flags",
+        );
       c.print(
         await cmd.botUpdate(c.client(), c.envelope(), botId, {
           ...(instructions === undefined ? {} : { instructions }),
           ...(policy ? { toolPolicy: policy } : {}),
+          ...(placement ? { placementPolicy: placement } : {}),
         }),
       );
     },
@@ -627,12 +677,18 @@ const specs: Record<string, Spec> = {
     ]),
   ),
   "executor run": {
-    usage: "[--once] [--provider fake|claude|codex]",
-    options: { once: flag, provider: { type: "string", default: "fake" } },
+    usage: "[--once] [--provider fake|claude|codex] [--concurrency N]",
+    options: {
+      once: flag,
+      provider: { type: "string", default: "fake" },
+      concurrency: { type: "string", default: "1" },
+    },
     run: async (c) => {
       const provider = c.values.provider;
       if (provider !== "fake" && provider !== "claude" && provider !== "codex")
         throw invalid("--provider must be fake, claude or codex");
+      const concurrency = parseConcurrency(c.values.concurrency as string);
+      if (concurrency === null) throw invalid("--concurrency must be an integer in 1..64");
       const token = c.creds.deviceToken;
       if (!token)
         throw new CliError("UNAUTHENTICATED", 3, "no deviceToken: run `hive device register`");
@@ -653,7 +709,9 @@ const specs: Record<string, Spec> = {
         },
       };
       c.print(
-        (await c.deps.runExecutor(pumping, c.values.once === true, provider)) ?? { claimed: null },
+        (await c.deps.runExecutor(pumping, c.values.once === true, provider, concurrency)) ?? {
+          claimed: null,
+        },
       );
     },
   },

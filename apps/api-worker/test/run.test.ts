@@ -23,6 +23,8 @@ const bots = async () => {
   const s = await setup();
   const { botId: helperId } = await s.ok({ type: "bot.create", name: "helper" });
   const device = executor(s.deviceToken, s.workspaceId);
+  // Several Runs at once on the one device.
+  await device.post("/v1/executor/heartbeat", { capacity: { background: 8 } });
   const claimJob = async (jobId: string, expectedRevision = 1) => {
     const res = await device.command(claim(jobId, expectedRevision));
     expect(res.status).toBe(200);

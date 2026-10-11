@@ -31,7 +31,13 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK), `codex` 
   (see Tool policy and approvals).
 - `src/environments.ts`: `<state-dir>/environments.json`, environment name → local checkout root; `runCwd`, the
   per-Run cwd both real adapters use.
-- `src/main.ts`: `--api-url --token-file --state-dir [--once] --provider fake|claude|codex` (`node:util` `parseArgs`).
+- `src/capabilities.ts`: `executorHeartbeat` builds the heartbeat body (§10.1): capabilities `bash` (always),
+  `claude` (Claude provider configured; no probe), `codex` (Codex provider and a `codex` binary on `PATH`) and
+  `env:<name>` per environment in `environments.json`; `capacity.background` = `--concurrency`. Bots match their
+  `requiredCapabilities` against these.
+- `src/main.ts`: `--api-url --token-file --state-dir [--once] [--concurrency N] --provider fake|claude|codex`
+  (`node:util` `parseArgs`). `--concurrency N` (1..64, default 1) runs N worker loops in `runLoop`, each sequential,
+  and reports N as the device's background capacity; the cloud refuses claims past it (409 `at_capacity`).
 
 ## Claude provider
 

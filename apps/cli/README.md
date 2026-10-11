@@ -14,9 +14,12 @@ hive workspace create --id <id> --name <name>          # stores apiUrl + workspa
 hive device register --name <n> --os <os> --agent-version <v>
                                                        # prints the token once, stores it for `executor run`
 hive channel create --name <name>
-hive bot create --name <name> [--allowed-device <device-id>]... [--instructions <text> | --instructions-file <path|->]
-                [--tools <Tool=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] [--environment <name>]
+hive bot create --name <name> [--instructions <text> | --instructions-file <path|->]
+                [--tools <Tool=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] [placement flags]
 hive bot update <bot-id> [--instructions <text> | --instructions-file <path|->] [--tools ...] [--cwd-mode ...]
+                [placement flags]
+  placement flags: [--mode any|preferred|pinned] [--preferred <id,...>] [--allowed <id,...>] [--allowed-device <id>]...
+                   [--overflow|--no-overflow] [--fallback|--no-fallback] [--capabilities <name,...>] [--environment <name>]
 hive device env add --name <name> --repo <url> --path <local checkout root>
 hive approval list [--state pending|approved|denied|expired]   # default pending
 hive approval resolve <approval-id> (--allow | --deny) [--reason <text>]
@@ -37,7 +40,7 @@ hive channel list | hive bot list | hive device list   # bootstrap lists of the 
 hive channel messages <channel-id>                     # newest-first messages of a member channel
 hive bot conversations                                 # private bot-to-bot conversations and their messages
 hive sync changes [--cursor <cursor>]                  # without --cursor: the bootstrap cursor
-hive executor run [--once] [--provider fake|claude|codex]  # Local Executor with the stored token (default fake)
+hive executor run [--once] [--provider fake|claude|codex] [--concurrency N]  # Local Executor (default fake, 1)
 hive project create --key <KEY> --name <name>
 hive task create (--project <KEY> | --parent <task>) --title <title> [--priority <n>]
 hive task list [--project <KEY>] [--status <status>]
@@ -79,6 +82,12 @@ a fresh UUID per invocation).
   `bot update --tools` replaces the tool list and keeps the current `cwdMode` unless `--cwd-mode` is given; it reads
   the Bot's revision from `bot list`, so a concurrent edit is 409 (exit 4). **Security:** Bash is not
   path-restricted (see `apps/executor/README.md`, Tool policy and approvals); prefer `Bash=ask`.
+- **Placement flags** build the Bot's `placementPolicy` (`apps/api-worker/README.md`, Placement): `--allowed` and
+  `--allowed-device` add up, `--overflow` / `--no-fallback` set `overflowToFallback: true` /
+  `fallbackOnUnavailable: false`. `bot update` merges the given fields over the Bot's current policy from `bot list`;
+  the server rejects preferred devices outside a non-empty allowed list and a `pinned` mode without exactly one
+  `--preferred` (422, exit 2). `device list` shows each device's `capabilities`, `capacityBackground` and
+  `lastHeartbeatAt` (online = within 45 s).
 - **`device env add`** resolves `--path` to an existing directory and writes it to
   `<config dir>/hive/executor/environments.json` first (the local path never leaves the device), then registers
   `{deviceId (from the stored device token), name, repository}` in the cloud. A Bot created with
@@ -92,7 +101,8 @@ a fresh UUID per invocation).
   `{"botId": "<bot-id>", "eventTypes": ["github.pull_request.*"], "filter": {"op": "eq", "field":
 "data.repositoryId", "value": 42}, "destination": {"conversationId": "<conversation-id>"}, "delivery": {"mode":
 "batch"}}`. The server validates it (see `apps/api-worker/README.md`, Subscriptions).
-- **`executor run`** wraps `runLoop` from `@hive/executor` with the credentials' `deviceToken`; the journal lives in
+- **`executor run`** wraps `runLoop` from `@hive/executor` with the credentials' `deviceToken` and the heartbeat of
+  `executorHeartbeat` (capabilities, `--concurrency` as the background capacity); the journal lives in
   `<config dir>/hive/executor/` (Claude transcripts under `transcripts/`, run cwd under `runs/`; see
   `apps/executor/README.md`). `FAKE_DELAY_MS` / `FAKE_FAIL=1` tune the fake provider. Before each poll it calls
   `POST /v1/executor/pump`, because no Queue consumer exists yet and `wrangler dev` fires no cron. After each Run

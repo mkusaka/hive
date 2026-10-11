@@ -11,7 +11,8 @@
     "./adapters/codex": "./src/adapters/codex.ts",
     "./journal": "./src/journal.ts",
     "./uploader": "./src/uploader.ts",
-    "./environments": "./src/environments.ts"
+    "./environments": "./src/environments.ts",
+    "./capabilities": "./src/capabilities.ts"
   },
   "scripts": {
     "start": "bun run src/main.ts"

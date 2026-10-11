@@ -1,7 +1,8 @@
 import * as v from "valibot";
 import { describe, expect, it } from "vitest";
-import { BotCreate, EventEmit, eventEnvelope, parse } from "./index.ts";
+import { BotCreate, EventEmit, eventEnvelope, parse, PlacementPolicy } from "./index.ts";
 
+const placement = (p: object) => parse(PlacementPolicy, p).ok;
 const BuildFailed = eventEnvelope(v.strictObject({ command: v.string(), exitCode: v.number() }));
 
 const valid = {
@@ -57,6 +58,14 @@ describe("command schemas", () => {
         toolPolicy: { tools: {}, cwdMode: "run_scratch" },
       },
     });
+  });
+
+  it("rejects preferred devices outside the allowed list and a pinned placement without one device", () => {
+    expect(placement({ allowedDeviceIds: ["pc1"], preferredDeviceIds: ["pc2"] })).toBe(false);
+    expect(placement({ preferredDeviceIds: ["pc1", "pc2"] })).toBe(true);
+    expect(placement({ mode: "pinned", allowedDeviceIds: ["pc1"] })).toBe(false);
+    expect(placement({ mode: "pinned", preferredDeviceIds: ["pc1", "pc2"] })).toBe(false);
+    expect(placement({ mode: "pinned", preferredDeviceIds: ["pc1"] })).toBe(true);
   });
 
   it("requires event data and caps it at 64 KiB of JSON bytes", () => {

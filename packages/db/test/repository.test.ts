@@ -155,6 +155,27 @@ describe("claimJob", () => {
     expect(await count("executions WHERE workspace_id = ?", s.ws)).toBe(1);
   });
 
+  it("rolls back a claim past the device's background capacity (checked inside the batch)", async () => {
+    const s = await seed();
+    expect((await claimJob(db, claimInput(s))).ok).toBe(true);
+    const other = id();
+    await db
+      .prepare(
+        "INSERT INTO jobs (id, workspace_id, bot_id, trigger_key, placement) VALUES (?, ?, ?, ?, '{}')",
+      )
+      .bind(other, s.ws, s.bot, other)
+      .run();
+    const input = claimInput(s, { jobId: other, resourceKeys: [] });
+    expect(await claimJob(db, input)).toEqual({ ok: false, reason: "at_capacity" });
+    expect(await job(other)).toEqual({ state: "queued", revision: 1 });
+    expect(await count("atomic_guards")).toBe(0);
+    await db
+      .prepare("UPDATE devices SET capacity_background = 2 WHERE id = ?")
+      .bind(s.device)
+      .run();
+    expect((await claimJob(db, { ...input, operationId: id() })).ok).toBe(true);
+  });
+
   it("replays the stored response for the same operation and rejects a different digest", async () => {
     const s = await seed();
     const input = claimInput(s);

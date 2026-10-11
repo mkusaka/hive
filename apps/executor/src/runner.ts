@@ -1,8 +1,9 @@
 // Job runner (docs/architecture.md §9.2, §20.2): heartbeat → list → claim → journal intent → adapter →
 // result, renewing the lease while the agent runs. Web-standard APIs only; the journal is injected.
-// Claims, runs and reconciles are sequential on purpose: one Run at a time per executor (capacity 1).
+// Claims, runs and reconciles are sequential on purpose within one worker loop; `--concurrency N` runs N loops, and
+// the cloud caps the device's active root Runs at the capacity the heartbeat reports.
 /* oxlint-disable no-await-in-loop */
-import type { RunContext } from "@hive/contracts";
+import type { ExecutorHeartbeat, RunContext } from "@hive/contracts";
 import { CloudError, type CloudClient, type RunApi } from "./cloudClient.ts";
 import type { Uploader } from "./uploader.ts";
 
@@ -59,12 +60,16 @@ export type RunningAgent = {
 };
 export type AgentAdapter = { start(input: LaunchContext): Promise<RunningAgent> };
 
-/** `uploader`: sends each Run's transcript after its result (uploader.ts); none means transcripts stay local. */
+/**
+ * `uploader`: sends each Run's transcript after its result (uploader.ts); none means transcripts stay local.
+ * `heartbeat`: capabilities / capacity reported with each poll (capabilities.ts).
+ */
 export type RunnerDeps = {
   cloud: CloudClient;
   journal: Journal;
   adapter: AgentAdapter;
   uploader?: Uploader;
+  heartbeat?: ExecutorHeartbeat;
 };
 
 const isStale = (error: unknown) =>
@@ -214,7 +219,7 @@ export const reconcile = async (deps: RunnerDeps) => {
 
 /** One poll: heartbeat, then claim and run the first queued Job this device wins. Null when none. */
 export const runOnce = async (deps: RunnerDeps) => {
-  await deps.cloud.heartbeat();
+  await deps.cloud.heartbeat(deps.heartbeat);
   for (const job of await deps.cloud.listQueuedJobs(10)) {
     const claim = await deps.cloud
       .claim({ jobId: job.id, expectedRevision: job.revision })
@@ -238,15 +243,24 @@ export const runOnce = async (deps: RunnerDeps) => {
   return null;
 };
 
-/** Reconcile, then poll. `once` handles at most one queued Job and returns. */
-export const runLoop = async (deps: RunnerDeps, options: { once: boolean; pollMs: number }) => {
+/**
+ * Reconcile, then poll. `once` handles at most one queued Job and returns. Otherwise `concurrency` (default 1) worker
+ * loops poll side by side, so up to that many Runs execute at once; claim races between them end in a 409.
+ */
+export const runLoop = async (
+  deps: RunnerDeps,
+  options: { once: boolean; pollMs: number; concurrency?: number },
+) => {
   await reconcile(deps);
   if (options.once) return runOnce(deps);
-  for (;;) {
-    const ran = await runOnce(deps).catch((error: unknown) => {
-      console.error("poll failed", error);
-      return null;
-    });
-    if (!ran) await new Promise((resolve) => setTimeout(resolve, options.pollMs));
-  }
+  const worker = async () => {
+    for (;;) {
+      const ran = await runOnce(deps).catch((error: unknown) => {
+        console.error("poll failed", error);
+        return null;
+      });
+      if (!ran) await new Promise((resolve) => setTimeout(resolve, options.pollMs));
+    }
+  };
+  await Promise.all(Array.from({ length: options.concurrency ?? 1 }, worker));
 };

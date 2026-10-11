@@ -77,7 +77,11 @@ describe("executor job.claim", () => {
     const { botId } = await s.ok({
       type: "bot.create",
       name: "pinned",
-      placementPolicy: { mode: "pinned", allowedDeviceIds: [other.deviceId] },
+      placementPolicy: {
+        mode: "pinned",
+        allowedDeviceIds: [other.deviceId],
+        preferredDeviceIds: [other.deviceId],
+      },
     });
     const { jobId } = await queuedJob(s, botId as string);
     const device = executor(s.deviceToken, s.workspaceId);

@@ -1,4 +1,5 @@
 import {
+  ExecutorHeartbeat,
   maxTranscriptPartBytes,
   parse,
   RunObservation,
@@ -200,7 +201,11 @@ export const createApp = ({
     hint(c, { workspaceId: parsed.value.workspaceId, scopes: scopes ?? [] });
     return c.json(response, status as ContentfulStatusCode);
   });
-  app.post("/v1/executor/heartbeat", async (c) => c.json(await heartbeat(c.env.DB, device(c))));
+  app.post("/v1/executor/heartbeat", async (c) => {
+    const parsed = parse(ExecutorHeartbeat, await c.req.json().catch(() => ({})));
+    if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
+    return c.json(await heartbeat(c.env.DB, device(c), parsed.value));
+  });
   app.get("/v1/executor/jobs", async (c) => {
     if (c.req.query("state") !== "queued")
       throw new HttpError("INVALID_INPUT", "state=queued is required");

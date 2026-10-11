@@ -15,12 +15,12 @@ import {
   expireLeases,
   markOutboxDead,
   markOutboxSent,
-  parkOfflineJobs,
   recordEventRouted,
   type Recipient,
   routeToRecipients,
   sealDueBatches,
 } from "@hive/db";
+import { parkWaitingJobs } from "./executor.ts";
 import type { Notification } from "./realtime.ts";
 import { fireDueRoutines } from "./routines.ts";
 import { indexSource } from "./search.ts";
@@ -235,9 +235,9 @@ export const pump = async (
       input.notify?.({ workspaceId, scopes: [`workspace:${workspaceId}`], jobAvailable: true });
     }
   }
-  // Recovery (§10.4): expired leases → unknown / recovery_required; Jobs whose devices are all offline wait.
+  // Recovery (§10.4): expired leases → unknown / recovery_required; Jobs no online device can run wait.
   const expired = await expireLeases(db);
-  const parked = await parkOfflineJobs(db);
+  const parked = await parkWaitingJobs(db);
   // Approval timeout (§19, roadmap §1): pending past expires_at, or for a Run no longer current, is a deny.
   const approvals = await expireApprovals(db);
   for (const workspaceId of new Set([...expired, ...parked, ...approvals])) {

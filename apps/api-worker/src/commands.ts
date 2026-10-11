@@ -362,7 +362,10 @@ const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env
   return uniqueName(db, "bots", workspaceId, command.name, run);
 };
 
-/** Revision CAS on `config_revision`. A Run reads the policy once at start, so an update never widens a running one. */
+/**
+ * Revision CAS on `config_revision`. A Run reads the policy once at start, so an update never widens a running one; a
+ * placement change applies to Jobs created afterwards (queued Jobs keep their snapshot, §10.2).
+ */
 const botUpdate: Handler<v.InferOutput<typeof BotUpdate>> = async (db, user, env) => {
   const { workspaceId, command } = env;
   const revision = async () => {
@@ -384,12 +387,13 @@ const botUpdate: Handler<v.InferOutput<typeof BotUpdate>> = async (db, user, env
       db
         .prepare(
           `UPDATE bots SET instructions = COALESCE(?, instructions), tool_policy = COALESCE(?, tool_policy),
-             config_revision = config_revision + 1, updated_at = ?
+             placement_policy = COALESCE(?, placement_policy), config_revision = config_revision + 1, updated_at = ?
             WHERE workspace_id = ? AND id = ? AND config_revision = ?`,
         )
         .bind(
           command.instructions ?? null,
           command.toolPolicy ? JSON.stringify(command.toolPolicy) : null,
+          command.placementPolicy ? JSON.stringify(command.placementPolicy) : null,
           new Date().toISOString(),
           workspaceId,
           command.botId,

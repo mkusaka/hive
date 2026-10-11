@@ -257,7 +257,11 @@ describe("job.start and completion", () => {
     expect(res.status).toBe(200);
     const { jobId } = await res.json<{ jobId: string }>();
     expect(await (await w.user.get(`/v1/jobs/${jobId}`)).json()).toMatchObject({
-      placement: { mode: "pinned", allowedDeviceIds: [w.deviceId] },
+      placement: {
+        mode: "pinned",
+        allowedDeviceIds: [w.deviceId],
+        preferredDeviceIds: [w.deviceId],
+      },
     });
     expect(await (await w.command(start, "start-1")).json()).toMatchObject({ jobId });
     expect((await w.task(taskId)).jobs).toHaveLength(1);
@@ -271,7 +275,11 @@ describe("job.start and completion", () => {
     const { botId } = await w.ok({
       type: "bot.create",
       name: "pinned",
-      placementPolicy: { mode: "pinned", allowedDeviceIds: [w.deviceId] },
+      placementPolicy: {
+        mode: "pinned",
+        allowedDeviceIds: [w.deviceId],
+        preferredDeviceIds: [w.deviceId],
+      },
     });
     const outside = await w.command({ ...start, botId, deviceId: other.deviceId });
     expect(await errorOf(outside)).toMatchObject({ status: 422, reason: "not_eligible" });

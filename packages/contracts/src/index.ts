@@ -96,17 +96,30 @@ export const ChannelCreate = v.strictObject({ type: v.literal("channel.create"),
 
 const DeviceIds = v.optional(v.array(DeviceId), []);
 
-// docs/architecture.md §3.2, §10.2. Every field defaults, so `{}` means "any eligible device".
-export const PlacementPolicy = v.strictObject({
-  mode: v.optional(v.picklist(["pinned", "preferred", "any"]), "any"),
-  allowedDeviceIds: DeviceIds,
-  preferredDeviceIds: DeviceIds,
-  fallbackOnUnavailable: v.optional(v.boolean(), true),
-  overflowToFallback: v.optional(v.boolean(), false),
-  environmentId: v.optional(Name),
-  requiredCapabilities: v.optional(v.array(Name), []),
-  recovery: v.optional(v.picklist(["manual", "safe_auto"]), "manual"),
-});
+// docs/architecture.md §3.2, §10.2. Every field defaults, so `{}` means "any eligible device". `preferred` ranks
+// `preferredDeviceIds` in order; `pinned` runs only on its single `preferredDeviceIds` entry.
+export const PlacementPolicy = v.pipe(
+  v.strictObject({
+    mode: v.optional(v.picklist(["pinned", "preferred", "any"]), "any"),
+    allowedDeviceIds: DeviceIds,
+    preferredDeviceIds: DeviceIds,
+    fallbackOnUnavailable: v.optional(v.boolean(), true),
+    overflowToFallback: v.optional(v.boolean(), false),
+    environmentId: v.optional(Name),
+    requiredCapabilities: v.optional(v.array(Name), []),
+    recovery: v.optional(v.picklist(["manual", "safe_auto"]), "manual"),
+  }),
+  v.check(
+    (p) =>
+      p.allowedDeviceIds.length === 0 ||
+      p.preferredDeviceIds.every((d) => p.allowedDeviceIds.includes(d)),
+    "preferredDeviceIds must be a subset of allowedDeviceIds",
+  ),
+  v.check(
+    (p) => p.mode !== "pinned" || p.preferredDeviceIds.length === 1,
+    "pinned placement needs exactly one preferredDeviceIds entry",
+  ),
+);
 export type PlacementPolicy = v.InferOutput<typeof PlacementPolicy>;
 
 const MessageText = v.pipe(v.string(), v.minLength(1), v.maxLength(64 * 1024));
@@ -146,7 +159,23 @@ export const BotUpdate = v.strictObject({
   expectedRevision: Revision,
   instructions: v.optional(Instructions),
   toolPolicy: v.optional(ToolPolicy),
+  placementPolicy: v.optional(PlacementPolicy),
 });
+
+/**
+ * `POST /v1/executor/heartbeat` body (§10.1). Capabilities name what the executor can run (`claude`, `codex`, `bash`,
+ * `env:<environment>`); `capacity.background` is how many background root Runs it runs at once. An omitted field
+ * keeps the stored value.
+ */
+export const ExecutorHeartbeat = v.strictObject({
+  capabilities: v.optional(v.pipe(v.array(Name), v.maxLength(100))),
+  capacity: v.optional(
+    v.strictObject({
+      background: v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(64)),
+    }),
+  ),
+});
+export type ExecutorHeartbeat = v.InferInput<typeof ExecutorHeartbeat>;
 
 /** Registers (or updates the repository of) an environment on one of the caller's devices (§10.1). */
 export const DeviceEnvironmentRegister = v.strictObject({

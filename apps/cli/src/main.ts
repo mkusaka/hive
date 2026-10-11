@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { text } from "node:stream/consumers";
 import { claudeAdapter } from "@hive/executor/adapters/claude";
 import { codexAdapter } from "@hive/executor/adapters/codex";
+import { executorHeartbeat } from "@hive/executor/capabilities";
 import { saveEnvironment } from "@hive/executor/environments";
 import { fakeAdapter } from "@hive/executor/adapters/fake";
 import { fileJournal, transcriptReader } from "@hive/executor/journal";
@@ -60,12 +61,13 @@ process.exitCode = await run(process.argv.slice(2), {
   },
   stdout: (line) => console.log(line),
   stderr: (line) => console.error(line),
-  runExecutor: async (cloud, once, provider) => {
+  runExecutor: async (cloud, once, provider, concurrency) => {
     const journal = await fileJournal(executorDir);
     return runLoop(
       {
         cloud,
         journal,
+        heartbeat: await executorHeartbeat({ provider, stateDir: executorDir, concurrency }),
         uploader: transcriptUploader({
           cloud,
           journal,
@@ -83,7 +85,7 @@ process.exitCode = await run(process.argv.slice(2), {
                 }),
       },
       // docs/roadmap.md §1: executor Job reconcile every 30 s (no WebSocket yet).
-      { once, pollMs: 30_000 },
+      { once, pollMs: 30_000, concurrency },
     );
   },
 });
