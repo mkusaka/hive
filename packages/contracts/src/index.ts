@@ -317,6 +317,22 @@ export const tokenizeMentions = (text: string, bots: readonly { id: string; name
   return out;
 };
 
+export const maxAttachmentBytes = 25 * 1024 * 1024;
+export const allowedAttachmentContentTypes = [
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "application/pdf",
+  "text/plain",
+  "text/markdown",
+  "application/json",
+  "text/csv",
+  "application/zip",
+] as const;
+const Sha256Hex = v.pipe(v.string(), v.regex(/^[0-9a-f]{64}$/));
+export type AttachmentSummary = { id: string; name: string; contentType: string; size: number };
+
 /**
  * A user's Channel message (docs/architecture.md §7.2). In a Channel's main conversation every member Bot gets the
  * Inbox item + Job that `agent.send` with `request` / `wake` gives (ROUTE-02, group chat); a `<@bot:ID>` mention or a
@@ -335,12 +351,39 @@ export const MessagePost = v.pipe(
     mentions: v.optional(v.array(BotId)),
     /** A Reply on a message of this conversation: on a Bot's message, it addresses that Bot (ROUTE-02). */
     replyToMessageId: v.optional(v.pipe(v.string(), v.minLength(1))),
+    attachmentIds: v.optional(
+      v.pipe(
+        v.array(v.pipe(v.string(), v.minLength(1))),
+        v.maxLength(10),
+        v.check((ids) => new Set(ids).size === ids.length, "attachmentIds must be unique"),
+      ),
+      [],
+    ),
   }),
   v.check(
     (c) => (c.channelId === undefined) !== (c.conversationId === undefined),
     "exactly one of channelId / conversationId is required",
   ),
 );
+
+/** Starts an immutable user attachment upload for the same target a `message.post` uses. */
+export const AttachmentInit = v.pipe(
+  v.strictObject({
+    workspaceId: WorkspaceId,
+    channelId: v.optional(ChannelId),
+    conversationId: v.optional(v.pipe(v.string(), v.minLength(1))),
+    threadOf: v.optional(v.pipe(v.string(), v.minLength(1))),
+    name: v.pipe(v.string(), v.minLength(1), v.maxLength(255)),
+    contentType: v.picklist(allowedAttachmentContentTypes),
+    size: v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(maxAttachmentBytes)),
+    sha256: v.optional(Sha256Hex),
+  }),
+  v.check(
+    (c) => (c.channelId === undefined) !== (c.conversationId === undefined),
+    "exactly one of channelId / conversationId is required",
+  ),
+);
+export type AttachmentInit = v.InferOutput<typeof AttachmentInit>;
 
 // --------------------------------------------- Run commands (docs/architecture.md §8, §18.2)
 // `POST /v1/run/commands` with a Run capability: the sender is the Run's Bot, never a declared one.
@@ -1118,6 +1161,8 @@ export type RunContext = {
   } | null;
   /** A batch Job's sealed Inbox batch, items oldest first; `inboxItem` is then null. */
   batch: { id: string; items: { id: string; body: string }[] } | null;
+  /** Attachments of the triggering message and the messages in this context; the executor fills `path` after download. */
+  attachments: (AttachmentSummary & { messageId: string; path?: string })[];
   /** Replies to requests this Job's Runs sent (§8.2), oldest first: what a successor Run continues from. */
   replies: {
     messageId: string;
@@ -1201,8 +1246,6 @@ export type ExecutorRun = {
 /** Largest part the cloud accepts; the executor splits at 1 MiB on line boundaries. */
 export const maxTranscriptPartBytes = 8 * 1024 * 1024;
 
-const Sha256Hex = v.pipe(v.string(), v.regex(/^[0-9a-f]{64}$/));
-
 /**
  * A native provider session stream (§13.3) instead of the Run's transcript. `subpath` is opaque (a sub-agent
  * transcript); omitted for the main one.
@@ -1254,6 +1297,8 @@ export const apiErrorStatus = {
   RESOURCE_BUSY: 409,
   CURSOR_EXPIRED: 410,
   INVALID_INPUT: 422,
+  PAYLOAD_TOO_LARGE: 413,
+  UNSUPPORTED_MEDIA_TYPE: 415,
   RATE_LIMITED: 429,
   UPSTREAM_UNAVAILABLE: 503,
 } as const;

@@ -815,6 +815,7 @@ export const getRunContext = async (
       delegator_name: string | null;
     }>();
   if (!row) throw new HttpError("NOT_FOUND", "job not found");
+  const attachmentMessageIds = row.message_id ? [row.message_id] : [];
   let batch: RunContext["batch"] = null;
   if (row.inbox_batch_id) {
     const { results } = await db
@@ -864,8 +865,8 @@ export const getRunContext = async (
       (
         await db
           .prepare(
-            `SELECT actorKind, actorId, body, createdAt FROM (
-               SELECT a.kind AS actorKind, a.id AS actorId, m.body, m.created_at AS createdAt, m.seq
+            `SELECT id, actorKind, actorId, body, createdAt FROM (
+               SELECT m.id, a.kind AS actorKind, a.id AS actorId, m.body, m.created_at AS createdAt, m.seq
                  FROM messages m JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
                 WHERE m.workspace_id = ?1 AND m.conversation_id = ?2
                   AND (?3 IS NULL OR m.seq < (SELECT seq FROM messages WHERE id = ?3))
@@ -873,15 +874,17 @@ export const getRunContext = async (
              ) ORDER BY seq`,
           )
           .bind(workspaceId, conversationId, before)
-          .all<RunContext["parentMessages"][number]>()
+          .all<RunContext["parentMessages"][number] & { id: string }>()
       ).results;
     const results = await lastMessages(row.conversation_id, null);
+    attachmentMessageIds.push(...results.map((message) => message.id));
     // A thread: its root message first, and the parent's messages before the root as read-only context.
     const thread =
       row.conversation_kind === "thread"
         ? await db
             .prepare(
-              `SELECT c.parent_conversation_id, c.root_message_id, a.kind AS actorKind, a.id AS actorId, m.body, m.created_at AS createdAt
+              `SELECT c.parent_conversation_id, c.root_message_id, m.id, a.kind AS actorKind, a.id AS actorId,
+                      m.body, m.created_at AS createdAt
                  FROM conversations c
                  JOIN messages m ON m.workspace_id = c.workspace_id AND m.id = c.root_message_id
                  JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
@@ -890,6 +893,7 @@ export const getRunContext = async (
             .bind(workspaceId, row.conversation_id)
             .first<
               RunContext["parentMessages"][number] & {
+                id: string;
                 parent_conversation_id: string;
                 root_message_id: string;
               }
@@ -897,8 +901,11 @@ export const getRunContext = async (
         : null;
     if (thread) {
       const { parent_conversation_id: parentId, root_message_id: rootId, ...root } = thread;
+      attachmentMessageIds.push(root.id);
       results.unshift(root);
-      parentMessages = await lastMessages(parentId, rootId);
+      const parent = await lastMessages(parentId, rootId);
+      attachmentMessageIds.push(...parent.map((message) => message.id));
+      parentMessages = parent.map(({ id: _id, ...message }) => message);
     }
     // A DM's counterpart: its user's actor.
     const counterpart =
@@ -917,7 +924,7 @@ export const getRunContext = async (
       channelId: row.channel_id,
       kind: row.conversation_kind ?? "channel",
       counterpart,
-      recent: results,
+      recent: results.map(({ id: _id, ...message }) => message),
     };
   }
   // Group chat (ROUTE-02): the other member Bots, and what was posted since this Bot's previous Run here.
@@ -1030,6 +1037,20 @@ export const getRunContext = async (
         snippet,
       }))
     : [];
+  const contextAttachmentIds = [...new Set(attachmentMessageIds)];
+  const attachments =
+    contextAttachmentIds.length === 0
+      ? []
+      : (
+          await db
+            .prepare(
+              `SELECT id, name, content_type AS contentType, size, message_id AS messageId FROM attachments
+                WHERE workspace_id = ? AND state = 'ready' AND message_id IN (${contextAttachmentIds.map(() => "?").join(", ")})
+                ORDER BY created_at, id`,
+            )
+            .bind(workspaceId, ...contextAttachmentIds)
+            .all<RunContext["attachments"][number]>()
+        ).results;
   // The native session to resume (§13.3): the latest earlier Job Run of this Job that reported one.
   const previous = await db
     .prepare(
@@ -1102,6 +1123,7 @@ export const getRunContext = async (
         }
       : null,
     batch,
+    attachments,
     replies: replies.map((r) => ({
       messageId: r.id,
       requestMessageId: r.reply_to_message_id,

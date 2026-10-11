@@ -1,9 +1,9 @@
 // @vitest-environment happy-dom
-import { act, screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { dayLabel, mentionItems } from "../../src/renderer/src/chat.tsx";
 import { parseMarkdown, toMarkdown } from "../../src/renderer/src/format.ts";
-import { renderApp } from "./fakeHive.ts";
+import { renderApp, sidebar } from "./fakeHive.ts";
 import { channels, messages } from "./fixtures.ts";
 
 const post = (text: string) => ({
@@ -281,5 +281,126 @@ describe("chat", () => {
     expect(await panel().findByText("Mina (you)")).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Channel details" }));
     expect(panel().getByRole("tab", { name: "About" }).getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("uploads picked files as removable chips and sends their attachment ids", async () => {
+    const { hive, user } = renderApp({
+      attachment: {
+        pick: () => ({ ok: true, value: { paths: ["/tmp/notes.md"] } }),
+        upload: ({ path }) =>
+          path === "/tmp/notes.md"
+            ? {
+                ok: true,
+                value: { id: "att-1", name: "notes.md", contentType: "text/markdown", size: 2048 },
+              }
+            : { ok: false, error: { code: "INVALID_ARGS", message: "unexpected path" } },
+      },
+    });
+    await screen.findByText("please fix the build");
+    await user.click(screen.getByRole("button", { name: "Attach files" }));
+    expect(await screen.findByText(/notes\.md.*2 KB/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Remove notes.md" }));
+    expect(screen.queryByText(/notes\.md.*2 KB/)).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Attach files" }));
+    await screen.findByText(/notes\.md.*2 KB/);
+    await user.type(editor(), "with file");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(hive.sent("message.post").map((entry) => entry.command)).toEqual([
+      { type: "message.post", channelId: "ch-1", text: "with file", attachmentIds: ["att-1"] },
+    ]);
+    expect(screen.queryByText(/notes\.md.*2 KB/)).toBeNull();
+  });
+
+  it("uploads dropped files and pasted images without reading renderer bytes", async () => {
+    const { hive } = renderApp({
+      attachment: {
+        filePaths: (files) =>
+          files.map((file) =>
+            file instanceof File && file.name === "paste.png" ? "/tmp/paste.png" : "/tmp/drop.png",
+          ),
+        upload: ({ path }) => ({
+          ok: true,
+          value: {
+            id: path.includes("drop") ? "att-drop" : "att-paste",
+            name: path.includes("drop") ? "drop.png" : "paste.png",
+            contentType: "image/png",
+            size: 4,
+          },
+        }),
+      },
+    });
+    await screen.findByText("please fix the build");
+    const composer = editor().closest("form")!;
+    fireEvent.drop(composer, { dataTransfer: { files: [{}] } });
+    await screen.findByText(/drop\.png.*4 B/);
+    fireEvent.paste(composer, {
+      clipboardData: { files: [new File(["x"], "paste.png", { type: "image/png" })] },
+    });
+    await screen.findByText(/paste\.png.*4 B/);
+    expect(hive.calls.attachment.filter((call) => call.method === "upload")).toHaveLength(2);
+  });
+
+  it("uses main clipboard upload when a pasted image has no native file path", async () => {
+    const { hive } = renderApp({
+      attachment: {
+        filePaths: () => [],
+        paste: () => ({
+          ok: true,
+          value: { id: "att-clipboard", name: "clipboard.png", contentType: "image/png", size: 4 },
+        }),
+      },
+    });
+    await screen.findByText("please fix the build");
+    fireEvent.paste(editor().closest("form")!, {
+      clipboardData: { files: [new File(["x"], "clipboard.png", { type: "image/png" })] },
+    });
+    expect(await screen.findByText(/clipboard\.png.*4 B/)).toBeTruthy();
+    expect(hive.calls.attachment).toContainEqual({
+      method: "paste",
+      input: { target: { workspaceId: "ws-1", channelId: "ch-1" } },
+    });
+  });
+
+  it("clears pending attachments when the composer target changes", async () => {
+    const { user } = renderApp({
+      attachment: {
+        pick: () => ({ ok: true, value: { paths: ["/tmp/notes.md"] } }),
+        upload: () => ({
+          ok: true,
+          value: { id: "att-1", name: "notes.md", contentType: "text/markdown", size: 4 },
+        }),
+      },
+    });
+    await screen.findByText("please fix the build");
+    await user.click(screen.getByRole("button", { name: "Attach files" }));
+    await screen.findByText(/notes\.md.*4 B/);
+    await user.click(await (await sidebar()).findByText("# release"));
+    await screen.findByText("release notes ready");
+    expect(screen.queryByText(/notes\.md.*4 B/)).toBeNull();
+  });
+
+  it("renders image attachments from main data URLs and saves other files through main", async () => {
+    const attached = {
+      ...messages[0]!,
+      attachments: [
+        { id: "att-image", name: "diagram.png", contentType: "image/png", size: 4 },
+        { id: "att-file", name: "notes.md", contentType: "text/markdown", size: 8 },
+      ],
+    };
+    const { hive, user } = renderApp({
+      get: { "/v1/channels/ch-1/messages": { messages: [attached] } },
+      attachment: {
+        dataUrl: () => ({ ok: true, value: { dataUrl: "data:image/png;base64,AA==" } }),
+      },
+    });
+    expect((await screen.findByRole("img", { name: "diagram.png" })).getAttribute("src")).toBe(
+      "data:image/png;base64,AA==",
+    );
+    await user.click(screen.getByRole("button", { name: "Save…" }));
+    expect(hive.calls.attachment).toContainEqual({
+      method: "save",
+      input: { id: "att-file", name: "notes.md" },
+    });
   });
 });

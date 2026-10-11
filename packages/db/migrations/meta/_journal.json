@@ -190,6 +190,13 @@
       "when": 1791754208174,
       "tag": "0032_permissions_skills",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "6",
+      "when": 1791755122676,
+      "tag": "0033_attachments",
+      "breakpoints": true
     }
   ]
 }

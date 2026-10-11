@@ -7,7 +7,16 @@ import Placeholder from "@tiptap/extension-placeholder";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import type { SuggestionProps } from "@tiptap/suggestion";
-import { Fragment, useEffect, useRef, useState } from "react";
+import type { AttachmentSummary } from "@hive/contracts";
+import {
+  Fragment,
+  type ClipboardEvent as ReactClipboardEvent,
+  type DragEvent as ReactDragEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import type { AttachmentTarget } from "../../shared/api.ts";
 import { everyone, type Inline, parseMarkdown, toMarkdown } from "./format.ts";
 import { Avatar, Icon, type Row, text } from "./ui.tsx";
 
@@ -109,6 +118,17 @@ export const mentionItems = (bots: Row[], query: string, dmBot: string | null, g
 
 type Suggestion = SuggestionProps<Row, { id: string; label: string }>;
 
+const attachment = (value: unknown): AttachmentSummary | null => {
+  if (!value || typeof value !== "object") return null;
+  const a = value as Partial<AttachmentSummary>;
+  return typeof a.id === "string" &&
+    typeof a.name === "string" &&
+    typeof a.contentType === "string" &&
+    typeof a.size === "number"
+    ? (a as AttachmentSummary)
+    : null;
+};
+
 /**
  * The message.post composer: a Tiptap editor with mention pills, the `@` popup and the operation line. `target` is the
  * command's address (`channelId` / `conversationId`, plus `threadOf` in a thread); `dmBot` limits `@` to a DM's Bot.
@@ -131,6 +151,8 @@ export const Composer = (props: {
   const [active, setActive] = useState(0);
   const [empty, setEmpty] = useState(true);
   const [op, setOp] = useState<Operation | null>(null);
+  const [attachments, setAttachments] = useState<AttachmentSummary[]>([]);
+  const [uploading, setUploading] = useState(false);
   /** What the editor's extensions (created once) read at call time. */
   const live = useRef({
     props,
@@ -138,6 +160,12 @@ export const Composer = (props: {
     keyDown: (_: KeyboardEvent): boolean => false,
     menuOpen: false,
   });
+  const attachmentRequest = useRef(0);
+  useEffect(() => {
+    attachmentRequest.current += 1;
+    setAttachments([]);
+    setUploading(false);
+  }, [props.ws, props.target?.channelId, props.target?.conversationId, props.target?.threadOf]);
   const editor = useEditor({
     extensions: [
       StarterKit.configure({
@@ -201,9 +229,94 @@ export const Composer = (props: {
   const highlighted = Math.min(active, matches.length - 1);
   const pick = (b: Row) => suggestion?.command({ id: b.id, label: String(b.name) });
 
+  const attachPaths = async (paths: string[]) => {
+    if (!props.target || uploading) return;
+    const available = 10 - attachments.length;
+    if (available <= 0) return;
+    const request = ++attachmentRequest.current;
+    const target: AttachmentTarget = { workspaceId: props.ws, ...props.target };
+    setUploading(true);
+    try {
+      for (const path of paths.slice(0, available)) {
+        const result = await window.hive.attachment.upload({ target, path });
+        const current = live.current.props;
+        if (
+          request !== attachmentRequest.current ||
+          current.ws !== target.workspaceId ||
+          current.target?.channelId !== target.channelId ||
+          current.target?.conversationId !== target.conversationId ||
+          current.target?.threadOf !== target.threadOf
+        )
+          return;
+        if (!result.ok) {
+          setOp({ operationId: "", jobIds: null, error: result.error.message });
+          break;
+        }
+        const uploaded = attachment(result.value);
+        if (uploaded) setAttachments((files) => [...files, uploaded]);
+      }
+    } finally {
+      if (request === attachmentRequest.current) setUploading(false);
+    }
+  };
+
+  const attachClipboard = async () => {
+    if (!props.target || uploading || attachments.length === 10) return;
+    const request = ++attachmentRequest.current;
+    const target: AttachmentTarget = { workspaceId: props.ws, ...props.target };
+    setUploading(true);
+    try {
+      const result = await window.hive.attachment.paste({ target });
+      const current = live.current.props;
+      if (
+        request !== attachmentRequest.current ||
+        current.ws !== target.workspaceId ||
+        current.target?.channelId !== target.channelId ||
+        current.target?.conversationId !== target.conversationId ||
+        current.target?.threadOf !== target.threadOf
+      )
+        return;
+      if (!result.ok) return setOp({ operationId: "", jobIds: null, error: result.error.message });
+      const uploaded = attachment(result.value);
+      if (uploaded) setAttachments((files) => [...files, uploaded]);
+    } finally {
+      if (request === attachmentRequest.current) setUploading(false);
+    }
+  };
+
+  const attachPicked = async () => {
+    const result = await window.hive.attachment.pick();
+    if (!result.ok) return setOp({ operationId: "", jobIds: null, error: result.error.message });
+    const paths = Array.isArray(result.value.paths)
+      ? result.value.paths.filter((path): path is string => typeof path === "string")
+      : [];
+    await attachPaths(paths);
+  };
+
+  const attachDropped = (event: ReactDragEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    void attachPaths(window.hive.attachment.filePaths(Array.from(event.dataTransfer.files)));
+  };
+
+  const attachPasted = (event: ReactClipboardEvent<HTMLFormElement>) => {
+    const images = Array.from(event.clipboardData.files).filter((file) =>
+      ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.type),
+    );
+    const hasImage =
+      images.length > 0 ||
+      Array.from(event.clipboardData.items ?? []).some((item) =>
+        ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(item.type),
+      );
+    if (!hasImage) return;
+    event.preventDefault();
+    const paths = window.hive.attachment.filePaths(images);
+    if (paths.length > 0) void attachPaths(paths);
+    else void attachClipboard();
+  };
+
   const send = async () => {
     const draft = editor ? toMarkdown(editor.getJSON()) : "";
-    if (!draft || !props.target) return;
+    if (!draft || !props.target || uploading) return;
     const operationId = crypto.randomUUID();
     const result = await window.hive.api.command({
       operationId,
@@ -214,11 +327,13 @@ export const Composer = (props: {
         ...props.target,
         ...(props.replyTo ? { replyToMessageId: props.replyTo.id } : {}),
         text: draft,
+        ...(attachments.length > 0 ? { attachmentIds: attachments.map((file) => file.id) } : {}),
       },
     });
     if (!result.ok) return setOp({ operationId, jobIds: null, error: result.error.message });
     editor?.chain().clearContent(true).focus().run();
     props.replyTo?.clear();
+    setAttachments([]);
     if (typeof result.value.conversationId === "string")
       props.onPosted?.(result.value.conversationId);
     const woken = (result.value.inboxItemIds as unknown[] | undefined)?.length ?? 0;
@@ -263,6 +378,9 @@ export const Composer = (props: {
     <>
       <form
         className="composer"
+        onDragOver={(event) => event.preventDefault()}
+        onDrop={attachDropped}
+        onPasteCapture={attachPasted}
         onSubmit={(e) => {
           e.preventDefault();
           void send();
@@ -299,8 +417,42 @@ export const Composer = (props: {
             ))}
           </ul>
         )}
-        <EditorContent editor={editor} className="composer-input" />
-        <button className="send" aria-label="Send" disabled={empty}>
+        <button
+          className="attachment-add"
+          type="button"
+          aria-label="Attach files"
+          disabled={uploading || attachments.length === 10}
+          onClick={() => void attachPicked()}
+        >
+          +
+        </button>
+        <div className="composer-body">
+          {attachments.length > 0 && (
+            <div className="attachment-chips" aria-label="Attachments">
+              {attachments.map((file) => (
+                <span key={file.id} className="attachment-chip">
+                  {file.name} ·{" "}
+                  {file.size < 1024
+                    ? `${file.size} B`
+                    : file.size < 1024 * 1024
+                      ? `${Math.ceil(file.size / 1024)} KB`
+                      : `${(file.size / 1024 / 1024).toFixed(1)} MB`}
+                  <button
+                    type="button"
+                    aria-label={`Remove ${file.name}`}
+                    onClick={() =>
+                      setAttachments((current) => current.filter((item) => item.id !== file.id))
+                    }
+                  >
+                    <Icon name="close" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <EditorContent editor={editor} className="composer-input" />
+        </div>
+        <button className="send" aria-label="Send" disabled={empty || uploading}>
           <Icon name="send" />
         </button>
       </form>
@@ -355,6 +507,41 @@ type ThreadSummary = {
   participants: string[];
 };
 
+const MessageAttachment = ({ file }: { file: AttachmentSummary }) => {
+  const [source, setSource] = useState<string | null>(null);
+  useEffect(() => {
+    if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.contentType)) return;
+    let current = true;
+    void window.hive.attachment
+      .dataUrl({ id: file.id, contentType: file.contentType })
+      .then((result) => {
+        if (current && result.ok && typeof result.value.dataUrl === "string")
+          setSource(result.value.dataUrl);
+      });
+    return () => {
+      current = false;
+    };
+  }, [file.contentType, file.id]);
+
+  if (["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.contentType))
+    return source ? <img className="attachment-image" src={source} alt={file.name} /> : null;
+  return (
+    <div className="attachment-card">
+      <span>
+        {file.name} ·{" "}
+        {file.size < 1024
+          ? `${file.size} B`
+          : file.size < 1024 * 1024
+            ? `${Math.ceil(file.size / 1024)} KB`
+            : `${(file.size / 1024 / 1024).toFixed(1)} MB`}
+      </span>
+      <button onClick={() => void window.hive.attachment.save({ id: file.id, name: file.name })}>
+        Save…
+      </button>
+    </div>
+  );
+};
+
 /** One message: author, time, bubble, hover actions and, with replies, the thread footer. */
 const Message = (props: {
   m: Row;
@@ -373,6 +560,12 @@ const Message = (props: {
   const names: Names = new Map(props.bots.map((b) => [b.id, String(b.name)]));
   const author = botByActor.get(String(m.actorId));
   const thread = m.thread as ThreadSummary | null | undefined;
+  const attachments = Array.isArray(m.attachments)
+    ? m.attachments.flatMap((value) => {
+        const file = attachment(value);
+        return file ? [file] : [];
+      })
+    : [];
   return (
     <article className="message">
       <div className="author">
@@ -393,6 +586,9 @@ const Message = (props: {
       )}
       <div className="bubble">
         <Markdown source={String(m.body ?? "")} names={names} />
+        {attachments.map((file) => (
+          <MessageAttachment key={file.id} file={file} />
+        ))}
       </div>
       {thread && props.openThread && (
         <button className="thread-footer" onClick={() => props.openThread?.(m)}>

@@ -100,8 +100,28 @@ export type HiveConfig = {
 
 export type ExecutorProvider = "fake" | "claude" | "codex";
 
+export type AttachmentTarget = {
+  workspaceId: string;
+  channelId?: string;
+  conversationId?: string;
+  threadOf?: string;
+};
+
+export type AttachmentApi = {
+  /** Native file picker; its paths are only ever sent back to main for upload. */
+  pick(): Promise<ApiResult>;
+  /** Resolves dropped or pasted Electron Files without reading their bytes in the renderer. */
+  filePaths(files: unknown[]): string[];
+  upload(input: { target: AttachmentTarget; path: string }): Promise<ApiResult>;
+  /** Uploads the current native clipboard image through main when Electron has no source file path. */
+  paste(input: { target: AttachmentTarget }): Promise<ApiResult>;
+  dataUrl(input: { id: string; contentType: string }): Promise<ApiResult>;
+  save(input: { id: string; name: string }): Promise<ApiResult>;
+};
+
 export type HiveApi = {
   api: { get(path: string): Promise<ApiResult>; command(envelope: UiCommand): Promise<ApiResult> };
+  attachment: AttachmentApi;
   /** The executor launchd service: status (with `registered`), start (= install with these options), stop. */
   executor: {
     status(): Promise<ApiResult>;
@@ -131,4 +151,9 @@ export const channels = {
   executorStatus: "hive:executor.status",
   executorStart: "hive:executor.start",
   executorStop: "hive:executor.stop",
+  attachmentPick: "hive:attachment.pick",
+  attachmentUpload: "hive:attachment.upload",
+  attachmentDataUrl: "hive:attachment.data-url",
+  attachmentSave: "hive:attachment.save",
+  attachmentPaste: "hive:attachment.paste",
 } as const;

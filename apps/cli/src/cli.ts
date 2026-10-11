@@ -12,6 +12,7 @@ import {
 import { accessTokens, login, type OAuthToken, type OpenBrowser } from "./accessLogin.ts";
 import { CliError, type Client, createClient, type Fetch, invalid } from "./client.ts";
 import * as cmd from "./commands.ts";
+import { uploadFile } from "./attachments.ts";
 
 export type Credentials = {
   apiUrl?: string;
@@ -32,8 +33,10 @@ export type Deps = {
   saveCredentials(patch: Credentials): Promise<{ tokenFile?: string }>;
   /** `hive login` and a re-login after `invalid_grant`. */
   openBrowser: OpenBrowser;
-  /** File contents; `-` is stdin. */
+  /** Text input, including `-` for stdin. */
   readInput(path: string): Promise<string>;
+  readBytes(path: string): Promise<Uint8Array>;
+  writeBytes(path: string, bytes: Uint8Array): Promise<void>;
   stdout(line: string): void;
   stderr(line: string): void;
   /** `concurrency`: background Runs at once, also reported as the device's capacity. */
@@ -601,13 +604,14 @@ const specs: Record<string, Spec> = {
   },
   "message post": {
     usage:
-      "(--channel <channel-id> | --conversation <dm-conversation-id>) [--thread-of <message-id>] [--reply-to <message-id>] --text <text with <@bot:ID> tokens> [--resolve-names]",
+      "(--channel <channel-id> | --conversation <dm-conversation-id>) [--thread-of <message-id>] [--reply-to <message-id>] --text <text with <@bot:ID> tokens> [--attach <path>...] [--resolve-names]",
     options: {
       channel: str,
       conversation: str,
       "thread-of": str,
       "reply-to": str,
       text: str,
+      attach: { type: "string", multiple: true },
       "resolve-names": flag,
     },
     run: async (c) => {
@@ -616,17 +620,40 @@ const specs: Record<string, Spec> = {
         throw invalid("exactly one of --channel / --conversation is required");
       const threadOf = c.values["thread-of"] as string | undefined;
       const replyTo = c.values["reply-to"] as string | undefined;
+      const target = {
+        ...(channel ? { channelId: channel } : { conversationId: conversation! }),
+        ...(threadOf ? { threadOf } : {}),
+      };
+      const attach = c.values.attach;
+      const paths = typeof attach === "string" ? [attach] : ((attach ?? []) as string[]);
+      const attachmentIds = await Promise.all(
+        paths.map(
+          async (path) =>
+            (await uploadFile(c.client(), { workspaceId: c.workspace(), ...target }, path)).id,
+        ),
+      );
       c.print(
         await cmd.messagePost(c.client(), c.envelope(), {
-          target: {
-            ...(channel ? { channelId: channel } : { conversationId: conversation! }),
-            ...(threadOf ? { threadOf } : {}),
-            ...(replyTo ? { replyToMessageId: replyTo } : {}),
-          },
+          target: { ...target, ...(replyTo ? { replyToMessageId: replyTo } : {}) },
           text: need(c.values, "text"),
+          ...(attachmentIds.length ? { attachmentIds } : {}),
           resolveNames: c.values["resolve-names"] === true,
         }),
       );
+    },
+  },
+  "attachment get": {
+    usage: "<attachment-id> --out <path>",
+    args: 1,
+    options: { out: str },
+    run: async (c) => {
+      const id = c.args[0]!;
+      const out = need(c.values, "out");
+      await c.deps.writeBytes(
+        out,
+        await c.client().getBytes(`/v1/attachments/${encodeURIComponent(id)}`),
+      );
+      c.print({ id, out });
     },
   },
   "thread list": {

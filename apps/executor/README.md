@@ -18,6 +18,8 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK), `codex` 
   told). `cancelRequested` on a renewal (`job.cancel`) stops the agent with reason `cancelled` and submits `failed`
   with error `cancelled`; the cloud finishes the Job `cancelled`. Web-standard APIs only, so it also runs inside
   workerd tests.
+- `src/attachments.ts`: downloads the Run context's attachments with the Run capability into its local scratch
+  directory before an adapter starts (see Run attachments).
 - `src/journal.ts`: the Local Journal file, `<state-dir>/journal.jsonl`, one fsynced JSON line per entry
   (`claim`, `intent`, `result`, `uploaded`). The intent is written before the adapter starts (§20.2).
   `transcriptReader(stateDir)` reads `<state-dir>/transcripts/<runId>.jsonl` (null when absent).
@@ -63,13 +65,13 @@ redacted again by the Worker. `--dry-run` makes no network calls or local writes
   (`skill-<encoded Bot Skill name>`); only generated project settings load for that Run. The native `Skill` tool is
   enabled only for configured skills; both permission gates reject other skill names. Skill metadata never adds
   execution tools: the parent Bot's policy and its `PreToolUse` hook remain the capability ceiling. The user
-  message = the Task (if any), the Conversation's recent messages (oldest first), a
-  "Memory" section (the context's memories with their scope) and a "Related" section (search hits with source kind
-  and snippet), then the trigger item's body. Plain text.
-- **Tools.** The Bot's tool policy (below) decides the native tools; `strictMcpConfig`, `maxTurns: 4`. With a Run
-  capability, `mcpServers: {hive}` is an in-process SDK MCP server (`src/tools.ts`) whose tools are in
-  `allowedTools`; without one (a Run resumed after a restart: the token is returned once and not journaled) there
-  are no hive tools and no approvals.
+  message = the Task (if any), the Conversation's recent messages (oldest first), a "Memory" section (the context's
+  memories with their scope), a "Related" section (search hits with source kind and snippet), attachment metadata
+  and local paths, then the trigger item's body. Supported image attachments are also Claude image blocks.
+- **Tools.** The Bot's tool policy (below) decides the native tools; `settingSources: []` (no user / project
+  settings, hooks or CLAUDE.md), `strictMcpConfig`, `maxTurns: 4`. With a Run capability, `mcpServers: {hive}` is an
+  in-process SDK MCP server (`src/tools.ts`) whose tools are in `allowedTools`; without one (a Run resumed after a
+  restart: the token is returned once and not journaled) there are no hive tools and no approvals.
 - **Hive tools.** `hive_send_request {botId | botName, text}`, `hive_notify {botId | botName, text}`,
   `hive_wait_for_reply {requestMessageId}`, `hive_reply {text}` (only when the trigger item is a request from another
   Bot), `hive_pass {}` (only in a Channel, thread or DM; no cloud call, ROUTE-02), `hive_task_get {taskId}` and `hive_task_update {status?: "completed", assignee?}` (only for a Task Job),
@@ -106,6 +108,21 @@ redacted again by the Worker. `--dry-run` makes no network calls or local writes
   `CLAUDE_CONFIG_DIR=<profile dir> hive executor run --provider claude`. hive never switches to an API key; an
   `ANTHROPIC_API_KEY` in the environment would be used by the SDK, so keep it unset for subscription use. The
   SDK runs its bundled Claude Code (2.1.289 with SDK 0.3.289), not the installed `claude`.
+
+## Run attachments
+
+The API context includes attachment metadata for the triggering, recent, thread-root and parent messages. Before an
+adapter receives that context, the executor uses only `GET /v1/run/attachments/:id` with the Run capability to
+download each attachment into `<state-dir>/runs/<run-id>/attachments/`. Filenames are traversal-free and numbered to
+avoid collisions; the context gains the resulting local `path`. The capability itself is never placed in the prompt
+or transcript.
+
+The prompt lists each attachment's message id, name, content type, size and local path. Claude Agent SDK 0.3.289
+accepts image content blocks, so PNG, JPEG, GIF and WebP attachments are supplied directly as images; text and other
+files remain at the documented paths for `Read`. Codex receives the same metadata and local paths, including image
+paths, because its app-server turn input is text-only.
+For environment Runs, the Claude path hook also permits `Read` of the downloaded attachment files outside the
+checkout. Other outside files and writes to those attachments remain denied; the Bot's Read policy still applies.
 
 ## Codex provider
 
@@ -272,6 +289,7 @@ aborts the wait. The provider response never reaches the model. Codex gets the s
 ## Tests
 
 `bun run test` from the repo root. `test/runner.test.ts` runs in Node against an in-memory cloud;
+`test/attachments.test.ts` covers capability-authenticated downloads, safe local paths and Claude image input;
 `test/uploader.test.ts` covers the splitter and the uploader's ACK / retry rules; `test/claude.test.ts` drives the Claude adapter with a fake `queryFn` (SDK message shapes, no subprocess);
 `test/codex.test.ts` drives the Codex adapter against `test/fakeCodex.mjs`, a scripted app-server spawned with
 `process.execPath` (happy path, journaling order, approvals, deny, outside paths, stop, kill, crash, hive tools);

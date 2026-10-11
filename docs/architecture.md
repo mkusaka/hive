@@ -240,6 +240,13 @@ executions), `ContextEpoch` (conversation reconstruction).
 - Local SQLite holds the durable upload journal, unsent commands, process records and cache. The local cache is
   not a second source of truth. PC-specific files, keys and auth stay on the PC.
 
+Implemented as (ATTACH-01): message files use R2 keys `workspace/<workspaceId>/attachment/<attachmentId>` and an
+`attachments` manifest (migration 0033). Authenticated users initialize a pending upload, PUT its bytes once, then
+complete it to `ready`; the Worker streams through a fixed-length, size-bounded pipeline and verifies an optional
+SHA-256 through R2 before completion. Files are limited to 25 MiB: PNG/JPEG/GIF/WebP, PDF, plain text/Markdown/JSON/CSV,
+and ZIP. The pump collects pending or never-attached manifests older than 24 hours, atomically queuing
+`attachment.gc` object deletion so an R2 failure remains retryable.
+
 ## 4. Task / Project / DAG (§7)
 
 ### 4.1 Lightweight status (§7.1)
@@ -513,6 +520,14 @@ user's `message.post` and for a Run's reply alike:
    working Bots as pulsing blobs on the member count, and Members shows the state.
 7. Bot-to-bot `agent.send` stays private in the `bot_pair` conversation and out of the Channel transcript.
 
+Implemented as (ATTACH-01): `message.post` accepts up to ten unique `attachmentIds`. The message batch attaches only
+ready, unattached files uploaded by the caller to that exact conversation; a failed conditional attachment update
+rolls back the message and receipt. Message lists and thread roots carry `{id, name, contentType, size}` metadata.
+File reads follow the conversation's participant rule (Channel member or DM user; threads inherit their parent's).
+Desktop's native picker, file drop and image paste upload through main; chips are removable, image bubbles use
+main-fetched data URLs, and other files have a native Save dialog. The renderer never reads file bytes or receives
+Access headers. CLI uses repeatable `message post --attach <path>` and `attachment get <id> --out <path>`.
+
 ### 7.3 Concurrency (§10.3)
 
 - At most one external model turn per ProviderBinding. Background Runs may use separate Bindings per Task / lane.
@@ -582,6 +597,13 @@ already has 20 Jobs. Unlike `agent.send`, hitting a limit is not an error: the r
   independent of Task completion and process stop.
 - Run exit, output sync, Job completion and Task completion are separate conditions. E.g. model succeeded but
   transcript upload pending shows `Run=succeeded, persistence=pending` and blocks resume on another PC.
+
+Implemented as (ATTACH-01): Run context includes attachments of triggering and recent messages, including a thread's
+root and parent context. Before launching the provider, the executor downloads them with the Run capability via
+`GET /v1/run/attachments/:id` into `<state-dir>/runs/<runId>/attachments/`, with safe, distinct local filenames.
+The prompt lists each file's name, content type, size, message id and local path. Claude receives supported images
+as SDK image blocks; text and other files are available to permitted Read tools. Other adapters receive the same
+path inventory. Tokens are never included in this context or prompt.
 
 ### 9.2 Execution protocol (§12.2)
 

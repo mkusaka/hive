@@ -5,6 +5,7 @@ import {
   BotSkills,
   EventEmit,
   eventEnvelope,
+  MessagePost,
   parse,
   PlacementPolicy,
   renderMentions,
@@ -66,6 +67,27 @@ describe("command schemas", () => {
         },
         toolPolicy: { tools: {}, cwdMode: "run_scratch" },
         skills: [],
+      },
+    });
+  });
+
+  it("accepts a message reply with attachments", () => {
+    expect(
+      parse(MessagePost, {
+        type: "message.post",
+        channelId: "channel-1",
+        text: "see the file",
+        replyToMessageId: "message-1",
+        attachmentIds: ["attachment-1"],
+      }),
+    ).toEqual({
+      ok: true,
+      value: {
+        type: "message.post",
+        channelId: "channel-1",
+        text: "see the file",
+        replyToMessageId: "message-1",
+        attachmentIds: ["attachment-1"],
       },
     });
   });

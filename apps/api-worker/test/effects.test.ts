@@ -99,7 +99,8 @@ const running = async (effects: Json = { "slack.post": "ask", "github.comment": 
     return res.json<{ effectId: string; state: string; approvalId: string | null }>();
   };
   const effect = (id: string) => call(`/v1/run/effects/${id}`, auth).then((r) => r.json<Json>());
-  const drain = () => pump(db, { owner: "test", limit: 100, performers: providers.performers });
+  const drain = () =>
+    pump(db, { owner: "test", limit: 100, r2: env.R2, performers: providers.performers });
   // The reconcile is scheduled 30 s out; make it due.
   const due = () =>
     db

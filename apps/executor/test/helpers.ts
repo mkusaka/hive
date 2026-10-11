@@ -27,6 +27,7 @@ export const context: RunContext = {
   parentMessages: [],
   peers: [],
   since: [],
+  attachments: [],
   inboxItem: {
     id: "inbox-1",
     body: "Say hello.",
@@ -93,6 +94,11 @@ export const fakeRunApi = (
       calls.push({ getTask: taskId });
       if (fail) throw fail;
       return { id: taskId, revision: 3 };
+    },
+    getAttachment: async (attachmentId) => {
+      calls.push({ getAttachment: attachmentId });
+      if (fail) throw fail;
+      return new Uint8Array();
     },
     search: async (q) => {
       calls.push({ search: q });

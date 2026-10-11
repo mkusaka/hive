@@ -90,6 +90,37 @@ describe("PreToolUse hook", () => {
     expect(await decision("Glob", { pattern: "*", path: "/tmp" })).toBe("deny");
   });
 
+  it("permits Read of downloaded attachments outside an environment without widening write access", async () => {
+    const attachmentPath = "/scratch/runs/run-1/attachments/01-note.md";
+    const attachmentHook = preToolUse(
+      { tools: { Read: "allow", Edit: "allow" }, cwdMode: "environment" },
+      [root],
+      hive,
+      undefined,
+      [attachmentPath],
+    );
+    const check = async (tool_name: string, path: string) => {
+      const result = await attachmentHook(
+        {
+          hook_event_name: "PreToolUse",
+          tool_name,
+          tool_input: { file_path: path },
+          tool_use_id: "t",
+        } as HookInput,
+        "t",
+        { signal: new AbortController().signal },
+      );
+      return "hookSpecificOutput" in result &&
+        result.hookSpecificOutput &&
+        "permissionDecision" in result.hookSpecificOutput
+        ? result.hookSpecificOutput.permissionDecision
+        : undefined;
+    };
+    expect(await check("Read", attachmentPath)).toBeUndefined();
+    expect(await check("Read", "/scratch/runs/run-1/attachments/other.md")).toBe("deny");
+    expect(await check("Edit", attachmentPath)).toBe("deny");
+  });
+
   it("accepts either root (cwd or its realpath)", () => {
     expect(
       outsidePath("Read", { file_path: "/private/tmp/x/a" }, ["/tmp/x", "/private/tmp/x"]),

@@ -114,6 +114,16 @@ operation, "posted, no Bot woken" when nobody was woken, else polls `GET /v1/ope
 10 min) until routing is done and lists the Job ids, plus how many busy Bots read the post in their current Job.
 Accepted is not started: the Job id appears only after the outbox pump ran (`hive executor run`).
 
+## Attachments (ATTACH-01)
+
+The composer uploads up to ten files through main only: **+** opens the native picker, and files can also be dropped
+onto the composer or pasted as images. The renderer never reads file bytes or credentials. Preload resolves dropped
+and pasted image files to paths; when Electron gives a pasted image no path, main uses Electron 44's async clipboard
+API, writes a temporary image file for the authenticated CLI helper, and removes it after init, upload and complete. Main returns
+only `{id, name, contentType, size}`. Chips show each pending file and can remove it before `message.post` sends their
+`attachmentIds`. Image attachments are fetched by main as data URLs for inline bubbles; other attachments have a
+**Save…** card that opens a native save dialog and downloads through main.
+
 ## Sync
 
 `src/renderer/src/sync.ts`, a pure controller (§12.3):
@@ -153,7 +163,8 @@ Conversation and Task instead of forwarding only raw events as Subscriptions do.
 - IPC handlers accept calls only from the app's own window, main frame, at the URL main loaded; anything else
   throws. Arguments are validated with Valibot before any request (`src/main/ipc.ts`).
 - CSP meta tag: `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self';
-img-src 'self'`. `'unsafe-inline'` styles are for Vite's dev-time `<style>` injection.
+img-src 'self' data:`. `'unsafe-inline'` styles are for Vite's dev-time `<style>` injection; `data:` is only for
+  image attachment bytes fetched by main.
 - `setWindowOpenHandler` denies every new window; `will-navigate` to any other URL is prevented.
 
 ## IPC surface (`src/shared/api.ts`)
@@ -161,6 +172,7 @@ img-src 'self'`. `'unsafe-inline'` styles are for Vite's dev-time `<style>` inje
 | `window.hive`       | Channel                | Validation / behavior                                                                                                                                                                                                                                                                                                                                                                                   |
 | ------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `api.get(path)`     | `hive:api.get`         | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, the query also allows URLSearchParams' `+` and `*`, no `..` anywhere                                                                                                                                                                                                                                                                            |
+| `attachment.*`      | `hive:attachment.*`    | `pick` returns native-selected paths; `upload` validates an absolute local path; `paste` validates the target before main reads a clipboard image into a temporary file; `dataUrl` permits only image MIME types; `save` validates attachment id / file name. Main owns all file bytes and authenticated requests.                                                                                      |
 | `api.command(env)`  | `hive:api.command`     | `commandEnvelope(variant [MessagePost, AgentSend, JobCancel, ApprovalResolve, MemoryWrite, ChannelUpdate, ChannelJoin, ChannelLeave, ChannelMemberAdd, ChannelMemberUpdate, ChannelMemberRemove, DmOpen, BotUpdate, RoutineCreate, RoutineUpdate, RoutineDelete, RoutinePause, RoutineResume, RoutineRun, RoutineRotateSecret, RunLinkTask, SidebarUpdate, WorkspaceCreate])`: only these command types |
 | `getConfig()`       | `hive:config`          | `{apiUrl, workspaceId, problem, loginRequired, deviceRegistered, workspaces, hostname, defaultApiUrl, connection}`; no secrets                                                                                                                                                                                                                                                                          |
 | `onRealtime(cb)`    | `hive:realtime`        | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                                                                                                                                                                                                                                                                                                             |

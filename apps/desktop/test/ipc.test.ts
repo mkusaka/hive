@@ -1,7 +1,7 @@
 import { createClient } from "@hive/cli/client";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { type Credentials, type Deps, run } from "@hive/cli/cli";
-import { handlers, setupHandlers } from "../src/main/ipc.ts";
+import { attachmentHandlers, handlers, setupHandlers } from "../src/main/ipc.ts";
 
 const setup = (respond: () => Response = () => Response.json({ ok: true })) => {
   const requests: { path: string; jwt: string | null; body: unknown }[] = [];
@@ -202,6 +202,76 @@ describe("IPC handlers", () => {
       ok: false,
       error: { code: "CURSOR_EXPIRED", message: "cursor expired", body },
     });
+  });
+});
+
+describe("attachment IPC", () => {
+  it("rejects unsafe local paths before upload", async () => {
+    const upload = vi.fn(async () => ({ id: "att-1" }));
+    const h = attachmentHandlers({
+      upload,
+      paste: async () => ({ id: "att-paste" }),
+      dataUrl: async () => "data:image/png;base64,AA==",
+      save: async () => true,
+    });
+    const results = await Promise.all(
+      ["relative.txt", "../outside.txt", "/tmp/\0file"].map((path) =>
+        h.upload({
+          target: { workspaceId: "ws-1", channelId: "ch-1" },
+          path,
+        }),
+      ),
+    );
+    expect(results).toMatchObject([
+      { ok: false, error: { code: "INVALID_ARGS" } },
+      { ok: false, error: { code: "INVALID_ARGS" } },
+      { ok: false, error: { code: "INVALID_ARGS" } },
+    ]);
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  it("returns only attachment metadata, never the Access assertion", async () => {
+    const accessAssertion = "private-access-assertion";
+    const h = attachmentHandlers({
+      upload: async () => ({
+        id: "att-1",
+        name: "notes.md",
+        contentType: "text/markdown",
+        size: 8,
+      }),
+      paste: async () => ({ id: "att-paste" }),
+      dataUrl: async () => `data:image/png;base64,${accessAssertion}`,
+      save: async () => true,
+    });
+    const uploaded = await h.upload({
+      target: { workspaceId: "ws-1", channelId: "ch-1" },
+      path: "/tmp/notes.md",
+    });
+    expect(uploaded).toEqual({
+      ok: true,
+      value: { id: "att-1", name: "notes.md", contentType: "text/markdown", size: 8 },
+    });
+    expect(JSON.stringify(uploaded)).not.toContain(accessAssertion);
+  });
+
+  it("validates clipboard image upload targets before main reads the clipboard", async () => {
+    const paste = vi.fn(async () => ({ id: "att-paste" }));
+    const h = attachmentHandlers({
+      upload: async () => ({ id: "att-1" }),
+      paste,
+      dataUrl: async () => "data:image/png;base64,AA==",
+      save: async () => true,
+    });
+    expect(await h.paste({ target: { workspaceId: "ws-1" } })).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_ARGS" },
+    });
+    expect(paste).not.toHaveBeenCalled();
+    expect(await h.paste({ target: { workspaceId: "ws-1", channelId: "ch-1" } })).toEqual({
+      ok: true,
+      value: { id: "att-paste" },
+    });
+    expect(paste).toHaveBeenCalledWith({ workspaceId: "ws-1", channelId: "ch-1" });
   });
 });
 

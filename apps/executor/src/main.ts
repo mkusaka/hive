@@ -6,6 +6,7 @@ import { parseArgs } from "node:util";
 import { claudeAdapter } from "./adapters/claude.ts";
 import { codexAdapter } from "./adapters/codex.ts";
 import { fakeAdapter } from "./adapters/fake.ts";
+import { withAttachments } from "./attachments.ts";
 import { executorHeartbeat, parseConcurrency } from "./capabilities.ts";
 import { createCloudClient } from "./cloudClient.ts";
 import { collectExternalRuns } from "./collector.ts";
@@ -73,15 +74,18 @@ const result = await runLoop(
         .catch(() => false);
       if (enabled) await collectExternalRuns(cloud, { stateDir });
     },
-    adapter: withGitCollector(
-      values.provider === "claude"
-        ? claudeAdapter({ stateDir, sessionStore: sessionStore({ stateDir, cloud }) })
-        : values.provider === "codex"
-          ? codexAdapter({ stateDir })
-          : fakeAdapter({
-              delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
-              fail: process.env.FAKE_FAIL === "1",
-            }),
+    adapter: withAttachments(
+      withGitCollector(
+        values.provider === "claude"
+          ? claudeAdapter({ stateDir, sessionStore: sessionStore({ stateDir, cloud }) })
+          : values.provider === "codex"
+            ? codexAdapter({ stateDir })
+            : fakeAdapter({
+                delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
+                fail: process.env.FAKE_FAIL === "1",
+              }),
+        { stateDir },
+      ),
       { stateDir },
     ),
   },

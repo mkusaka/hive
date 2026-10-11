@@ -15,6 +15,7 @@ export default {
       pump(env.DB, {
         owner: "cron",
         limit: 100,
+        r2: env.R2,
         notify: (n) => ctx.waitUntil(notify(env, n)),
         performers: createPerformers(env),
       }),

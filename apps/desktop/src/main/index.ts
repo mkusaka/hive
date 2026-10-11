@@ -1,18 +1,26 @@
 // Electron main: owns the Access assertion, all HTTP and the Realtime WebSocket (docs/architecture.md §20.1).
 // The renderer gets only the typed IPC surface in src/shared/api.ts. It also owns the executor launchd service, whose
 // program is this app started with `--executor` (headless executor mode, see README "Executor service").
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir, hostname } from "node:os";
-import { dirname, join } from "node:path";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { homedir, hostname, tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { accessTokens, login, systemBrowser } from "@hive/cli/accessLogin";
+import { uploadFile } from "@hive/cli/attachments";
 import { type Credentials, run } from "@hive/cli/cli";
 import { CliError, createClient } from "@hive/cli/client";
 import { deps } from "@hive/cli/deps";
 import * as service from "@hive/cli/service";
-import { app, BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, type IpcMainInvokeEvent } from "electron";
 import { channels, type HiveConfig, type RealtimeEvent } from "../shared/api.ts";
-import { executorHandlers, handlers, setupHandlers } from "./ipc.ts";
+import { attachmentHandlers, executorHandlers, handlers, setupHandlers, toResult } from "./ipc.ts";
+
+const clipboardImageExtensions = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+} as const;
 
 // Same file and env override as the CLI (apps/cli/src/main.ts): one credential store, so a login or refresh by
 // either client is seen by the other.
@@ -239,6 +247,53 @@ const createWindow = async () => {
     channels.command,
     guard((envelope: unknown) => handlers(client).command(envelope)),
   );
+  const attachment = attachmentHandlers({
+    upload: async (target, path) => ({ ...(await uploadFile(client, target, path)) }),
+    paste: async (target) => {
+      const item = (await clipboard.read()).find((entry) =>
+        entry.types.some((type) => Object.hasOwn(clipboardImageExtensions, type)),
+      );
+      const type = item?.types.find((value): value is keyof typeof clipboardImageExtensions =>
+        Object.hasOwn(clipboardImageExtensions, value),
+      );
+      if (!item || !type)
+        throw new CliError("INVALID_ARGS", 2, "clipboard does not contain a supported image");
+      const image = await item.getType(type);
+      const directory = await mkdtemp(join(tmpdir(), "hive-attachment-"));
+      try {
+        const path = join(directory, `clipboard.${clipboardImageExtensions[type]}`);
+        await writeFile(path, new Uint8Array(await image.arrayBuffer()));
+        return { ...(await uploadFile(client, target, path)) };
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+    dataUrl: async (id, contentType) => {
+      const bytes = await client.getBytes(`/v1/attachments/${id}`);
+      return `data:${contentType};base64,${Buffer.from(bytes).toString("base64")}`;
+    },
+    save: async (id, name) => {
+      const destination = await dialog.showSaveDialog(win, { defaultPath: basename(name) });
+      if (destination.canceled || !destination.filePath) return false;
+      await writeFile(destination.filePath, await client.getBytes(`/v1/attachments/${id}`));
+      return true;
+    },
+  });
+  ipcMain.handle(
+    channels.attachmentPick,
+    guard(() =>
+      toResult(async () => {
+        const picked = await dialog.showOpenDialog(win, {
+          properties: ["openFile", "multiSelections"],
+        });
+        return { paths: picked.canceled ? [] : picked.filePaths };
+      }),
+    ),
+  );
+  ipcMain.handle(channels.attachmentUpload, guard(attachment.upload));
+  ipcMain.handle(channels.attachmentDataUrl, guard(attachment.dataUrl));
+  ipcMain.handle(channels.attachmentPaste, guard(attachment.paste));
+  ipcMain.handle(channels.attachmentSave, guard(attachment.save));
   const e = executorHandlers(servicedProgram(), async () => registered(await loadCredentials()));
   ipcMain.handle(channels.executorStatus, guard(e.status));
   ipcMain.handle(channels.executorStart, guard(e.start));

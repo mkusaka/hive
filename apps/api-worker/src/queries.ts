@@ -1,6 +1,7 @@
 // Read routes for a user principal, scoped to the user's Workspaces (docs/architecture.md §22.2).
 import {
   type ApprovalStatus,
+  type AttachmentSummary,
   defaultSidebarPrefs,
   type PlacementPolicy,
   type SidebarPrefs,
@@ -428,8 +429,13 @@ const threadSummaries = (parent: string) => `SELECT t.root_message_id, t.id AS c
  WHERE t.workspace_id = ?1 AND t.parent_conversation_id = ${parent} AND t.kind = 'thread'
  GROUP BY t.id`;
 
+const attachmentSummaries = `SELECT message_id,
+  json_group_array(json_object('id', id, 'name', name, 'contentType', content_type, 'size', size)) AS attachments
+  FROM attachments WHERE workspace_id = ?1 AND state = 'ready' AND message_id IS NOT NULL GROUP BY message_id`;
+
 const messageColumns = `m.id, m.conversation_id AS conversationId, m.seq, m.actor_id AS actorId, a.user_id AS userId,
-  m.body, m.reply_to_message_id AS replyToMessageId, m.created_at AS createdAt`;
+  m.body, m.reply_to_message_id AS replyToMessageId, m.created_at AS createdAt,
+  COALESCE(at.attachments, '[]') AS attachments`;
 
 type Thread = {
   conversationId: string;
@@ -477,21 +483,32 @@ export const listMessages = async (
          FROM messages m
          LEFT JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
          LEFT JOIN (${threadSummaries("?2")}) th ON th.root_message_id = m.id
+         LEFT JOIN (${attachmentSummaries}) at ON at.message_id = m.id
         WHERE m.workspace_id = ?1 AND m.conversation_id = ?2
         ORDER BY m.seq DESC LIMIT ?3`,
     )
     .bind(input.workspaceId, conversation.id, input.limit)
-    .all<{ thread: string | Thread | null }>();
-  for (const m of results) m.thread = m.thread && (JSON.parse(m.thread as string) as Thread);
+    .all<{ thread: string | Thread | null; attachments: string | AttachmentSummary[] }>();
+  for (const m of results) {
+    m.thread = m.thread && (JSON.parse(m.thread as string) as Thread);
+    m.attachments =
+      typeof m.attachments === "string"
+        ? (JSON.parse(m.attachments) as AttachmentSummary[])
+        : m.attachments;
+  }
   if (!conversation.root_message_id) return { messages: results };
   const root = await db
     .prepare(
       `SELECT ${messageColumns} FROM messages m
          LEFT JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-        WHERE m.workspace_id = ? AND m.id = ?`,
+         LEFT JOIN (${attachmentSummaries}) at ON at.message_id = m.id
+        WHERE m.workspace_id = ?1 AND m.id = ?2`,
     )
     .bind(input.workspaceId, conversation.root_message_id)
-    .first();
+    .first<{ attachments: string | AttachmentSummary[] }>();
+  if (root && typeof root.attachments === "string") {
+    root.attachments = JSON.parse(root.attachments) as AttachmentSummary[];
+  }
   return { messages: results, root };
 };
 
@@ -504,7 +521,8 @@ export const listThreads = async (db: D1Database, workspaceId: string, userId: s
     .prepare(
       `SELECT c.id AS conversationId, c.channel_id AS channelId, c.parent_conversation_id AS parentConversationId,
               p.kind AS parentKind, ch.name AS channelName,
-              json_object('id', rm.id, 'actorId', rm.actor_id, 'body', rm.body, 'createdAt', rm.created_at) AS root,
+              json_object('id', rm.id, 'actorId', rm.actor_id, 'body', rm.body, 'createdAt', rm.created_at,
+                'attachments', json(COALESCE(at.attachments, '[]'))) AS root,
               (SELECT COUNT(*) FROM messages r WHERE r.workspace_id = c.workspace_id AND r.conversation_id = c.id)
                 AS replyCount,
               (SELECT MAX(created_at) FROM messages r WHERE r.workspace_id = c.workspace_id AND r.conversation_id = c.id)
@@ -513,6 +531,7 @@ export const listThreads = async (db: D1Database, workspaceId: string, userId: s
          JOIN conversations p ON p.workspace_id = c.workspace_id AND p.id = c.parent_conversation_id
          JOIN channels ch ON ch.workspace_id = c.workspace_id AND ch.id = c.channel_id
          JOIN messages rm ON rm.workspace_id = c.workspace_id AND rm.id = c.root_message_id
+         LEFT JOIN (${attachmentSummaries}) at ON at.message_id = rm.id
          JOIN actors me ON me.workspace_id = c.workspace_id AND me.user_id = ?2
         WHERE c.workspace_id = ?1 AND c.kind = 'thread' AND ${mayRead("?2")}
           AND (rm.actor_id = me.id OR EXISTS (SELECT 1 FROM messages r WHERE r.workspace_id = c.workspace_id

@@ -192,6 +192,7 @@ export const messagePost = async (
       replyToMessageId?: string;
     };
     text: string;
+    attachmentIds?: string[];
     resolveNames: boolean;
   },
 ) => {
@@ -200,7 +201,12 @@ export const messagePost = async (
     const { bots } = (await listBots(c, e.workspaceId)) as { bots: { id: string; name: string }[] };
     text = tokenizeMentions(text, bots);
   }
-  return c.command(e, { type: "message.post", ...input.target, text });
+  return c.command(e, {
+    type: "message.post",
+    ...input.target,
+    text,
+    ...(input.attachmentIds ? { attachmentIds: input.attachmentIds } : {}),
+  });
 };
 
 export const eventEmit = (

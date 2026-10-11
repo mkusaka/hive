@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { text } from "node:stream/consumers";
 import { claudeAdapter } from "@hive/executor/adapters/claude";
 import { codexAdapter } from "@hive/executor/adapters/codex";
+import { withAttachments } from "@hive/executor/attachments";
 import { executorHeartbeat } from "@hive/executor/capabilities";
 import { collectExternalRuns } from "@hive/executor/collector";
 import { saveEnvironment } from "@hive/executor/environments";
@@ -83,6 +84,8 @@ export const deps: Deps = {
   },
   openBrowser: systemBrowser((line) => console.error(line)),
   readInput: (path) => (path === "-" ? text(process.stdin) : readFile(path, "utf8")),
+  readBytes: async (path) => new Uint8Array(await readFile(path)),
+  writeBytes: async (path, bytes) => void (await writeFile(path, bytes)),
   saveEnvironment: async (name, path) => {
     const root = await realpath(path);
     if (!(await stat(root)).isDirectory()) throw new Error(`not a directory: ${root}`);
@@ -120,18 +123,21 @@ export const deps: Deps = {
           if ((await readCollectConfig()).enabled)
             await collectExternalRuns(cloud, { stateDir: executorDir });
         },
-        adapter: withGitCollector(
-          provider === "claude"
-            ? claudeAdapter({
-                stateDir: executorDir,
-                sessionStore: sessionStore({ stateDir: executorDir, cloud }),
-              })
-            : provider === "codex"
-              ? codexAdapter({ stateDir: executorDir })
-              : fakeAdapter({
-                  delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
-                  fail: process.env.FAKE_FAIL === "1",
-                }),
+        adapter: withAttachments(
+          withGitCollector(
+            provider === "claude"
+              ? claudeAdapter({
+                  stateDir: executorDir,
+                  sessionStore: sessionStore({ stateDir: executorDir, cloud }),
+                })
+              : provider === "codex"
+                ? codexAdapter({ stateDir: executorDir })
+                : fakeAdapter({
+                    delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
+                    fail: process.env.FAKE_FAIL === "1",
+                  }),
+            { stateDir: executorDir },
+          ),
           { stateDir: executorDir },
         ),
       },

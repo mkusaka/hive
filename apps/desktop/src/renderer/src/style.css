@@ -541,6 +541,35 @@ button.pill:hover {
   border-radius: var(--r-sm);
   background: var(--bg-tertiary);
 }
+.attachment-image {
+  display: block;
+  max-width: min(100%, 480px);
+  max-height: 360px;
+  margin-top: 8px;
+  border-radius: var(--r-lg);
+}
+.attachment-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: var(--r-lg);
+  background: var(--bg-tertiary);
+  color: var(--text-2);
+  font-size: 13px;
+}
+.attachment-card button {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border-radius: var(--r-sm);
+  background: var(--bg-quaternary);
+  color: var(--text);
+}
+.attachment-card button:hover {
+  background: var(--hover);
+}
 .bubble pre {
   margin: 8px 0;
   padding: 10px 12px;
@@ -627,6 +656,61 @@ button.pill:hover {
   padding: 6px;
   border-radius: 28px;
   background: var(--bg-tertiary);
+}
+.composer-body {
+  flex: 1;
+  min-width: 0;
+}
+.attachment-add {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--bg-quaternary);
+  color: var(--text-2);
+  font-size: 22px;
+  line-height: 1;
+}
+.attachment-add:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+.attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 8px 0;
+}
+.attachment-chip {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 8px;
+  border-radius: 999px;
+  background: var(--bg-quaternary);
+  color: var(--text-2);
+  font-size: 12px;
+}
+.attachment-chip button {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: 50%;
+  background: none;
+  color: inherit;
+}
+.attachment-chip button:hover {
+  background: var(--hover);
+}
+.attachment-chip svg {
+  width: 12px;
+  height: 12px;
 }
 .composer-input {
   flex: 1;
