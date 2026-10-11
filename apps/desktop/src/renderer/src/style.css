@@ -1,0 +1,158 @@
+:root {
+  font:
+    14px/1.4 system-ui,
+    sans-serif;
+  color: #1d1d1f;
+  background: #fff;
+}
+body {
+  margin: 0;
+}
+.pad {
+  padding: 16px;
+}
+.mono {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+.error {
+  color: #b3261e;
+}
+.ok {
+  color: #1b7f3b;
+}
+.warn {
+  color: #9a6700;
+}
+.app {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  height: 100vh;
+}
+nav {
+  display: flex;
+  gap: 4px;
+  padding: 8px;
+  border-bottom: 1px solid #ddd;
+}
+button {
+  font: inherit;
+  cursor: pointer;
+}
+nav button,
+.list button {
+  border: 0;
+  background: none;
+  padding: 4px 8px;
+  border-radius: 4px;
+  text-align: left;
+}
+nav button.active,
+.list button.active {
+  background: #e8eefc;
+}
+main {
+  overflow: auto;
+  padding: 8px 16px;
+}
+h2 {
+  font-size: 16px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.split {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 16px;
+  height: 100%;
+}
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.list button {
+  width: 100%;
+}
+.channel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.messages {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex: 1;
+  overflow: auto;
+}
+.messages li {
+  padding: 6px 0;
+  border-bottom: 1px solid #f0f0f0;
+}
+.meta {
+  color: #666;
+  font-size: 12px;
+}
+form {
+  display: flex;
+  gap: 8px;
+  padding: 8px 0;
+}
+form input {
+  flex: 1;
+  font: inherit;
+  padding: 4px 8px;
+}
+.op {
+  color: #444;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+th,
+td {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid #eee;
+}
+pre {
+  background: #f6f8fa;
+  padding: 8px;
+  overflow: auto;
+  margin: 0;
+}
+.badge {
+  display: inline-block;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 12px;
+  background: #eee;
+}
+.badge.queued,
+.badge.pending {
+  background: #fff4ce;
+}
+.badge.active,
+.badge.claimed {
+  background: #dbeafe;
+}
+.badge.succeeded,
+.badge.processed {
+  background: #d1fadf;
+}
+.badge.failed,
+.badge.cancelled,
+.badge.recovery_required {
+  background: #fde2e1;
+}
+footer {
+  display: flex;
+  gap: 16px;
+  padding: 4px 16px;
+  border-top: 1px solid #ddd;
+  font-size: 12px;
+  color: #444;
+}
