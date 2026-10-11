@@ -54,13 +54,18 @@ export const createClient = (opts: {
     });
     return { Authorization: `Bearer ${token}` };
   };
-  const send = async (method: "GET" | "POST", path: string, body?: unknown) => {
+  const send = async (
+    method: "GET" | "POST" | "PUT",
+    path: string,
+    body?: RequestInit["body"],
+    contentType = "application/json",
+  ) => {
     const headers = await auth();
     const res = await opts
       .fetch(new URL(path, opts.apiUrl), {
         method,
-        headers: { ...headers, "Content-Type": "application/json" },
-        body: body === undefined ? undefined : JSON.stringify(body),
+        headers: { ...headers, ...(body === undefined ? {} : { "Content-Type": contentType }) },
+        body,
       })
       .catch((error: unknown) => {
         throw new CliError("NETWORK", 7, `request failed: ${String(error)}`);
@@ -78,11 +83,22 @@ export const createClient = (opts: {
     return res;
   };
   const request = async (method: "GET" | "POST", path: string, body?: unknown) =>
-    (await (await send(method, path, body)).json().catch(() => null)) as Record<string, unknown>;
+    (await (
+      await send(method, path, body === undefined ? undefined : JSON.stringify(body))
+    )
+      .json()
+      .catch(() => null)) as Record<string, unknown>;
   return {
     /** The Access header alone, for the Realtime WebSocket upgrade. */
     accessHeaders: auth,
     get: (path: string) => request("GET", path),
+    post: (path: string, body: Record<string, unknown>) => request("POST", path, body),
+    putBytes: async (path: string, body: Uint8Array, contentType: string) =>
+      (await (await send("PUT", path, body, contentType)).json().catch(() => null)) as Record<
+        string,
+        unknown
+      >,
+    getBytes: async (path: string) => new Uint8Array(await (await send("GET", path)).arrayBuffer()),
     /** A non-JSON body as text (the raw transcript). */
     getText: async (path: string) =>
       new TextDecoder().decode(await (await send("GET", path)).arrayBuffer()),

@@ -22,6 +22,14 @@ export type Routes = Record<
 type Options = {
   get?: Routes;
   command?: (envelope: UiCommand) => ApiResult | undefined;
+  attachment?: {
+    pick?: () => ApiResult;
+    filePaths?: (files: unknown[]) => string[];
+    upload?: (input: { target: { workspaceId: string }; path: string }) => ApiResult;
+    paste?: (input: { target: { workspaceId: string } }) => ApiResult;
+    dataUrl?: (input: { id: string; contentType: string }) => ApiResult;
+    save?: (input: { id: string; name: string }) => ApiResult;
+  };
   config?: Partial<HiveConfig>;
   executor?: Record<string, unknown>;
   /** `login()`'s answer (default ok); `never` keeps it pending. */
@@ -37,6 +45,7 @@ export const fakeHive = (options: Options = {}) => {
     get: [] as string[],
     command: [] as UiCommand[],
     executor: [] as unknown[],
+    attachment: [] as { method: string; input?: unknown }[],
     /** config.set patches, device.register inputs, logins and logouts, in order. */
     setup: [] as unknown[],
   };
@@ -66,6 +75,37 @@ export const fakeHive = (options: Options = {}) => {
       command: async (envelope) => {
         calls.command.push(envelope);
         return options.command?.(envelope) ?? ok({});
+      },
+    },
+    attachment: {
+      pick: async () => {
+        calls.attachment.push({ method: "pick" });
+        return options.attachment?.pick?.() ?? ok({ paths: [] });
+      },
+      filePaths: (files) => options.attachment?.filePaths?.(files) ?? [],
+      upload: async (input) => {
+        calls.attachment.push({ method: "upload", input });
+        return (
+          options.attachment?.upload?.(input) ??
+          ok({ id: "att-1", name: "file.txt", contentType: "text/plain", size: 1 })
+        );
+      },
+      paste: async (input) => {
+        calls.attachment.push({ method: "paste", input });
+        return (
+          options.attachment?.paste?.(input) ??
+          ok({ id: "att-paste", name: "clipboard.png", contentType: "image/png", size: 1 })
+        );
+      },
+      dataUrl: async (input) => {
+        calls.attachment.push({ method: "dataUrl", input });
+        return (
+          options.attachment?.dataUrl?.(input) ?? ok({ dataUrl: "data:image/png;base64,AA==" })
+        );
+      },
+      save: async (input) => {
+        calls.attachment.push({ method: "save", input });
+        return options.attachment?.save?.(input) ?? ok({ saved: true });
       },
     },
     executor: {

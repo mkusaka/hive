@@ -78,6 +78,7 @@ import {
 } from "@hive/db";
 import * as v from "valibot";
 import { hashSecret, newDeviceSecret } from "./auth/device.ts";
+import { attachmentStatements } from "./attachments.ts";
 import type { Principal } from "./auth/principal.ts";
 import { queuePerform, summarize } from "./effects.ts";
 import { HttpError } from "./errors.ts";
@@ -863,7 +864,7 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
     receivedAt,
   };
   const scope = `channel:${parent.channel_id}`;
-  return receipt(
+  const posted = receipt(
     db,
     user.userId,
     env,
@@ -891,6 +892,13 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
         actorId: parent.actor_id,
         clientMessageId: env.idempotencyKey,
         body: command.text,
+      }),
+      ...attachmentStatements(db, {
+        workspaceId,
+        messageId,
+        actorId: parent.actor_id,
+        conversationId,
+        attachmentIds: command.attachmentIds,
       }),
       ...deliveries.flatMap((d) =>
         deliveryStatements(db, env, {
@@ -926,6 +934,23 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
         : []),
     ],
   );
+  if (command.attachmentIds.length === 0) return posted;
+  return explainFailure(posted, async () => {
+    const { n } = (await db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM attachments WHERE workspace_id = ? AND uploader_actor_id = ?
+          AND conversation_id = ? AND state = 'ready' AND message_id IS NULL
+          AND id IN (${command.attachmentIds.map(() => "?").join(", ")})`,
+      )
+      .bind(workspaceId, parent.actor_id, conversationId, ...command.attachmentIds)
+      .first<{ n: number }>())!;
+    return n === command.attachmentIds.length
+      ? null
+      : new HttpError(
+          "REVISION_CONFLICT",
+          "attachments must be ready, unattached, and belong to this conversation",
+        );
+  });
 };
 
 const eventEmit: Handler<v.InferOutput<typeof EventEmit>> = async (db, user, env) => {

@@ -43,6 +43,8 @@ export type RunApi = {
   getApproval(approvalId: string): Promise<ApprovalStatus>;
   /** The Run's own external effect (§19), polled while an effect tool waits for it to settle. */
   getEffect(effectId: string): Promise<Effect>;
+  /** Attachment bytes readable by the Run in its trigger conversation. */
+  getAttachment(attachmentId: string): Promise<Uint8Array>;
   /** Search limited to what the Run may read (its Workspace, Channel, Bot and Task scopes). */
   search(q: string): Promise<SearchResult>;
 };
@@ -229,6 +231,17 @@ export const createCloudClient = ({
           `/v1/run/effects/${encodeURIComponent(effectId)}`,
           undefined,
           capabilityToken,
+        ),
+      getAttachment: async (attachmentId) =>
+        new Uint8Array(
+          await (
+            await send(
+              "GET",
+              `/v1/run/attachments/${encodeURIComponent(attachmentId)}`,
+              undefined,
+              capabilityToken,
+            )
+          ).arrayBuffer(),
         ),
       search: (q) =>
         request("GET", `/v1/run/search?${new URLSearchParams({ q })}`, undefined, capabilityToken),

@@ -305,6 +305,47 @@ export const messages = sqliteTable(
   ],
 );
 
+const attachmentStates = ["pending", "ready"] as const;
+
+/** Immutable uploaded content. A row becomes ready only after R2 has the verified object. */
+export const attachments = sqliteTable(
+  "attachments",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    uploaderActorId: text("uploader_actor_id").notNull(),
+    conversationId: text("conversation_id").notNull(),
+    messageId: text("message_id"),
+    name: text("name").notNull(),
+    contentType: text("content_type").notNull(),
+    size: integer("size").notNull(),
+    r2Key: text("r2_key").notNull(),
+    sha256: text("sha256"),
+    state: text("state", { enum: attachmentStates }).notNull().default("pending"),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    scoped(t),
+    unique().on(t.r2Key),
+    check("attachments_size", sql`${t.size} BETWEEN 1 AND 26214400`),
+    index("attachments_gc").on(t.state, t.createdAt),
+    index("attachments_message").on(t.workspaceId, t.messageId),
+    oneOf("attachments_state", t.state, attachmentStates),
+    foreignKey({
+      columns: [t.workspaceId, t.uploaderActorId],
+      foreignColumns: [actors.workspaceId, actors.id],
+    }),
+    foreignKey({
+      columns: [t.workspaceId, t.conversationId],
+      foreignColumns: [conversations.workspaceId, conversations.id],
+    }),
+    foreignKey({
+      columns: [t.workspaceId, t.messageId],
+      foreignColumns: [messages.workspaceId, messages.id],
+    }),
+  ],
+);
+
 // --------------------------------------------------------------------- Bot
 
 /** current state */

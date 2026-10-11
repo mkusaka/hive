@@ -1,5 +1,8 @@
 import {
+  allowedAttachmentContentTypes,
+  AttachmentInit,
   ExecutorHeartbeat,
+  maxAttachmentBytes,
   maxTranscriptPartBytes,
   parse,
   RunObservation,
@@ -15,6 +18,13 @@ import { authenticateUser, remoteJwks } from "./auth/access.ts";
 import { authenticateDevice, hiveToken } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
 import { authenticateRun } from "./auth/run.ts";
+import {
+  completeAttachment,
+  initAttachment,
+  putAttachmentContent,
+  readAttachment,
+  readRunAttachment,
+} from "./attachments.ts";
 import { CommandEnvelope, RunEnvelope, runCommand, runRunCommand } from "./commands.ts";
 import { HttpError, toErrorResponse } from "./errors.ts";
 import {
@@ -214,11 +224,50 @@ export const createApp = ({
     return c.json(response, status as ContentfulStatusCode);
   });
 
+  app.post("/v1/attachments/init", async (c) => {
+    const body = await c.req.json().catch(() => null);
+    const contentType =
+      body && typeof body === "object" && "contentType" in body ? body.contentType : null;
+    if (
+      typeof contentType !== "string" ||
+      !allowedAttachmentContentTypes.some((allowed) => allowed === contentType)
+    ) {
+      throw new HttpError("UNSUPPORTED_MEDIA_TYPE", "attachment content type is not allowed");
+    }
+    const size = body && typeof body === "object" && "size" in body ? body.size : null;
+    if (typeof size === "number" && size > maxAttachmentBytes) {
+      throw new HttpError("PAYLOAD_TOO_LARGE", "attachment is too large");
+    }
+    const parsed = parse(AttachmentInit, body);
+    if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
+    return c.json(await initAttachment(c.env.DB, user(c), parsed.value));
+  });
+  app.put("/v1/attachments/:id/content", async (c) => {
+    const contentLength = Number(c.req.header("Content-Length") ?? 0);
+    if (Number.isFinite(contentLength) && contentLength > maxAttachmentBytes) {
+      throw new HttpError("PAYLOAD_TOO_LARGE", "attachment is too large");
+    }
+    return c.json(
+      await putAttachmentContent(c.env.DB, c.env.R2, user(c), c.req.param("id"), c.req.raw.body),
+    );
+  });
+  app.post("/v1/attachments/:id/complete", async (c) =>
+    c.json(await completeAttachment(c.env.DB, c.env.R2, user(c), c.req.param("id"))),
+  );
+  app.get("/v1/attachments/:id", async (c) => {
+    const { row, object } = await readAttachment(c.env.DB, c.env.R2, user(c), c.req.param("id"));
+    return c.body(object.body, 200, {
+      "Content-Type": row.contentType,
+      "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(row.name)}`,
+    });
+  });
+
   app.post("/v1/executor/pump", async (c) =>
     c.json(
       await pump(c.env.DB, {
         owner: `device:${device(c).deviceId}`,
         limit: 50,
+        r2: c.env.R2,
         notify: (n) => hint(c, n),
         performers: createPerformers(c.env),
       }),
@@ -331,6 +380,18 @@ export const createApp = ({
       scopes: run.scopes,
     };
     return c.json(me);
+  });
+  app.get("/v1/run/attachments/:id", async (c) => {
+    const { row, object } = await readRunAttachment(
+      c.env.DB,
+      c.env.R2,
+      runPrincipal(c),
+      c.req.param("id"),
+    );
+    return c.body(object.body, 200, {
+      "Content-Type": row.contentType,
+      "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(row.name)}`,
+    });
   });
   app.get("/v1/run/approvals/:id", async (c) =>
     c.json(await getRunApproval(c.env.DB, runPrincipal(c), c.req.param("id"))),

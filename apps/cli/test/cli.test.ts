@@ -1,6 +1,9 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type Credentials, type Deps, run } from "../src/cli.ts";
-import { exitCodeFor } from "../src/client.ts";
+import { createClient, exitCodeFor } from "../src/client.ts";
 
 type Call = { method: string; path: string; headers: Headers; body: unknown };
 
@@ -14,13 +17,20 @@ const harness = (
   const err: string[] = [];
   const saved: Credentials[] = [];
   const environments: [string, string][] = [];
+  const files = new Map<string, Uint8Array>();
   const deps: Deps = {
     fetch: async (url, init) => {
+      const body =
+        typeof init.body === "string"
+          ? JSON.parse(init.body)
+          : init.body instanceof Uint8Array
+            ? init.body
+            : undefined;
       const call = {
         method: init.method ?? "GET",
         path: `${url.pathname}${url.search}`,
         headers: new Headers(init.headers),
-        body: init.body ? JSON.parse(init.body as string) : undefined,
+        body,
       };
       calls.push(call);
       return respond(call);
@@ -39,6 +49,8 @@ const harness = (
       throw new Error("no browser in tests");
     },
     readInput: async (path) => (path === "-" ? stdin : `{"file":"${path}"}`),
+    readBytes: async (path) => files.get(path) ?? new Uint8Array(),
+    writeBytes: async (path, bytes) => void files.set(path, bytes),
     stdout: (line) => void out.push(line),
     stderr: (line) => void err.push(line),
     runExecutor: async () => null,
@@ -54,6 +66,7 @@ const harness = (
     out,
     err,
     saved,
+    files,
     environments,
     hive: (...argv: string[]) => run(argv, deps),
   };
@@ -124,6 +137,79 @@ describe("argv → request", () => {
       command: { type: "message.post", channelId: "ch-1", threadOf: "m-1", text: "hi" },
     });
     expect(h.calls[1]!.path).toBe("/v1/threads?workspaceId=ws-1&participant=me");
+  });
+  it("uploads repeated attachments before posting their ids", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hive-attachment-"));
+    const file = join(dir, "note.md");
+    const image = join(dir, "image.png");
+    await writeFile(file, "hello");
+    await writeFile(image, new Uint8Array([1]));
+    try {
+      let count = 0;
+      const h = harness((call) => {
+        if (call.path === "/v1/attachments/init") {
+          count += 1;
+          return Response.json({
+            id: `a-${count}`,
+            uploadUrl: `/v1/attachments/a-${count}/content`,
+          });
+        }
+        if (call.path.endsWith("/complete"))
+          return Response.json({ id: call.path.split("/")[3], name: "attachment" });
+        return Response.json({ ok: true });
+      });
+      expect(
+        await h.hive(
+          "message",
+          "post",
+          "--channel",
+          "ch-1",
+          "--thread-of",
+          "m-1",
+          "--text",
+          "attached",
+          "--attach",
+          file,
+          "--attach",
+          image,
+        ),
+      ).toBe(0);
+      expect(h.calls.at(-1)).toMatchObject({ method: "POST", path: "/v1/commands" });
+      const inits = h.calls.filter((call) => call.path === "/v1/attachments/init");
+      expect(inits).toHaveLength(2);
+      expect(inits.map((call) => call.body)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            workspaceId: "ws-1",
+            channelId: "ch-1",
+            threadOf: "m-1",
+            name: "note.md",
+            contentType: "text/markdown",
+            size: 5,
+          }),
+          expect.objectContaining({ name: "image.png", contentType: "image/png", size: 1 }),
+        ]),
+      );
+      expect(h.calls.at(-1)!.body).toMatchObject({
+        command: {
+          type: "message.post",
+          channelId: "ch-1",
+          threadOf: "m-1",
+          attachmentIds: expect.any(Array),
+        },
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("downloads an attachment with Access authentication", async () => {
+    const h = harness(() => new Response(new Uint8Array([1, 2, 3])));
+    expect(await h.hive("attachment", "get", "a-1", "--out", "/tmp/out")).toBe(0);
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0]).toMatchObject({ method: "GET", path: "/v1/attachments/a-1" });
+    expect(h.calls[0]!.headers.get("Cf-Access-Jwt-Assertion")).toBe("jwt");
+    expect(h.files.get("/tmp/out")).toEqual(new Uint8Array([1, 2, 3]));
   });
 
   it("agent send builds the command envelope with the Access assertion", async () => {
@@ -308,6 +394,18 @@ describe("argv → request", () => {
     ).toBe(2);
     expect(await h.hive("nope")).toBe(2);
     expect(await h.hive("job", "get", "j", "--bogus")).toBe(2);
+    expect(
+      await h.hive(
+        "message",
+        "post",
+        "--channel",
+        "c",
+        "--text",
+        "x",
+        "--attach",
+        "/tmp/unsafe.exe",
+      ),
+    ).toBe(2);
     expect(h.calls).toEqual([]);
   });
 });
@@ -338,6 +436,49 @@ describe("exit codes", () => {
     const anon = harness(undefined, { creds: { accessJwt: undefined } });
     expect(await anon.hive("job", "get", "j-1")).toBe(3);
     expect(anon.calls).toEqual([]);
+  });
+});
+
+describe("attachment client methods", () => {
+  it("uses Access credentials for JSON and byte requests", async () => {
+    const calls: {
+      method: string;
+      path: string;
+      headers: Headers;
+      body: RequestInit["body"];
+    }[] = [];
+    const client = createClient({
+      apiUrl: "https://hive.test",
+      accessJwt: "jwt",
+      fetch: async (url, init) => {
+        calls.push({
+          method: init.method ?? "GET",
+          path: url.pathname,
+          headers: new Headers(init.headers),
+          body: init.body,
+        });
+        return url.pathname === "/bytes"
+          ? new Response(new Uint8Array([4, 5]))
+          : Response.json({ ok: true });
+      },
+    });
+    expect(await client.post("/json", { value: "x" })).toEqual({ ok: true });
+    expect(await client.putBytes("/upload", new Uint8Array([1, 2]), "image/png")).toEqual({
+      ok: true,
+    });
+    expect(await client.getBytes("/bytes")).toEqual(new Uint8Array([4, 5]));
+    expect(calls.map(({ method, path }) => [method, path])).toEqual([
+      ["POST", "/json"],
+      ["PUT", "/upload"],
+      ["GET", "/bytes"],
+    ]);
+    expect(calls.map((call) => call.headers.get("Cf-Access-Jwt-Assertion"))).toEqual([
+      "jwt",
+      "jwt",
+      "jwt",
+    ]);
+    expect(calls[0]!.headers.get("Content-Type")).toBe("application/json");
+    expect(calls[1]!.headers.get("Content-Type")).toBe("image/png");
   });
 });
 

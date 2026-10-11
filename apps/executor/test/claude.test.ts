@@ -2,7 +2,6 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
-  Options,
   SDKAssistantMessage,
   SDKMessage,
   SDKResultSuccess,
@@ -50,8 +49,9 @@ const transcriptOf = async (dir: string, runId = "run-1") =>
 
 /** Records each call's params and replays `messages`. */
 const fakeQuery = (messages: SDKMessage[]) => {
-  const calls: { prompt: string; options: Options }[] = [];
+  const calls: Parameters<QueryFn>[0][] = [];
   const queryFn: QueryFn = async function* (params) {
+    if (typeof params.prompt !== "string") throw new Error("unexpected attachment prompt");
     calls.push(params);
     yield* messages;
   };
@@ -133,6 +133,7 @@ describe("claudeAdapter", () => {
     expect(await transcriptOf(dir)).toEqual([init, assistant, result()]);
     // Instructions go to the system prompt; the request and recent conversation to the user message. No tools.
     const [{ prompt, options }] = calls as [(typeof calls)[number]];
+    if (typeof prompt !== "string") throw new Error("unexpected attachment prompt");
     expect(options.systemPrompt).toContain("Reply in one short sentence.");
     expect(prompt).toContain("Request:\nSay hello.");
     expect(prompt).toContain("[user actor-1] Say hello.");

@@ -84,18 +84,24 @@ const decide = (permissionDecision: "allow" | "deny" | "ask", reason: string) =>
 });
 
 /** The mandatory before_tool hook (§20.3). */
-export const preToolUse =
-  (policy: ToolPolicy, roots: string[], hiveTools: Set<string>): HookCallback =>
-  async (input) => {
+export const preToolUse = (
+  policy: ToolPolicy,
+  roots: string[],
+  hiveTools: Set<string>,
+  attachmentPaths: string[] = [],
+): HookCallback => {
+  const readRoots = attachmentPaths.length ? [...roots, ...attachmentPaths] : roots;
+  return async (input) => {
     if (input.hook_event_name !== "PreToolUse") return {};
     const tool = input.tool_name;
     if (hiveTools.has(tool)) return {};
     const mode = modeOf(policy, tool);
     if (mode === "deny") return decide("deny", `${tool} is not allowed for this bot`);
-    const outside = outsidePath(tool, input.tool_input, roots);
+    const outside = outsidePath(tool, input.tool_input, tool === "Read" ? readRoots : roots);
     if (outside) return decide("deny", `${outside} is outside the working directory`);
     return mode === "ask" ? decide("ask", `${tool} needs a human approval`) : {};
   };
+};
 
 const canonical = (value: unknown): string => {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;

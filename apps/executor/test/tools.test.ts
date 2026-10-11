@@ -1,7 +1,7 @@
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { RunContext } from "@hive/contracts";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
@@ -307,9 +307,10 @@ describe("effect tools", () => {
 describe("claudeAdapter with hive tools", () => {
   it("ends the Run as waiting after hive_wait_for_reply; the token is in no prompt", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hive-tools-"));
-    const calls: { prompt: string; options: Options }[] = [];
+    const calls: Parameters<QueryFn>[0][] = [];
     let consumed = 0;
     const queryFn: QueryFn = async function* (params) {
+      if (typeof params.prompt !== "string") throw new Error("unexpected attachment prompt");
       calls.push(params);
       for (const message of stream) {
         consumed += 1;
@@ -348,6 +349,7 @@ describe("claudeAdapter with hive tools", () => {
     const transcript = await readFile(join(dir, "transcripts", "run-1.jsonl"), "utf8");
     expect(transcript.trim().split("\n")).toHaveLength(3);
     const [{ prompt, options }] = calls as [(typeof calls)[number]];
+    if (typeof prompt !== "string") throw new Error("unexpected attachment prompt");
     expect(options.abortController?.signal.aborted).toBe(true);
     expect(options.allowedTools).toEqual([
       "mcp__hive__hive_send_request",
@@ -363,8 +365,9 @@ describe("claudeAdapter with hive tools", () => {
 
   it("puts the sender Bot and earlier replies in the prompt", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hive-tools-"));
-    const calls: { prompt: string }[] = [];
+    const calls: Parameters<QueryFn>[0][] = [];
     const queryFn: QueryFn = async function* (params) {
+      if (typeof params.prompt !== "string") throw new Error("unexpected attachment prompt");
       calls.push(params);
       yield* [] as SDKMessage[];
     };
@@ -389,14 +392,17 @@ describe("claudeAdapter with hive tools", () => {
       observe: async () => {},
     });
     await agent.waitForExit();
-    expect(calls[0]!.prompt).toContain("Request from bot asker (request):\nwhat is 2+2?");
-    expect(calls[0]!.prompt).toContain("Replies to your requests:\n[bot math] 4");
+    const prompt = calls[0]?.prompt;
+    if (typeof prompt !== "string") throw new Error("unexpected attachment prompt");
+    expect(prompt).toContain("Request from bot asker (request):\nwhat is 2+2?");
+    expect(prompt).toContain("Replies to your requests:\n[bot math] 4");
   });
 
   it("renders Memory and Related before the request", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hive-tools-"));
-    const calls: { prompt: string }[] = [];
+    const calls: Parameters<QueryFn>[0][] = [];
     const queryFn: QueryFn = async function* (params) {
+      if (typeof params.prompt !== "string") throw new Error("unexpected attachment prompt");
       calls.push(params);
       yield* [] as SDKMessage[];
     };
@@ -421,7 +427,8 @@ describe("claudeAdapter with hive tools", () => {
       observe: async () => {},
     });
     await agent.waitForExit();
-    const prompt = calls[0]!.prompt;
+    const prompt = calls[0]?.prompt;
+    if (typeof prompt !== "string") throw new Error("unexpected attachment prompt");
     expect(prompt).toContain("Memory:\n- (bot) staging is stage-3");
     expect(prompt).toContain("Related:\n- (message) the [staging] deploy failed");
     expect(prompt.indexOf("Related:")).toBeLessThan(prompt.indexOf("Request:"));

@@ -39,7 +39,8 @@ hive memory write --scope <workspace|channel:<id>|project:<id>|bot:<id>|task:<id
 hive memory list --scope <...>                         # live memories of the scope, newest first
 hive memory delete <memory-id> [--revision <n>]        # tombstone; a live memory is at revision 1
 hive agent send <bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]
-hive message post (--channel <channel-id> | --conversation <dm-id>) [--thread-of <message-id>] --text <text> [--resolve-names]  # <@bot:ID> wakes that Bot (a DM always wakes its Bot); --thread-of replies in that message's thread (Bots already in it wake too); --resolve-names maps @name
+hive message post (--channel <channel-id> | --conversation <dm-id>) [--thread-of <message-id>] --text <text> [--attach <path>...] [--resolve-names]  # <@bot:ID> wakes that Bot (a DM always wakes its Bot); --thread-of replies in that message's thread (Bots already in it wake too); --resolve-names maps @name
+hive attachment get <attachment-id> --out <path>         # downloads an attachment you may read
 hive thread list                                      # threads you started or replied in, newest reply first
 hive event emit <type> [--data-file <path|->] [--subject <kind:id>]
 hive op get <operation-id>
@@ -90,6 +91,9 @@ a fresh UUID per invocation).
   and diagnostics go to stderr. On an API error, `json` also prints the `ApiError` body on stdout.
 - **`--wait`** polls `GET /v1/operations/:id` until routing created the Job, then watches it. `--notify` creates no
   Job, so `--notify --wait` is invalid. A timeout never cancels the Job. The default timeout is 300 s.
+- **Attachments.** `message post --attach` is repeatable; each file is uploaded before the message and must be at
+  most 25 MiB with a `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.pdf`, `.txt`, `.md`, `.json`, `.csv`, or `.zip`
+  extension. `attachment get` writes an attachment available to the signed-in user.
 - **`event emit`** reads JSON from `--data-file` (`-` is stdin); without it `data` is `{}`.
 - **`routine create`** defaults `--tz` to this machine's IANA zone. `--channel` is resolved to the Channel's main
   Conversation (the Routine's lane and reply target) through `channel list`. `job resolve --retry` is 409 (exit 4)

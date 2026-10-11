@@ -9,6 +9,7 @@
   "exports": {
     "./client": "./src/client.ts",
     "./commands": "./src/commands.ts",
+    "./attachments": "./src/attachments.ts",
     "./cli": "./src/cli.ts",
     "./accessLogin": "./src/accessLogin.ts",
     "./deps": "./src/deps.ts",

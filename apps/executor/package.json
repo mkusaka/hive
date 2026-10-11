@@ -6,6 +6,7 @@
   "exports": {
     "./cloudClient": "./src/cloudClient.ts",
     "./runner": "./src/runner.ts",
+    "./attachments": "./src/attachments.ts",
     "./adapters/fake": "./src/adapters/fake.ts",
     "./adapters/claude": "./src/adapters/claude.ts",
     "./adapters/codex": "./src/adapters/codex.ts",

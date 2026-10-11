@@ -8,6 +8,7 @@ import {
   matchesEventType,
   matchesFilter,
 } from "@hive/contracts";
+import { collectAttachments } from "./attachments.ts";
 import {
   acquireOutboxBatch,
   createDeliveryAndInbox,
@@ -202,6 +203,7 @@ export const pump = async (
     owner: string;
     limit: number;
     notify?: (n: Notification) => void;
+    r2: R2Bucket;
     /** External effect providers (effects.ts); the Worker builds them from its secrets. */
     performers: Performers;
   },
@@ -239,6 +241,9 @@ export const pump = async (
                 );
           if (workspaceId) input.notify?.({ workspaceId, scopes: [`workspace:${workspaceId}`] });
         }
+        if (row.topic === "attachment.gc") {
+          await input.r2.delete((row.payload as { r2Key: string }).r2Key);
+        }
         await markOutboxSent(db, settle);
         return "processed";
       } catch (error) {
@@ -267,6 +272,8 @@ export const pump = async (
   const approvals = await expireApprovals(db);
   // Delegations (§8.1): closed once their Job is terminal, expired past their deadline.
   const delegations = await settleDelegations(db);
+  // Attachments are unreferenced until a message attaches them; both pending and unattached ready rows expire.
+  const attachmentsGc = await collectAttachments(db);
   for (const workspaceId of new Set([...expired, ...parked, ...approvals, ...delegations])) {
     input.notify?.({ workspaceId, scopes: [`workspace:${workspaceId}`] });
   }
@@ -279,5 +286,6 @@ export const pump = async (
     parked: parked.length,
     approvalsExpired: approvals.length,
     delegations: delegations.length,
+    attachmentsGc,
   };
 };

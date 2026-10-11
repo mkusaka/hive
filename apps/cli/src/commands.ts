@@ -154,6 +154,7 @@ export const messagePost = async (
   input: {
     target: ({ channelId: string } | { conversationId: string }) & { threadOf?: string };
     text: string;
+    attachmentIds?: string[];
     resolveNames: boolean;
   },
 ) => {
@@ -163,7 +164,12 @@ export const messagePost = async (
     for (const bot of bots.toSorted((a, b) => b.name.length - a.name.length))
       text = text.replaceAll(`@${bot.name}`, mentionToken(bot.id));
   }
-  return c.command(e, { type: "message.post", ...input.target, text });
+  return c.command(e, {
+    type: "message.post",
+    ...input.target,
+    text,
+    ...(input.attachmentIds ? { attachmentIds: input.attachmentIds } : {}),
+  });
 };
 
 export const eventEmit = (

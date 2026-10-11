@@ -1,4 +1,5 @@
 // IPC argument validation and the HTTP calls behind it. No `electron` import, so it runs under vitest.
+import { isAbsolute } from "node:path";
 import { CliError, type Client } from "@hive/cli/client";
 import * as service from "@hive/cli/service";
 import {
@@ -23,7 +24,7 @@ import {
   WorkspaceCreate,
 } from "@hive/contracts";
 import * as v from "valibot";
-import type { ApiResult } from "../shared/api.ts";
+import type { ApiResult, AttachmentTarget } from "../shared/api.ts";
 
 /**
  * A `/v1/...` path with an optional query. Path segments allow no `.` or `%`, so neither a literal nor an
@@ -90,6 +91,74 @@ export const handlers = (client: Client) => ({
     if (!parsed.ok) return Promise.resolve(invalid(parsed.issues));
     const { command, ...rest } = parsed.value;
     return toResult(() => client.command(rest, command));
+  },
+});
+
+const AttachmentId = v.pipe(v.string(), v.minLength(1), v.maxLength(200), v.regex(/^[\w-]+$/));
+const AttachmentPath = v.pipe(
+  v.string(),
+  v.minLength(1),
+  v.maxLength(4096),
+  v.check((path) => !path.includes("\0") && isAbsolute(path), "must be an absolute local path"),
+);
+const AttachmentTargetSchema = v.pipe(
+  v.strictObject({
+    workspaceId: v.pipe(v.string(), v.minLength(1), v.maxLength(200)),
+    channelId: v.optional(AttachmentId),
+    conversationId: v.optional(AttachmentId),
+    threadOf: v.optional(AttachmentId),
+  }),
+  v.check(
+    (target) => (target.channelId === undefined) !== (target.conversationId === undefined),
+    "exactly one of channelId / conversationId is required",
+  ),
+);
+const AttachmentUpload = v.strictObject({ target: AttachmentTargetSchema, path: AttachmentPath });
+const AttachmentPaste = v.strictObject({ target: AttachmentTargetSchema });
+const AttachmentDataUrl = v.strictObject({
+  id: AttachmentId,
+  contentType: v.picklist(["image/png", "image/jpeg", "image/gif", "image/webp"]),
+});
+const AttachmentSave = v.strictObject({
+  id: AttachmentId,
+  name: v.pipe(v.string(), v.minLength(1), v.maxLength(500)),
+});
+
+/**
+ * Attachment IPC has a deliberately narrow boundary: renderer supplies only a validated local path or attachment
+ * metadata; main owns credentials, byte IO and native dialogs.
+ */
+export const attachmentHandlers = (deps: {
+  upload(target: AttachmentTarget, path: string): Promise<Record<string, unknown>>;
+  paste(target: AttachmentTarget): Promise<Record<string, unknown>>;
+  dataUrl(id: string, contentType: string): Promise<string>;
+  save(id: string, name: string): Promise<boolean>;
+}) => ({
+  upload: (input: unknown) => {
+    const parsed = parse(AttachmentUpload, input);
+    return parsed.ok
+      ? toResult(async () => deps.upload(parsed.value.target, parsed.value.path))
+      : Promise.resolve(invalid(parsed.issues));
+  },
+  paste: (input: unknown) => {
+    const parsed = parse(AttachmentPaste, input);
+    return parsed.ok
+      ? toResult(async () => deps.paste(parsed.value.target))
+      : Promise.resolve(invalid(parsed.issues));
+  },
+  dataUrl: (input: unknown) => {
+    const parsed = parse(AttachmentDataUrl, input);
+    return parsed.ok
+      ? toResult(async () => ({
+          dataUrl: await deps.dataUrl(parsed.value.id, parsed.value.contentType),
+        }))
+      : Promise.resolve(invalid(parsed.issues));
+  },
+  save: (input: unknown) => {
+    const parsed = parse(AttachmentSave, input);
+    return parsed.ok
+      ? toResult(async () => ({ saved: await deps.save(parsed.value.id, parsed.value.name) }))
+      : Promise.resolve(invalid(parsed.issues));
   },
 });
 

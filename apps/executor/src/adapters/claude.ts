@@ -17,6 +17,7 @@ import {
   query,
   type SDKMessage,
   type SDKResultMessage,
+  type SDKUserMessage,
   type SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
 import { runCwd } from "../environments.ts";
@@ -24,7 +25,10 @@ import type { AgentAdapter, LaunchContext, RunningAgent } from "../runner.ts";
 import { approvalGate, preToolUse, toolOptions, truncate } from "../toolPolicy.ts";
 import { hiveMcpServer, hiveTools, toolName, waitForReplyTool } from "../tools.ts";
 
-export type QueryFn = (params: { prompt: string; options: Options }) => AsyncIterable<SDKMessage>;
+export type QueryFn = (params: {
+  prompt: string | AsyncIterable<SDKUserMessage>;
+  options: Options;
+}) => AsyncIterable<SDKMessage>;
 type Exit = Awaited<ReturnType<RunningAgent["waitForExit"]>>;
 
 const kib8 = 8 * 1024;
@@ -38,6 +42,48 @@ export const systemPrompt = ({ bot }: LaunchContext["context"]) =>
 /** One conversation line of the prompt. */
 const promptLine = (m: { actorKind: string; actorId: string; body: string }) =>
   `[${m.actorKind} ${m.actorId}] ${m.body}`;
+
+type Attachment = LaunchContext["context"]["attachments"][number];
+const imageContentTypes = ["image/png", "image/jpeg", "image/gif", "image/webp"] as const;
+type ImageContentType = (typeof imageContentTypes)[number];
+const isImage = (
+  attachment: Attachment,
+): attachment is Attachment & { contentType: ImageContentType } =>
+  imageContentTypes.includes(attachment.contentType as ImageContentType);
+
+/**
+ * Claude Agent SDK 0.3.289 accepts streamed user messages with Anthropic image blocks. Other attachment types stay
+ * on disk and are named in the text prompt for the Read tool.
+ */
+export const promptWithAttachments = async (
+  text: string,
+  attachments: LaunchContext["context"]["attachments"],
+): Promise<string | AsyncIterable<SDKUserMessage>> => {
+  const images = attachments.filter(
+    (attachment): attachment is Attachment & { contentType: ImageContentType; path: string } =>
+      Boolean(attachment.path) && isImage(attachment),
+  );
+  if (!images.length) return text;
+  const content: Exclude<SDKUserMessage["message"]["content"], string> = [{ type: "text", text }];
+  for (const attachment of images) {
+    content.push({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: attachment.contentType,
+        // oxlint-disable-next-line no-await-in-loop -- encode up to 25 MiB at a time
+        data: (await readFile(attachment.path)).toString("base64"),
+      },
+    });
+  }
+  return (async function* () {
+    yield {
+      type: "user",
+      parent_tool_use_id: null,
+      message: { role: "user", content },
+    } satisfies SDKUserMessage;
+  })();
+};
 
 /**
  * User message: Task, a thread's parent messages, recent conversation (oldest first), Memory, Related search hits,
@@ -53,6 +99,7 @@ export const userPrompt = ({
   replies,
   memories,
   related,
+  attachments,
   delegation,
 }: LaunchContext["context"]) => {
   const parts: string[] = [];
@@ -79,6 +126,21 @@ export const userPrompt = ({
       (r) => `- (${r.sourceKind}) ${[r.title, r.snippet].filter(Boolean).join(": ")}`,
     );
     parts.push(`Related:\n${lines.join("\n")}`);
+  }
+  if (attachments.length) {
+    parts.push(
+      `Attachments (use Read for files; images are also supplied to Claude):\n${attachments
+        .map((attachment) =>
+          JSON.stringify({
+            messageId: attachment.messageId,
+            name: attachment.name,
+            contentType: attachment.contentType,
+            size: attachment.size,
+            path: attachment.path,
+          }),
+        )
+        .join("\n")}`,
+    );
   }
   const request = batch
     ? batch.items.map((i, n) => `[${n + 1}] ${i.body}`).join("\n")
@@ -181,6 +243,9 @@ export const claudeAdapter = ({
       return { requestStop: async () => {}, waitForExit: async () => exit };
     }
     const roots = [...new Set([cwd, await realpath(cwd)])];
+    const attachmentPaths = ctx.context.attachments.flatMap((attachment) =>
+      attachment.path ? [attachment.path] : [],
+    );
     // An earlier Run's session, possibly from another device: only when the store holds it complete.
     const earlier = ctx.context.previousProviderSessionId;
     const loaded = earlier
@@ -213,22 +278,25 @@ export const claudeAdapter = ({
       const file = await open(transcript, "a");
       try {
         let result: SDKResultMessage | undefined;
+        const prompt = restarted
+          ? "Your previous attempt was interrupted. Give your final answer to the last request."
+          : await promptWithAttachments(userPrompt(ctx.context), ctx.context.attachments);
         const messages = queryFn({
-          prompt: restarted
-            ? "Your previous attempt was interrupted. Give your final answer to the last request."
-            : userPrompt(ctx.context),
+          prompt,
           options: {
             cwd,
             abortController: abort,
             systemPrompt: systemPrompt(ctx.context),
             // No settings / MCP / hooks from the user's Claude config: the tool policy and the hive tools only.
             ...toolOptions(policy, hive),
-            hooks: { PreToolUse: [{ hooks: [preToolUse(policy, roots, new Set(hive))] }] },
+            hooks: {
+              PreToolUse: [{ hooks: [preToolUse(policy, roots, new Set(hive), attachmentPaths)] }],
+            },
             canUseTool: approvalGate({
               policy,
               run: ctx.run,
               cwdLabel: policy.cwdMode === "environment" ? environment! : "run_scratch",
-              roots,
+              roots: [...roots, ...attachmentPaths],
               hiveTools: new Set(hive),
               pollMs: approvalPollMs,
             }),
