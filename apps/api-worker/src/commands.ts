@@ -13,6 +13,7 @@ import {
   WorkspaceCreate,
 } from "@hive/contracts";
 import {
+  appendChange,
   digest,
   enqueueOutbox,
   IdempotencyConflict,
@@ -44,25 +45,36 @@ type Handler<T extends Command> = (
   db: D1Database,
   user: User,
   envelope: Envelope & { command: T },
-) => Promise<{ status: number; response: unknown }>;
+) => Promise<{ status: number; response: unknown; scopes?: string[] }>;
 
+type Change = Omit<Parameters<typeof appendChange>[1], "workspaceId">;
+
+/** Runs the batch with one change row per `changes` entry; returns the touched scopes unless replayed. */
 const receipt = async <T>(
   db: D1Database,
   user: User,
   envelope: Envelope,
   statements: D1PreparedStatement[],
   response: T,
-) =>
-  withOperationReceipt(
+  changes: Change[],
+) => {
+  const { workspaceId } = envelope;
+  const result = await withOperationReceipt(
     db,
     {
-      workspaceId: envelope.workspaceId,
+      workspaceId,
       actorId: user.userId,
       idempotencyKey: envelope.idempotencyKey,
       requestDigest: await digest(envelope.command),
     },
-    () => ({ statements, status: 200, response }),
+    () => ({
+      statements: [...statements, ...changes.map((c) => appendChange(db, { workspaceId, ...c }))],
+      status: 200,
+      response,
+    }),
   );
+  return { ...result, scopes: result.replayed ? [] : [...new Set(changes.map((c) => c.scope))] };
+};
 
 const workspaceCreate: Handler<v.InferOutput<typeof WorkspaceCreate>> = async (db, user, env) => {
   const { workspaceId } = env;
@@ -101,6 +113,7 @@ const workspaceCreate: Handler<v.InferOutput<typeof WorkspaceCreate>> = async (d
         .bind(crypto.randomUUID(), workspaceId, user.userId),
     ],
     { operationId: env.operationId, status: "accepted", workspaceId },
+    [{ entityKind: "workspace", entityId: workspaceId, scope: `workspace:${workspaceId}` }],
   );
 };
 
@@ -132,12 +145,10 @@ const deviceRegister: Handler<v.InferOutput<typeof DeviceRegister>> = async (db,
       deviceId,
       deviceToken: null as string | null,
     },
+    [{ entityKind: "device", entityId: deviceId, scope: `workspace:${workspaceId}` }],
   );
   if (result.replayed) return result;
-  return {
-    status: result.status,
-    response: { ...result.response, deviceToken: `${deviceId}.${secret}` },
-  };
+  return { ...result, response: { ...result.response, deviceToken: `${deviceId}.${secret}` } };
 };
 
 const deviceRevoke: Handler<v.InferOutput<typeof DeviceRevoke>> = async (db, user, env) => {
@@ -167,6 +178,7 @@ const deviceRevoke: Handler<v.InferOutput<typeof DeviceRevoke>> = async (db, use
         .bind(now, workspaceId, command.deviceId),
     ],
     { operationId: env.operationId, status: "accepted", deviceId: command.deviceId },
+    [{ entityKind: "device", entityId: command.deviceId, scope: `workspace:${workspaceId}` }],
   );
 };
 
@@ -220,6 +232,10 @@ const channelCreate: Handler<v.InferOutput<typeof ChannelCreate>> = async (db, u
         .bind(workspaceId, channelId, actorId),
     ],
     { operationId: env.operationId, status: "accepted", channelId, conversationId },
+    [
+      { entityKind: "channel", entityId: channelId, scope: `channel:${channelId}` },
+      { entityKind: "conversation", entityId: conversationId, scope: `channel:${channelId}` },
+    ],
   );
   return uniqueName(db, "channels", workspaceId, command.name, run);
 };
@@ -245,11 +261,12 @@ const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env
         .bind(botId, workspaceId, actorId, command.name, JSON.stringify(command.placementPolicy)),
     ],
     { operationId: env.operationId, status: "accepted", botId },
+    [{ entityKind: "bot", entityId: botId, revision: 1, scope: `workspace:${workspaceId}` }],
   );
   return uniqueName(db, "bots", workspaceId, command.name, run);
 };
 
-/** §11.1: Message, Inbox item, Event, Outbox and Receipt in one batch. Routing creates the Job later. */
+/** §11.1: Message, Inbox item, Event, Change Log, Outbox and Receipt in one batch. Routing creates the Job later. */
 const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env) => {
   const { workspaceId, command } = env;
   const member = await db
@@ -332,6 +349,10 @@ const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env
       enqueueOutbox(db, { workspaceId, topic: "event.route", payload: { eventId } }),
     ],
     response,
+    [
+      { entityKind: "message", entityId: messageId, scope: `channel:${command.channelId}` },
+      { entityKind: "inbox_item", entityId: inboxItemId, scope: `channel:${command.channelId}` },
+    ],
   );
 };
 
@@ -372,6 +393,8 @@ const eventEmit: Handler<v.InferOutput<typeof EventEmit>> = async (db, user, env
       enqueueOutbox(db, { workspaceId, topic: "event.route", payload: { eventId } }),
     ],
     response,
+    // Events are not a synced entity; routing logs the inbox items / Jobs it creates.
+    [],
   );
 };
 

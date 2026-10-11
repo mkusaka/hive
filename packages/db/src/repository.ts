@@ -116,7 +116,7 @@ export type ClaimFailure =
   | { ok: false; reason: "already_claimed"; jobState: string };
 export type ClaimResult = ({ ok: true } & Claim) | ClaimFailure;
 
-/** job.claim (§9.2 step 4): Job CAS, root Run, Execution, reservations and receipt in one batch. */
+/** job.claim (§9.2 step 4): Job CAS, root Run, Execution, reservations, change rows and receipt in one batch. */
 export const claimJob = async (db: D1Database, input: ClaimInput): Promise<ClaimResult> => {
   const { workspaceId, jobId, deviceId, operationId } = input;
   const key = {
@@ -165,6 +165,19 @@ export const claimJob = async (db: D1Database, input: ClaimInput): Promise<Claim
         db
           .prepare("INSERT INTO executions (id, workspace_id, run_id) VALUES (?, ?, ?)")
           .bind(claim.executionId, workspaceId, claim.runId),
+        appendChange(db, {
+          workspaceId,
+          entityKind: "job",
+          entityId: jobId,
+          revision: input.expectedRevision + 1,
+          scope: `workspace:${workspaceId}`,
+        }),
+        appendChange(db, {
+          workspaceId,
+          entityKind: "run",
+          entityId: claim.runId,
+          scope: `workspace:${workspaceId}`,
+        }),
         ...input.resourceKeys.map((resourceKey) =>
           db
             .prepare(
@@ -232,7 +245,7 @@ export const renewLease = async (
 
 /**
  * Run completion (§11.1): fenced terminal Run with its result, Execution, released reservations, Job state,
- * outbox, the caller's extra `statements` (e.g. the Inbox outcome) and receipt. A replay with the same
+ * outbox, change rows, the caller's extra `statements` (e.g. the Inbox outcome) and receipt. A replay with the same
  * operationId returns the stored `{ ok: true }`.
  */
 export const finishRun = async (
@@ -305,6 +318,18 @@ export const finishRun = async (
           topic: "run.finished",
           payload: { runId: input.runId, jobId: run.job_id, state: input.state },
         }),
+        appendChange(db, {
+          workspaceId: run.workspace_id,
+          entityKind: "run",
+          entityId: input.runId,
+          scope: `workspace:${run.workspace_id}`,
+        }),
+        appendChange(db, {
+          workspaceId: run.workspace_id,
+          entityKind: "job",
+          entityId: run.job_id,
+          scope: `workspace:${run.workspace_id}`,
+        }),
         ...(input.statements ?? []),
         clearGuard,
       ],
@@ -323,6 +348,36 @@ export const finishRun = async (
     throw error;
   }
 };
+
+// -------------------------------------------------------------- Change log
+
+/**
+ * Returns a statement to include in the batch that commits the change (§12.2). `scope` is
+ * `workspace:<id>` or `channel:<id>`; `revision` is omitted for entities without a revision column.
+ */
+export const appendChange = (
+  db: D1Database,
+  input: {
+    workspaceId: string;
+    entityKind: string;
+    entityId: string;
+    op?: "upsert" | "delete";
+    revision?: number;
+    scope: string;
+  },
+) =>
+  db
+    .prepare(
+      "INSERT INTO change_log (workspace_id, entity_kind, entity_id, op, revision, scope) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(
+      input.workspaceId,
+      input.entityKind,
+      input.entityId,
+      input.op ?? "upsert",
+      input.revision ?? null,
+      input.scope,
+    );
 
 // ------------------------------------------------------------------ Outbox
 
@@ -619,11 +674,12 @@ export const recordEventRouted = (
 /**
  * Event route (§11.1): consumer receipt, Delivery, Inbox item and (for `wake`) a queued Job in one batch.
  * The Inbox item may already exist (agent.send writes it at intake): it is linked to the Delivery, and
- * exactly one row must change. The Job's trigger key is `inbox:<inboxItemId>`.
+ * exactly one row must change. The Job's trigger key is `inbox:<inboxItemId>`. Change rows: the inbox item
+ * under `scope` and the Job under `workspace:<id>`.
  */
 export const createDeliveryAndInbox = async (
   db: D1Database,
-  input: InboxInput & { eventId: string },
+  input: InboxInput & { eventId: string; scope: string },
 ): Promise<{ routed: false } | { routed: true; deliveryId: string; jobId: string | null }> => {
   const deliveryId = crypto.randomUUID();
   const jobId = input.deliveryMode === "wake" ? crypto.randomUUID() : null;
@@ -657,6 +713,12 @@ export const createDeliveryAndInbox = async (
       ),
     setGuard,
     clearGuard,
+    appendChange(db, {
+      workspaceId: input.workspaceId,
+      entityKind: "inbox_item",
+      entityId: input.id,
+      scope: input.scope,
+    }),
     ...(jobId
       ? [
           createJob(db, {
@@ -664,6 +726,13 @@ export const createDeliveryAndInbox = async (
             workspaceId: input.workspaceId,
             botId: input.botId,
             triggerKey: `inbox:${input.id}`,
+          }),
+          appendChange(db, {
+            workspaceId: input.workspaceId,
+            entityKind: "job",
+            entityId: jobId,
+            revision: 1,
+            scope: `workspace:${input.workspaceId}`,
           }),
         ]
       : []),

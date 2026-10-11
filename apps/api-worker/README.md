@@ -13,6 +13,13 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/operations/:id`                    | Access assertion (user)                | Receipt of the user's command; for `agent.send` also the inbox item, routing status and Job id |
 | `GET /v1/jobs/:id`                          | Access assertion (user)                | A Job in one of the user's Workspaces                                                          |
 | `GET /v1/inbox?botId=`                      | Access assertion (user)                | The Bot's inbox items (first 100, no cursor yet)                                               |
+| `GET /v1/channels?workspaceId=`             | Access assertion (user)                | Channels the user is a member of, with the main `conversationId` (max 500)                     |
+| `GET /v1/channels/:id/messages`             | Access assertion (user)                | Newest-first messages of a member channel (limit 1..200, default 50; 404 if not a member)      |
+| `GET /v1/bots?workspaceId=`                 | Access assertion (user)                | Bots of the Workspace (max 500)                                                                |
+| `GET /v1/devices?workspaceId=`              | Access assertion (user)                | Devices of the Workspace, no credentials (max 500)                                             |
+| `GET /v1/jobs?limit=`                       | Access assertion (user)                | Newest-first Jobs (limit 1..200, default 50)                                                   |
+| `GET /v1/sync/changes?cursor=`              | Access assertion (user)                | Permitted changes after the cursor (limit 1..500, default 100); see Sync below                 |
+| `GET /v1/realtime?workspaceId=`             | Access assertion, or device Bearer     | WebSocket upgrade to the Workspace's Realtime DO; see Realtime below                           |
 | `GET /v1/executor/me`                       | `Authorization: Bearer <device-token>` | Returns the device principal                                                                   |
 | `POST /v1/executor/pump`                    | `Authorization: Bearer <device-token>` | Runs the outbox pump once; returns `{processed, dead}`                                         |
 | `POST /v1/executor/commands`                | `Authorization: Bearer <device-token>` | Executor command intake (see below)                                                            |
@@ -72,6 +79,56 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 inbox:<id>`) to `processed` (succeeded) or `failed`, plus the `run.finished` outbox row. A stale fence is 409
   `STALE_GENERATION`; a replay with the same key returns `{ok: true}` again.
 
+## Sync
+
+The list, sync and realtime routes take the Workspace as `?workspaceId=` (required; 403 if the principal is not a
+member).
+
+- **Change log.** Every batch that changes a client-visible entity appends one `change_log` row per entity
+  (`appendChange`, `packages/db`), so a rolled-back command leaves none:
+
+  | Command / step                      | Rows (scope)                                           |
+  | ----------------------------------- | ------------------------------------------------------ |
+  | `workspace.create`                  | workspace (workspace)                                  |
+  | `device.register` / `device.revoke` | device (workspace)                                     |
+  | `channel.create`                    | channel, conversation (channel)                        |
+  | `bot.create`                        | bot (workspace)                                        |
+  | `agent.send`                        | message, inbox item (channel)                          |
+  | event route                         | inbox item (channel), Job (workspace) for `wake`       |
+  | `job.claim`                         | Job, Run (workspace)                                   |
+  | `run.result.submit`                 | Run, Job (workspace), trigger inbox item (its channel) |
+
+  `run.lease.renew` and heartbeats are not logged. `event.emit` logs nothing itself (events are not a synced
+  entity). Rows carry no payload: clients refetch the entity.
+
+- **Cursor.** Opaque to clients; today base64url of the JSON `{workspaceId, epoch, seq}`. `epoch` is
+  `workspaces.auth_epoch`. An undecodable cursor, one from another Workspace, or one whose epoch is not current is
+  410 `CURSOR_EXPIRED`: bootstrap again.
+- **`GET /v1/sync/changes`** returns `{changes: [{seq, entityKind, entityId, op, revision, scope, createdAt}],
+cursor, hasMore}`. It scans `limit` rows after the cursor, drops rows outside the caller's scopes
+  (`workspace:<id>` plus `channel:<id>` of each channel the user is a member of) and returns the last _scanned_
+  seq, so a page of hidden rows still advances (§12.3).
+- **Bootstrap.** Without `cursor` the response is `{changes: [], cursor: <head>, hasMore: false}`. Take that cursor
+  first, then read current state through the list routes, then follow `sync/changes` from the cursor, comparing
+  `revision` / `seq` so older data never overwrites newer.
+
+## Realtime
+
+`src/realtime.ts`: one Durable Object per Workspace (`idFromName(workspaceId)`, binding `REALTIME`) using the
+WebSocket Hibernation API. It holds connections only, never state (ADR-04); every message is a refetch hint.
+
+- **Upgrade.** `GET /v1/realtime?workspaceId=` with `Upgrade: websocket` (otherwise 422). The Worker
+  authenticates: a `Authorization: Bearer <device-token>` header selects device auth, else the Access assertion.
+  It then computes the socket's scopes (user: as for sync; device: `workspace:<id>`) and forwards a fresh request
+  to the DO with the principal in `X-Hive-Principal`. The DO rejects a connect request without it (403); DOs are
+  reachable only through the binding, and the Worker never forwards client headers. Scopes are fixed at upgrade.
+- **Messages.** `{"type":"sync.changed","workspaceId","cursor","scopes"}` goes to sockets whose scopes intersect
+  the change, carrying only the intersecting scopes; `cursor` is the head cursor when the hint was sent.
+  `{"type":"job.available","workspaceId"}` goes to device sockets when routing queued a Job. Clients send nothing.
+- **Notify path.** After a non-replayed command, executor command or routed event, the Worker calls the DO's
+  `/notify` inside `waitUntil`. A failure is logged and dropped (§12.2): clients reconcile over HTTP.
+- **Executor.** `apps/executor` still polls `GET /v1/executor/jobs`; it does not open the socket yet.
+
 ## Outbox pump
 
 `src/pump.ts` acquires ready outbox rows (lease 60 s) and routes `event.route` rows:
@@ -100,6 +157,11 @@ It runs from the `scheduled()` cron trigger (every minute) and from `POST /v1/ex
   artifacts, lease expiry is not recovered automatically (an expired `active` Job stays `active`), and there is no
   scheduler / offer: executors poll `GET /v1/executor/jobs`. A page of that list is filtered after `LIMIT`, so it
   may hold fewer than `limit` eligible Jobs.
+- **Sync / realtime.** No scope revocation: no command removes a member, so nothing bumps `auth_epoch` or closes
+  sockets whose scopes shrank (§12.4); add it with the member commands. Socket scopes are computed once at
+  upgrade, so a channel joined later needs a reconnect, and they live in the socket attachment (16 KiB cap, about
+  350 channels). The list routes are bounded but not paginated. G-04
+  (Access + WebSocket from native clients) is not executed. Notify hints are sent per request, not batched.
 - **Bot channel membership.** `agent.send` does not require the recipient Bot to be a member of the channel;
   `bot.create` adds no membership.
 
@@ -137,4 +199,6 @@ export HIVE_ACCESS_JWT=$(bun scripts/dev-token.ts)  # 12 h dev assertion for the
 
 `bun run test` from the repo root runs `test/` in miniflare with the `packages/db` migrations applied.
 `test/cli.test.ts` drives the Phase 1 loop through the `hive` CLI's command functions (`@hive/cli/commands`);
-`test/devToken.test.ts` covers the `ACCESS_DEV_JWKS` path.
+`test/devToken.test.ts` covers the `ACCESS_DEV_JWKS` path. `test/sync.test.ts` covers the change rows of every command, sync paging
+and expiry, the list routes, and real WebSocket fan-out through the Realtime DO (two user sockets with different
+scopes plus a device socket).

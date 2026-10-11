@@ -37,6 +37,9 @@ const scoped = (t: { workspaceId: AnySQLiteColumn; id: AnySQLiteColumn }) =>
 export const workspaces = sqliteTable("workspaces", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
+  // Part of every sync cursor (docs/architecture.md §12.3): bumped when membership / ACL changes, which
+  // expires old cursors. Nothing bumps it yet (no member add/remove command).
+  authEpoch: integer("auth_epoch").notNull().default(1),
   createdAt: createdAt(),
   updatedAt: updatedAt(),
 });
@@ -522,6 +525,31 @@ export const operationReceipts = sqliteTable(
     createdAt: createdAt(),
   },
   (t) => [primaryKey({ columns: [t.workspaceId, t.actorId, t.idempotencyKey] })],
+);
+
+const changeOps = ["upsert", "delete"] as const;
+
+/**
+ * immutable history. Appended in the batch of the change it describes (docs/architecture.md §12.2). `scope` is
+ * the access scope: `workspace:<id>` or `channel:<id>`. `revision` is the entity's revision column, null when it
+ * has none or it is not known when the batch is built.
+ */
+export const changeLog = sqliteTable(
+  "change_log",
+  {
+    seq: integer("seq").primaryKey({ autoIncrement: true }),
+    workspaceId: workspaceId(),
+    entityKind: text("entity_kind").notNull(),
+    entityId: text("entity_id").notNull(),
+    op: text("op", { enum: changeOps }).notNull(),
+    revision: integer("revision"),
+    scope: text("scope").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("change_log_workspace_seq").on(t.workspaceId, t.seq),
+    oneOf("change_log_op", t.op, changeOps),
+  ],
 );
 
 const outboxStates = ["pending", "sending", "sent", "dead"] as const;

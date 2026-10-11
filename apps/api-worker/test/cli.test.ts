@@ -1,15 +1,12 @@
 // Phase 1 completion (docs/roadmap.md §7): CLI → Cloud → PC → Cloud result, through the CLI's command
 // functions with `fetch` backed by the Hono app.
-import { env } from "cloudflare:test";
 import { createClient } from "@hive/cli/client";
 import * as hive from "@hive/cli/commands";
 import { fakeAdapter } from "@hive/executor/adapters/fake";
 import { createCloudClient } from "@hive/executor/cloudClient";
 import { type JournalEntry, runOnce } from "@hive/executor/runner";
 import { expect, it } from "vitest";
-import { app, assertion, call } from "./helpers.ts";
-
-const fetch = async (url: URL, init: RequestInit) => app.request(url, init, env);
+import { assertion, call, request as fetch } from "./helpers.ts";
 const apiUrl = "https://hive.test";
 
 it("workspace → device → channel → bot → agent send → executor → job succeeded", async () => {

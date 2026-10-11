@@ -34,6 +34,7 @@ type Ctx = {
   creds: Credentials;
   apiUrl(): string;
   client(): Client;
+  workspace(): string;
   envelope(workspaceId?: string): cmd.Envelope;
   print(body: unknown): void;
   wait(): cmd.WaitOptions;
@@ -183,6 +184,26 @@ const specs: Record<string, Spec> = {
       return exitForJob(job);
     },
   },
+  "channel list": {
+    usage: "",
+    run: async (c) => c.print(await cmd.listChannels(c.client(), c.workspace())),
+  },
+  "bot list": {
+    usage: "",
+    run: async (c) => c.print(await cmd.listBots(c.client(), c.workspace())),
+  },
+  "device list": {
+    usage: "",
+    run: async (c) => c.print(await cmd.listDevices(c.client(), c.workspace())),
+  },
+  "sync changes": {
+    usage: "[--cursor <cursor>]",
+    options: { cursor: str },
+    run: async (c) =>
+      c.print(
+        await cmd.syncChanges(c.client(), c.workspace(), c.values.cursor as string | undefined),
+      ),
+  },
   "inbox list": {
     usage: "--bot <bot-id>",
     options: { bot: str },
@@ -256,6 +277,11 @@ export const run = async (argv: string[], deps: Deps): Promise<number> => {
       if (!url) throw invalid("--api-url is required (or apiUrl in the credentials file)");
       return url;
     };
+    const workspace = () => {
+      const id = (values.workspace as string | undefined) ?? creds.workspaceId;
+      if (!id) throw invalid("--workspace is required (or run `hive workspace create`)");
+      return id;
+    };
     const timeout = Number(values.timeout ?? 300);
     if (!(timeout > 0)) throw invalid("--timeout must be a positive number of seconds");
     const code = await spec.run({
@@ -266,14 +292,12 @@ export const run = async (argv: string[], deps: Deps): Promise<number> => {
       apiUrl,
       client: () =>
         createClient({ apiUrl: apiUrl(), accessJwt: creds.accessJwt, fetch: deps.fetch }),
-      envelope: (workspaceId = (values.workspace as string | undefined) ?? creds.workspaceId) => {
-        if (!workspaceId) throw invalid("--workspace is required (or run `hive workspace create`)");
-        return {
-          operationId: (values["operation-id"] as string | undefined) ?? crypto.randomUUID(),
-          idempotencyKey: (values["idempotency-key"] as string | undefined) ?? crypto.randomUUID(),
-          workspaceId,
-        };
-      },
+      workspace,
+      envelope: (workspaceId = workspace()) => ({
+        operationId: (values["operation-id"] as string | undefined) ?? crypto.randomUUID(),
+        idempotencyKey: (values["idempotency-key"] as string | undefined) ?? crypto.randomUUID(),
+        workspaceId,
+      }),
       print: (body) => {
         if (json) return deps.stdout(JSON.stringify(body));
         for (const [key, value] of Object.entries(body as cmd.Json))

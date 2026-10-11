@@ -21,6 +21,8 @@ hive op get <operation-id>
 hive job get <job-id>
 hive job watch <job-id> [--timeout <s>]                # polls GET /v1/jobs/:id every 2 s
 hive inbox list --bot <bot-id>
+hive channel list | hive bot list | hive device list   # bootstrap lists of the workspace
+hive sync changes [--cursor <cursor>]                  # without --cursor: the bootstrap cursor
 hive executor run [--once]                             # Local Executor (fake provider) with the stored token
 ```
 

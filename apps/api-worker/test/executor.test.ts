@@ -3,7 +3,15 @@ import { fakeAdapter } from "@hive/executor/adapters/fake";
 import { createCloudClient } from "@hive/executor/cloudClient";
 import { type JournalEntry, runOnce } from "@hive/executor/runner";
 import { describe, expect, it } from "vitest";
-import { app, call, envelope, type Json, register, setup, withWorkspace } from "./helpers.ts";
+import {
+  call,
+  envelope,
+  type Json,
+  register,
+  request as fetchApp,
+  setup,
+  withWorkspace,
+} from "./helpers.ts";
 
 const db = env.DB;
 const count = async (from: string, ...params: unknown[]) =>
@@ -227,7 +235,7 @@ describe("end to end", () => {
     const cloud = createCloudClient({
       apiUrl: "https://hive.test",
       token: s.deviceToken,
-      fetch: async (url, init) => app.request(url, init, env),
+      fetch: fetchApp,
     });
 
     const result = await runOnce({

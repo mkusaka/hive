@@ -12,7 +12,7 @@ import {
   type RunResultAccepted,
   type RunResultSubmit,
 } from "@hive/contracts";
-import { claimJob, finishRun, renewLease } from "@hive/db";
+import { appendChange, claimJob, finishRun, renewLease } from "@hive/db";
 import type * as v from "valibot";
 import type { Principal } from "./auth/principal.ts";
 import { HttpError } from "./errors.ts";
@@ -25,7 +25,7 @@ type Handler<T extends Command> = (
   db: D1Database,
   device: Device,
   envelope: Envelope & { command: T },
-) => Promise<{ status: number; response: unknown }>;
+) => Promise<{ status: number; response: unknown; scopes?: string[] }>;
 
 /** docs/roadmap.md §1 defaults. */
 export const leaseSeconds = 90;
@@ -100,7 +100,7 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
     leaseExpiresAt: result.leaseExpiresAt,
     job: { id: job.id, botId: job.botId, inboxItemId: job.inboxItemId, placement: job.placement },
   };
-  return { status: 200, response };
+  return { status: 200, response, scopes: [`workspace:${workspaceId}`] };
 };
 
 const staleGeneration = () =>
@@ -121,6 +121,18 @@ const runLeaseRenew: Handler<v.InferOutput<typeof RunLeaseRenew>> = async (db, d
 /** Run completion plus the Inbox outcome of the Job's trigger item, in `finishRun`'s batch (§11.1). */
 const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (db, device, env) => {
   const { workspaceId, command } = env;
+  // The trigger item's channel names its change scope; an item without a conversation is workspace-wide.
+  const item = await db
+    .prepare(
+      `SELECT i.id, c.channel_id FROM runs r
+         JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
+         JOIN inbox_items i ON i.workspace_id = j.workspace_id AND 'inbox:' || i.id = j.trigger_key
+         LEFT JOIN conversations c ON c.workspace_id = i.workspace_id AND c.id = i.conversation_id
+        WHERE r.id = ? AND r.workspace_id = ?`,
+    )
+    .bind(command.runId, workspaceId)
+    .first<{ id: string; channel_id: string | null }>();
+  const itemScope = item?.channel_id ? `channel:${item.channel_id}` : `workspace:${workspaceId}`;
   const inboxOutcome = db
     .prepare(
       `UPDATE inbox_items SET state = ?, updated_at = ?
@@ -144,11 +156,21 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
     summary: command.summary,
     error: command.error,
     operationId: env.idempotencyKey,
-    statements: [inboxOutcome],
+    statements: item
+      ? [
+          inboxOutcome,
+          appendChange(db, {
+            workspaceId,
+            entityKind: "inbox_item",
+            entityId: item.id,
+            scope: itemScope,
+          }),
+        ]
+      : [inboxOutcome],
   });
   if (!result.ok) throw staleGeneration();
   const response: RunResultAccepted = { ok: true };
-  return { status: 200, response };
+  return { status: 200, response, scopes: [...new Set([`workspace:${workspaceId}`, itemScope])] };
 };
 
 const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>> } = {

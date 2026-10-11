@@ -6,8 +6,11 @@ const migrations = new URL("../../packages/db/migrations", import.meta.url).path
 export default defineConfig({
   plugins: [
     cloudflareTest(async () => ({
+      // The pool wraps Durable Object classes exported from `main`.
+      main: "./src/index.ts",
       miniflare: {
         d1Databases: ["DB"],
+        durableObjects: { REALTIME: { className: "Realtime", useSQLite: true } },
         bindings: {
           TEST_MIGRATIONS: await readD1Migrations(migrations),
           ACCESS_TEAM_DOMAIN: "test.cloudflareaccess.com",

@@ -103,6 +103,22 @@ describe("argv → request", () => {
     expect(new Set(keys).size).toBe(2);
   });
 
+  it("list and sync commands GET with the workspace query", async () => {
+    const h = harness();
+    expect(await h.hive("channel", "list")).toBe(0);
+    expect(await h.hive("bot", "list", "--workspace", "ws-2")).toBe(0);
+    expect(await h.hive("device", "list")).toBe(0);
+    expect(await h.hive("sync", "changes")).toBe(0);
+    expect(await h.hive("sync", "changes", "--cursor", "c-1")).toBe(0);
+    expect(h.calls.map((c) => [c.method, c.path])).toEqual([
+      ["GET", "/v1/channels?workspaceId=ws-1"],
+      ["GET", "/v1/bots?workspaceId=ws-2"],
+      ["GET", "/v1/devices?workspaceId=ws-1"],
+      ["GET", "/v1/sync/changes?workspaceId=ws-1"],
+      ["GET", "/v1/sync/changes?workspaceId=ws-1&cursor=c-1"],
+    ]);
+  });
+
   it("event emit reads --data-file - from stdin and parses --subject", async () => {
     const h = harness(undefined, { stdin: '{"command":"bun test","exitCode":1}\n' });
     const code = await h.hive(

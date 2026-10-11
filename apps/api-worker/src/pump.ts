@@ -8,6 +8,7 @@ import {
   markOutboxSent,
   recordEventRouted,
 } from "@hive/db";
+import type { Notification } from "./realtime.ts";
 
 const maxAttempts = 5;
 const leaseSeconds = 60;
@@ -20,8 +21,11 @@ type AgentMessageSent = {
   delivery: "wake" | "notify";
 };
 
-/** Idempotent: the consumer receipt makes a second route of the same event a no-op. */
-export const routeEvent = async (db: D1Database, eventId: string) => {
+/**
+ * Idempotent: the consumer receipt makes a second route of the same event a no-op. Returns the realtime
+ * hint for what this call changed, or null.
+ */
+export const routeEvent = async (db: D1Database, eventId: string): Promise<Notification | null> => {
   const event = await db
     .prepare("SELECT workspace_id, type, data FROM events WHERE id = ?")
     .bind(eventId)
@@ -31,10 +35,11 @@ export const routeEvent = async (db: D1Database, eventId: string) => {
   if (event.type !== "agent.message.sent") {
     // No subscriptions yet: nothing matches (matched=0), only the consumer receipt is written.
     await recordEventRouted(db, { workspaceId, eventId });
-    return;
+    return null;
   }
   const data = JSON.parse(event.data) as AgentMessageSent;
-  await createDeliveryAndInbox(db, {
+  const scope = `channel:${data.channelId}`;
+  const routed = await createDeliveryAndInbox(db, {
     id: data.inboxItemId,
     workspaceId,
     eventId,
@@ -44,23 +49,36 @@ export const routeEvent = async (db: D1Database, eventId: string) => {
     lane: data.channelId,
     purpose: "agent.send",
     deliveryMode: data.delivery,
+    scope,
   });
+  if (!routed.routed) return null;
+  return routed.jobId
+    ? { workspaceId, scopes: [scope, `workspace:${workspaceId}`], jobAvailable: true }
+    : { workspaceId, scopes: [scope] };
 };
 
 /**
  * Acquires ready outbox rows and handles them. A failed row keeps its lease and is retried after it
  * expires; at `maxAttempts` it goes `dead`. Topics without a consumer yet (e.g. `run.finished`) are
- * marked sent so they do not cycle to dead.
+ * marked sent so they do not cycle to dead. `notify` receives the realtime hint of each routed event.
  */
-export const pump = async (db: D1Database, input: { owner: string; limit: number }) => {
-  const rows = await acquireOutboxBatch(db, { ...input, leaseSeconds });
+export const pump = async (
+  db: D1Database,
+  input: { owner: string; limit: number; notify?: (n: Notification) => void },
+) => {
+  const rows = await acquireOutboxBatch(db, {
+    owner: input.owner,
+    limit: input.limit,
+    leaseSeconds,
+  });
   // Rows are independent events, so they are handled concurrently.
   const outcomes = await Promise.all(
     rows.map(async (row) => {
       const settle = { id: row.id, owner: input.owner };
       try {
         if (row.topic === "event.route") {
-          await routeEvent(db, (row.payload as { eventId: string }).eventId);
+          const routed = await routeEvent(db, (row.payload as { eventId: string }).eventId);
+          if (routed) input.notify?.(routed);
         }
         await markOutboxSent(db, settle);
         return "processed";

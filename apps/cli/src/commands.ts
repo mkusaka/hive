@@ -50,6 +50,17 @@ export const getJob = (c: Client, id: string) => c.get(path("/v1/jobs", id));
 export const listInbox = (c: Client, botId: string) =>
   c.get(`/v1/inbox?botId=${encodeURIComponent(botId)}`);
 
+const inWorkspace = (resource: string, workspaceId: string, query: Record<string, string> = {}) =>
+  `/v1/${resource}?${new URLSearchParams({ workspaceId, ...query })}`;
+export const listChannels = (c: Client, workspaceId: string) =>
+  c.get(inWorkspace("channels", workspaceId));
+export const listBots = (c: Client, workspaceId: string) => c.get(inWorkspace("bots", workspaceId));
+export const listDevices = (c: Client, workspaceId: string) =>
+  c.get(inWorkspace("devices", workspaceId));
+/** No cursor: the bootstrap cursor (§12.3). */
+export const syncChanges = (c: Client, workspaceId: string, cursor?: string) =>
+  c.get(inWorkspace("sync/changes", workspaceId, cursor ? { cursor } : {}));
+
 /** `failed` / `cancelled` exit 5. `recovery_required` is not terminal here: it needs a human (§10). */
 export const terminalJobStates = ["succeeded", "failed", "cancelled"];
 
