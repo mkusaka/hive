@@ -9,7 +9,7 @@
     {
       "binding": "DB",
       "database_name": "hive",
-      // PLACEHOLDER: replace with the real id once the owner provisions D1 (`bunx wrangler d1 create hive`).
+      // PLACEHOLDER: replace with terraform output `d1_database_id` (infra/README.md).
       "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "../../packages/db/migrations",
     },

@@ -41,6 +41,7 @@ These are never conflated.
 - [docs/adr.md](docs/adr.md): architecture decision records.
 - [docs/roadmap.md](docs/roadmap.md): current status, defaults, verification gates, acceptance tests and phases.
 - [docs/references.md](docs/references.md): primary sources.
+- [infra/README.md](infra/README.md): Terraform for D1, R2 and Access, and how its outputs reach Wrangler.
 
 ## Development
 

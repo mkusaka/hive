@@ -153,3 +153,7 @@ vite.config.ts.timestamp-*
 .dev.vars*
 worktrees
 .dev-keys.json
+infra/.terraform/
+infra/*.tfstate*
+infra/*.tfvars
+!infra/example.tfvars

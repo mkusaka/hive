@@ -503,8 +503,8 @@ D1 FTS5 search projection and explicit Memory (docs/architecture.md §13.5, §13
 ## Transcripts
 
 Raw provider transcripts in R2 with a D1 manifest (docs/architecture.md §3.3, §9.1, §13.2; UPLOAD-01;
-`src/transcripts.ts`). Binding `R2`, bucket `hive-objects` (placeholder in `wrangler.jsonc`: create it with
-`bunx wrangler r2 bucket create hive-objects`; `wrangler dev` uses a local bucket).
+`src/transcripts.ts`). Binding `R2`, bucket `hive` (created by Terraform in
+`infra/`; `wrangler dev` uses a local bucket).
 
 - **Auth and fencing.** The upload routes take the device token, or a Run capability (`Bearer cap.`) while the Run is
   active. The executor uses the device token, because the capability is revoked when the result is submitted. A
