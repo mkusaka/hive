@@ -72,6 +72,9 @@ export type RunnerDeps = {
   heartbeat?: ExecutorHeartbeat;
 };
 
+/** Agents this process is running, so a SIGTERM (service stop, process-tree stop) can stop them first. */
+const running = new Set<RunningAgent>();
+
 const isStale = (error: unknown) =>
   error instanceof CloudError && error.code === "STALE_GENERATION";
 
@@ -113,6 +116,7 @@ const execute = async (
   };
   await journal.append({ kind: "intent", runId: ctx.runId });
   const agent = await deps.adapter.start(ctx);
+  running.add(agent);
 
   let stale = false;
   let cancelled = false;
@@ -132,7 +136,15 @@ const execute = async (
       },
     );
   }, renewEveryMs);
-  const exit = await agent.waitForExit().finally(() => clearInterval(timer));
+  const exit = await agent.waitForExit().finally(() => {
+    clearInterval(timer);
+    running.delete(agent);
+  });
+  // Stopped by a service stop (runLoop SIGTERM): no result, so the restarted executor's reconcile resumes the Run.
+  if (exit.reason === "sigterm" && !stale && !cancelled) {
+    console.error(`run ${ctx.runId} left active for reconcile`);
+    return { runId: ctx.runId, jobId: ctx.jobId, state: "left_active" };
+  }
 
   const outcome =
     exit.code !== 0 || cancelled ? "failed" : exit.waitingFor ? "waiting" : "succeeded";
@@ -246,6 +258,10 @@ export const runOnce = async (deps: RunnerDeps) => {
 /**
  * Reconcile, then poll. `once` handles at most one queued Job and returns. Otherwise `concurrency` (default 1) worker
  * loops poll side by side, so up to that many Runs execute at once; claim races between them end in a 409.
+ * On SIGTERM the loop stops polling, stops its running agents and exits once the workers finished, or after 10 s (below
+ * launchd's 20 s exit timeout). A stopped Run gets no result and stays active: after the restart, reconcile renews its
+ * lease and runs it again (or, if the lease expired, confirms it stopped). A Job claimed during shutdown also falls to
+ * reconcile.
  */
 export const runLoop = async (
   deps: RunnerDeps,
@@ -253,14 +269,32 @@ export const runLoop = async (
 ) => {
   await reconcile(deps);
   if (options.once) return runOnce(deps);
+  let stopping = false;
+  let wake!: () => void;
+  const woken = new Promise<void>((resolve) => (wake = resolve));
   const worker = async () => {
     for (;;) {
+      if (stopping) return;
       const ran = await runOnce(deps).catch((error: unknown) => {
         console.error("poll failed", error);
         return null;
       });
-      if (!ran) await new Promise((resolve) => setTimeout(resolve, options.pollMs));
+      // Once stopping, `woken` is resolved, so this returns at once.
+      if (!ran)
+        await Promise.race([woken, new Promise((resolve) => setTimeout(resolve, options.pollMs))]);
     }
   };
-  await Promise.all(Array.from({ length: options.concurrency ?? 1 }, worker));
+  const workers = Promise.all(Array.from({ length: options.concurrency ?? 1 }, worker));
+  const onTerm = () => {
+    stopping = true;
+    wake();
+    for (const agent of running) agent.requestStop("sigterm").catch(() => undefined);
+    const deadline = setTimeout(() => process.exit(0), 10_000);
+    void workers.finally(() => {
+      clearTimeout(deadline);
+      process.exit(0);
+    });
+  };
+  process.once("SIGTERM", onTerm);
+  await workers.finally(() => process.off("SIGTERM", onTerm));
 };
