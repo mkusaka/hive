@@ -100,7 +100,7 @@ describe("claimJob", () => {
     expect(await job(s.job)).toEqual({ state: "active", revision: 2 });
     const run = await db.prepare("SELECT * FROM runs WHERE id = ?").bind(result.runId).first();
     expect(run).toMatchObject({
-      kind: "root",
+      kind: "job",
       state: "starting",
       execution_generation: 1,
       device_id: s.device,

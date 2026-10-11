@@ -7,6 +7,7 @@ import type {
   ExecutorCommand,
   ExecutorHeartbeat,
   ExecutorRun,
+  ExternalRunInput,
   JobClaimed,
   LeaseRenewed,
   QueuedJob,
@@ -69,6 +70,8 @@ export type CloudClient = {
     executionGeneration: number;
   }): Promise<RunContext>;
   observe(input: RunObservation): Promise<void>;
+  /** Creates or updates a Run observed from an external CLI session. */
+  externalRun(input: ExternalRunInput): Promise<{ runId: string; state: "active" | "finished" }>;
   /** Transcript upload (§3.3) with the device token: also after the Run's capability was revoked. */
   uploadInit(input: UploadInit): Promise<UploadInitialized>;
   uploadPart(uploadId: string, bytes: Uint8Array): Promise<void>;
@@ -183,6 +186,7 @@ export const createCloudClient = ({
     observe: async (input) => {
       await request("POST", "/v1/executor/observations", input);
     },
+    externalRun: (input) => request("POST", "/v1/executor/external-runs", input),
     uploadInit: (input) => request("POST", "/v1/executor/uploads/init", input),
     uploadPart: async (uploadId, bytes) => {
       await request("PUT", `/v1/executor/uploads/${encodeURIComponent(uploadId)}`, bytes);

@@ -34,7 +34,7 @@ hive approval resolve <approval-id> (--allow | --deny) [--reason <text>]
 hive approval watch [--timeout <s>]                # prints each new pending approval once, polls every 2 s
 hive effect list [--state <state>] [--run <run-id>]  # external effects, newest first
 hive effect resolve <effect-id> (--succeeded <external-id> [--url <url>] | --failed | --retry)
-hive search <query> [--kinds message,task,memory]   # GET /v1/search; 1-2 characters take the bounded short path
+hive search <query> [--kinds message,task,memory,run]   # GET /v1/search; 1-2 characters take the bounded short path
 hive memory write --scope <workspace|channel:<id>|project:<id>|bot:<id>|task:<id>> (--content <text> | --file <path|->)
 hive memory list --scope <...>                         # live memories of the scope, newest first
 hive memory delete <memory-id> [--revision <n>]        # tombstone; a live memory is at revision 1
@@ -44,6 +44,8 @@ hive thread list                                      # threads you started or r
 hive event emit <type> [--data-file <path|->] [--subject <kind:id>]
 hive op get <operation-id>
 hive run get <run-id>                                  # state, persistence (pending|complete), transcript parts, git
+hive run list [--kind job|external]                    # external sessions are owner-visible workspace Runs
+hive run link-task <run-id> <task-id>                  # attaches an external Run to a Task
 hive run transcript <run-id> [--raw]                   # normalized, redacted entries; --raw: owner-only JSONL
 hive job get <job-id>
 hive job watch <job-id> [--timeout <s>]                # polls GET /v1/jobs/:id every 2 s
@@ -52,6 +54,8 @@ hive channel list | hive bot list | hive device list   # bootstrap lists of the 
 hive channel messages <channel-id>                     # newest-first messages of a member channel
 hive bot conversations                                 # private bot-to-bot conversations and their messages
 hive sync changes [--cursor <cursor>]                  # without --cursor: the bootstrap cursor
+hive collect enable | hive collect disable | hive collect status
+hive collect run [--since <duration>] [--dry-run]      # imports local Claude/Codex session deltas; manual runs work while disabled
 hive executor run [--once] [--provider fake|claude|codex] [--concurrency N]  # Local Executor (default fake, 1)
 hive project create --key <KEY> --name <name>
 hive task create (--project <KEY> | --parent <task>) --title <title> [--priority <n>]
@@ -126,6 +130,13 @@ a fresh UUID per invocation).
   `apps/executor/README.md`). `FAKE_DELAY_MS` / `FAKE_FAIL=1` tune the fake provider. Before each poll it calls
   `POST /v1/executor/pump`, because no Queue consumer exists yet and `wrangler dev` fires no cron. After each Run
   (and at start for earlier ones) it uploads the Run's transcript; see `apps/executor/README.md`, Transcript upload.
+- **External session collection.** Collection is off by default. `collect enable` writes only
+  `<config dir>/hive/config.json` (`collect.enabled`); an enabled executor collects at startup and every ten
+  minutes. `collect run` is manual and works regardless of that setting. It reads Claude JSONL under
+  `$CLAUDE_CONFIG_DIR/projects` (or `~/.claude/projects`) and Codex JSONL under `~/.codex/sessions`, never modifies
+  them, and persists offsets in `<config dir>/hive/executor/collector.json`. Only user/assistant text and tool
+  names/inputs/results needed by the Run Inspector are sent; environment, configuration and reasoning data are
+  omitted, and credential-shaped values are redacted before upload. `--dry-run` performs no writes or network calls.
 - **`run transcript`** pages `GET /v1/runs/:id/transcript` until the last confirmed part and prints
   `<seq> <kind>[(<tool>)]: <text>` per entry (`--format json`: `{entries}`). It needs membership of the Run's
   channel or Workspace ownership (404 otherwise). `--raw` prints `GET /v1/transcripts/:id/raw` as-is (owner only).

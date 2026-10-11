@@ -34,6 +34,8 @@ export const App = () => {
   const [replies, setReplies] = useState<Row[]>([]);
   const [bots, setBots] = useState<Row[]>([]);
   const [inbox, setInbox] = useState<Row[]>([]);
+  const [externalRuns, setExternalRuns] = useState<Row[]>([]);
+  const [sessionKind, setSessionKind] = useState<"jobs" | "external">("jobs");
   const [jobs, setJobs] = useState<Row[]>([]);
   const [devices, setDevices] = useState<Row[]>([]);
   const [approvals, setApprovals] = useState<Row[]>([]);
@@ -109,8 +111,8 @@ export const App = () => {
 
   // Refetches run from sync callbacks, so they read the current selection through refs.
   const threadId = thread?.conversationId ?? null;
-  const selection = useRef({ channelId, dmId, botId, runId, threadId });
-  selection.current = { channelId, dmId, botId, runId, threadId };
+  const selection = useRef({ channelId, dmId, botId, runId, threadId, sessionKind });
+  selection.current = { channelId, dmId, botId, runId, threadId, sessionKind };
 
   const refetch = useCallback(async (keys: Set<ListKey>, ws: string) => {
     const {
@@ -119,6 +121,7 @@ export const App = () => {
       botId: bot,
       runId: inspected,
       threadId: th,
+      sessionKind: sessions,
     } = selection.current;
     const tasks: Promise<void>[] = [];
     if (keys.has("run") && inspected) tasks.push(inspect(inspected).then(setRun));
@@ -130,6 +133,8 @@ export const App = () => {
     load("bots", inWorkspace("bots", ws), "bots", setBots);
     load("devices", inWorkspace("devices", ws), "devices", setDevices);
     load("jobs", inWorkspace("jobs", ws, { limit: "50" }), "jobs", setJobs);
+    if (sessions === "external")
+      load("jobs", inWorkspace("runs", ws, { kind: "external" }), "runs", setExternalRuns);
     load(
       "approvals",
       inWorkspace("approvals", ws, { state: "pending" }),
@@ -290,6 +295,13 @@ export const App = () => {
     setRun(null);
     if (isLive(config) && runId) void refetch(new Set(["run"]), config.workspaceId);
   }, [config, runId, refetch]);
+  useEffect(() => {
+    if (sessionKind === "external" && isLive(config))
+      void get(inWorkspace("runs", config.workspaceId, { kind: "external" })).then(
+        (body) => setExternalRuns(body.runs as Row[]),
+        (e) => setError(String(e)),
+      );
+  }, [config, sessionKind]);
   useEffect(() => {
     if (!channelId && channels[0]) setChannelId(channels[0].id);
     if (!botId && bots[0]) setBotId(bots[0].id);
@@ -456,59 +468,115 @@ export const App = () => {
         {view === "activity" && (
           <section className="view split">
             <div>
-              <h2>Jobs</h2>
-              <ul className="list">
-                {jobs.map((j) => (
-                  <li key={j.id}>
-                    <button
-                      onClick={() =>
-                        void get(`/v1/jobs/${encodeURIComponent(j.id)}`)
-                          // A Task's Job also shows the Task's git rollup (GIT-01).
-                          .then(async (job) =>
-                            job.taskId
-                              ? {
-                                  ...job,
-                                  task: await get(
-                                    `/v1/tasks/${encodeURIComponent(String(job.taskId))}`,
-                                  ),
-                                }
-                              : job,
-                          )
-                          .then(setJobDetail, (e) => setError(String(e)))
-                      }
-                    >
-                      <Badge state={j.state} /> <span className="mono">{j.id}</span>
-                      {j.cancelRequestedAt ? " (cancel requested)" : ""}
-                    </button>
-                    {["queued", "waiting_device", "active"].includes(String(j.state)) &&
-                      !j.cancelRequestedAt && (
-                        <button onClick={() => void cancelJob(ws, j.id)}>Cancel</button>
-                      )}
-                  </li>
-                ))}
-              </ul>
-            </div>
-            <div>
-              {jobDetail?.task ? (
-                <TaskGit task={jobDetail.task as Record<string, unknown>} />
-              ) : null}
-              <pre>{jobDetail ? JSON.stringify(jobDetail, null, 2) : "Select a Job"}</pre>
-              {Array.isArray(jobDetail?.runs) && (
+              <h2>Activity</h2>
+              <div role="group" aria-label="Sessions">
+                <button
+                  className={sessionKind === "jobs" ? "active" : ""}
+                  onClick={() => {
+                    setSessionKind("jobs");
+                    setRunId("");
+                  }}
+                >
+                  Jobs
+                </button>
+                <button
+                  className={sessionKind === "external" ? "active" : ""}
+                  onClick={() => {
+                    setSessionKind("external");
+                    setJobDetail(null);
+                    setRunId("");
+                  }}
+                >
+                  External
+                </button>
+              </div>
+              {sessionKind === "jobs" ? (
                 <ul className="list">
-                  {(jobDetail.runs as Row[]).map((r) => (
+                  {jobs.map((j) => (
+                    <li key={j.id}>
+                      <button
+                        onClick={() =>
+                          void get(`/v1/jobs/${encodeURIComponent(j.id)}`)
+                            // A Task's Job also shows the Task's git rollup (GIT-01).
+                            .then(async (job) =>
+                              job.taskId
+                                ? {
+                                    ...job,
+                                    task: await get(
+                                      `/v1/tasks/${encodeURIComponent(String(job.taskId))}`,
+                                    ),
+                                  }
+                                : job,
+                            )
+                            .then(setJobDetail, (e) => setError(String(e)))
+                        }
+                      >
+                        <Badge state={j.state} /> <span className="mono">{j.id}</span>
+                        {j.cancelRequestedAt ? " (cancel requested)" : ""}
+                      </button>
+                      {["queued", "waiting_device", "active"].includes(String(j.state)) &&
+                        !j.cancelRequestedAt && (
+                          <button onClick={() => void cancelJob(ws, j.id)}>Cancel</button>
+                        )}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <ul className="list">
+                  {externalRuns.map((r) => (
                     <li key={r.id}>
                       <button
                         className={r.id === runId ? "active" : ""}
-                        onClick={() => setRunId(r.id)}
+                        onClick={() => {
+                          setJobDetail(null);
+                          setRunId(r.id);
+                        }}
                       >
-                        Run {text(r.generation)} <Badge state={r.state} />{" "}
-                        <span className="mono">{r.id}</span>
+                        <Badge state={r.state} /> {text(r.provider)}{" "}
+                        <span className="mono" title={text(r.cwd)}>
+                          {text(r.cwdLabel ?? r.cwd)
+                            .split(/[\\/]/)
+                            .findLast(Boolean) || text(r.cwd)}
+                        </span>{" "}
+                        {text(r.repository)} {text(r.title)} started {text(r.startedAt)} · last
+                        activity {text(r.lastActivityAt)}
                       </button>
                     </li>
                   ))}
                 </ul>
               )}
-              {run && <RunInspector run={run} />}
+            </div>
+            <div>
+              {jobDetail?.task ? (
+                <TaskGit task={jobDetail.task as Record<string, unknown>} openRun={setRunId} />
+              ) : null}
+              {sessionKind === "jobs" && (
+                <>
+                  <pre>{jobDetail ? JSON.stringify(jobDetail, null, 2) : "Select a Job"}</pre>
+                  {Array.isArray(jobDetail?.runs) && (
+                    <ul className="list">
+                      {(jobDetail.runs as Row[]).map((r) => (
+                        <li key={r.id}>
+                          <button
+                            className={r.id === runId ? "active" : ""}
+                            onClick={() => setRunId(r.id)}
+                          >
+                            Run {text(r.generation)} <Badge state={r.state} />{" "}
+                            <span className="mono">{r.id}</span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </>
+              )}
+              {run && (
+                <RunInspector
+                  key={String(run.detail.id)}
+                  run={run}
+                  reload={() => void refetch(new Set(["run"]), ws)}
+                />
+              )}
             </div>
           </section>
         )}
@@ -675,8 +743,15 @@ const RunGit = ({ git }: { git: GitDetail }) => (
 );
 
 /** A Task's git rollup over its Runs (GIT-01). */
-const TaskGit = ({ task }: { task: Record<string, unknown> }) => {
+const TaskGit = ({
+  task,
+  openRun,
+}: {
+  task: Record<string, unknown>;
+  openRun: (id: string) => void;
+}) => {
   const git = task.git as { commits: number; prs: Pr[]; repositories: string[] };
+  const externalSessions = (task.externalSessions as Row[] | undefined) ?? [];
   return (
     <section>
       <h4>
@@ -684,14 +759,57 @@ const TaskGit = ({ task }: { task: Record<string, unknown> }) => {
         <span className="mono">{git.repositories.join(", ") || "—"}</span>
       </h4>
       <PrList prs={git.prs} />
+      {externalSessions.length > 0 && (
+        <>
+          <h4>External sessions</h4>
+          <ul className="list">
+            {externalSessions.map((session) => (
+              <li key={session.id}>
+                <button onClick={() => openRun(session.id)}>
+                  {text(session.provider)}{" "}
+                  <span className="mono" title={text(session.cwd)}>
+                    {text(session.cwdLabel ?? session.cwd)
+                      .split(/[\\/]/)
+                      .findLast(Boolean) || text(session.cwd)}
+                  </span>{" "}
+                  {text(session.title)}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
     </section>
   );
 };
 
 /** Run Inspector (§21): state, transcript persistence, provider session presence and the normalized transcript. */
-const RunInspector = ({ run }: { run: Inspected }) => {
+const RunInspector = ({ run, reload }: { run: Inspected; reload: () => void }) => {
   const d = run.detail;
   const transcript = d.transcript as { parts: number; confirmedThroughSeq: number | null };
+  const [tasks, setTasks] = useState<Row[]>([]);
+  const [taskId, setTaskId] = useState(String(d.taskId ?? ""));
+  const [linkError, setLinkError] = useState<string | null>(null);
+  useEffect(() => {
+    if (d.kind === "external")
+      void get(inWorkspace("tasks", String(d.workspaceId))).then(
+        (body) => setTasks(body.tasks as Row[]),
+        (error) => setLinkError(String(error)),
+      );
+  }, [d.kind, d.workspaceId]);
+  const linkTask = async () => {
+    if (!taskId) return;
+    const result = await window.hive.api.command({
+      operationId: crypto.randomUUID(),
+      idempotencyKey: crypto.randomUUID(),
+      workspaceId: String(d.workspaceId),
+      command: { type: "run.link_task", runId: String(d.id), taskId },
+    });
+    if (result.ok) {
+      setLinkError(null);
+      reload();
+    } else setLinkError(failure(result));
+  };
   return (
     <section className="inspector">
       <h3>
@@ -704,6 +822,24 @@ const RunInspector = ({ run }: { run: Inspected }) => {
         {d.hasProviderSession ? "yes" : "no"} · parts {transcript.parts} (confirmed through{" "}
         {text(transcript.confirmedThroughSeq)})
       </p>
+      {d.kind === "external" && (
+        <section>
+          <h4>Link to Task</h4>
+          {d.taskId ? <p>Linked Task {text(d.taskKey ?? d.taskId)}</p> : null}
+          <select aria-label="Task" value={taskId} onChange={(e) => setTaskId(e.target.value)}>
+            <option value="">Choose a Task</option>
+            {tasks.map((task) => (
+              <option key={task.id} value={task.id}>
+                {text(task.key)}: {text(task.title)}
+              </option>
+            ))}
+          </select>
+          <button disabled={!taskId} onClick={() => void linkTask()}>
+            Link to Task
+          </button>
+          {linkError ? <p className="error">{linkError}</p> : null}
+        </section>
+      )}
       {d.resultError ? <p className="error">{text(d.resultError)}</p> : null}
       {d.resultSummary ? <p>{text(d.resultSummary)}</p> : null}
       {run.effects.length > 0 && (

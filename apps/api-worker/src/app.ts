@@ -1,5 +1,6 @@
 import {
   ExecutorHeartbeat,
+  ExternalRunInput,
   maxTranscriptPartBytes,
   parse,
   RunObservation,
@@ -26,6 +27,7 @@ import {
   listQueuedJobs,
   recordObservation,
   runExecutorCommand,
+  upsertExternalRun,
 } from "./executor.ts";
 import { createPerformers, getRunEffect, listEffects } from "./effects.ts";
 import { pump } from "./pump.ts";
@@ -46,6 +48,7 @@ import {
   listMessages,
   listProjects,
   listChannelMembers,
+  listRuns,
   listRoutines,
   listSubscriptions,
   listThreads,
@@ -241,6 +244,17 @@ export const createApp = ({
     const parsed = parse(ExecutorHeartbeat, await c.req.json().catch(() => ({})));
     if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
     return c.json(await heartbeat(c.env.DB, device(c), parsed.value));
+  });
+
+  app.post("/v1/executor/external-runs", async (c) => {
+    const parsed = parse(ExternalRunInput, await c.req.json().catch(() => null));
+    if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
+    const result = await upsertExternalRun(c.env.DB, device(c), parsed.value);
+    hint(c, {
+      workspaceId: device(c).workspaceIds[0]!,
+      scopes: [`workspace:${device(c).workspaceIds[0]!}`],
+    });
+    return c.json(result);
   });
   app.get("/v1/executor/jobs", async (c) => {
     if (c.req.query("state") !== "queued")
@@ -473,6 +487,21 @@ export const createApp = ({
     ),
   );
 
+  app.get("/v1/runs", async (c) => {
+    const kind = c.req.query("kind");
+    if (kind !== undefined && kind !== "job" && kind !== "native_child" && kind !== "external") {
+      throw new HttpError("INVALID_INPUT", "kind must be job, native_child, or external");
+    }
+    return c.json(
+      await listRuns(
+        c.env.DB,
+        user(c),
+        workspaceParam(c),
+        kind as "job" | "native_child" | "external" | undefined,
+      ),
+    );
+  });
+
   app.get("/v1/projects", async (c) => c.json(await listProjects(c.env.DB, workspaceParam(c))));
   app.get("/v1/tasks", async (c) =>
     c.json(
@@ -483,7 +512,7 @@ export const createApp = ({
     ),
   );
   app.get("/v1/tasks/:id", async (c) =>
-    c.json(await getTask(c.env.DB, user(c).workspaceIds, c.req.param("id"))),
+    c.json(await getTask(c.env.DB, user(c).workspaceIds, c.req.param("id"), user(c).userId)),
   );
 
   app.get("/v1/approvals", async (c) =>

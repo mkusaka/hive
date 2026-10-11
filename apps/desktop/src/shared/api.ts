@@ -17,6 +17,7 @@ import type {
   RoutineRun,
   RoutineUpdate,
   SidebarUpdate,
+  RunLinkTask,
   WorkspaceCreate,
 } from "@hive/contracts";
 import type * as v from "valibot";
@@ -26,7 +27,7 @@ export type ApiResult =
   | { ok: true; value: Record<string, unknown> }
   | { ok: false; error: { code: string; message: string; body?: unknown } };
 
-/** The commands the UI sends today: message.post, agent.send, job.cancel, approval.resolve, memory.write, channel.update / join / leave, dm.open, the routine commands, sidebar.update and workspace.create (Welcome). */
+/** The commands the UI sends today: messaging, Job cancellation, approval, memory, Channel, DM, routine, sidebar, external Run task linking and workspace creation (Welcome). */
 export type UiCommand = v.InferInput<
   ReturnType<
     typeof commandEnvelope<
@@ -48,6 +49,7 @@ export type UiCommand = v.InferInput<
           typeof RoutinePause,
           typeof RoutineResume,
           typeof RoutineRun,
+          typeof RunLinkTask,
           typeof SidebarUpdate,
           typeof WorkspaceCreate,
         ],

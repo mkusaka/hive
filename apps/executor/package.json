@@ -15,7 +15,8 @@
     "./environments": "./src/environments.ts",
     "./gitCollector": "./src/gitCollector.ts",
     "./capabilities": "./src/capabilities.ts",
-    "./retention": "./src/retention.ts"
+    "./retention": "./src/retention.ts",
+    "./collector": "./src/collector.ts"
   },
   "scripts": {
     "start": "bun run src/main.ts"

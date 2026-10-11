@@ -44,6 +44,7 @@ import {
   RunAgentSend,
   type RunAgentSendAccepted,
   RunCommand,
+  RunLinkTask,
   SidebarUpdate,
   SubscriptionCreate,
   SubscriptionDelete,
@@ -112,6 +113,7 @@ export const CommandEnvelope = commandEnvelope(
     JobStart,
     JobCancel,
     JobResolve,
+    RunLinkTask,
     SubscriptionCreate,
     SubscriptionUpdate,
     SubscriptionPause,
@@ -2046,7 +2048,7 @@ const jobResolve: Handler<v.InferOutput<typeof JobResolve>> = async (db, user, e
   const job = await loadJob(db, workspaceId, command.jobId);
   if (job.state !== "recovery_required") throw jobChanged(job.state);
   const unconfirmed = `EXISTS (SELECT 1 FROM runs WHERE workspace_id = jobs.workspace_id AND job_id = jobs.id
-    AND kind = 'root' AND state NOT IN ${terminalRunStates})`;
+    AND kind = 'job' AND state NOT IN ${terminalRunStates})`;
   if (command.action === "retry") {
     const busy = await db
       .prepare(`SELECT ${unconfirmed} AS busy FROM jobs WHERE workspace_id = ? AND id = ?`)
@@ -2102,6 +2104,49 @@ const jobResolve: Handler<v.InferOutput<typeof JobResolve>> = async (db, user, e
         )
       : jobChanged(current.state);
   });
+};
+
+/** Links an external session only when the user owns its device or owns the Workspace. */
+const runLinkTask: Handler<v.InferOutput<typeof RunLinkTask>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const [task, run] = await Promise.all([
+    db
+      .prepare("SELECT 1 FROM tasks WHERE workspace_id = ? AND id = ?")
+      .bind(workspaceId, command.taskId)
+      .first(),
+    db
+      .prepare(
+        `SELECT r.id FROM runs r JOIN devices d ON d.workspace_id = r.workspace_id AND d.id = r.device_id
+          WHERE r.workspace_id = ? AND r.id = ? AND r.kind = 'external'
+            AND (d.owner_user_id = ? OR EXISTS (
+              SELECT 1 FROM workspace_members m
+               WHERE m.workspace_id = r.workspace_id AND m.user_id = ? AND m.role = 'owner'))`,
+      )
+      .bind(workspaceId, command.runId, user.userId, user.userId)
+      .first(),
+  ]);
+  if (!task) throw new HttpError("NOT_FOUND", "task not found");
+  if (!run) throw new HttpError("NOT_FOUND", "external run not found");
+  return receipt(
+    db,
+    user.userId,
+    env,
+    [
+      db
+        .prepare("UPDATE runs SET task_id = ?, updated_at = ? WHERE workspace_id = ? AND id = ?")
+        .bind(command.taskId, new Date().toISOString(), workspaceId, command.runId),
+    ],
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      runId: command.runId,
+      taskId: command.taskId,
+    },
+    [
+      { entityKind: "run", entityId: command.runId, scope: `workspace:${workspaceId}` },
+      { entityKind: "task", entityId: command.taskId, scope: `workspace:${workspaceId}` },
+    ],
+  );
 };
 
 // ------------------------------------------------ Routines (docs/architecture.md §17.2)
@@ -2798,6 +2843,7 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "integration.create": integrationCreate,
   "job.cancel": jobCancel,
   "job.resolve": jobResolve,
+  "run.link_task": runLinkTask,
   "routine.create": routineCreate,
   "routine.update": routineUpdate,
   "routine.pause": routinePause,

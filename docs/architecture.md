@@ -780,6 +780,14 @@ Provider-native data is never modified for search; redaction goes into a separat
 contain secrets, so it is encrypted, ACL-restricted and retention-limited. Provider auth directories and OAuth
 credentials are never uploaded with transcripts.
 
+Implemented as (COLLECT-01): the opt-in external CLI collector reads Claude Code project JSONL and Codex session
+JSONL without changing the source files. It uploads only normalized user / assistant text and tool summaries,
+redacts token / secret / key assignments, and omits environment dumps, provider configuration and private reasoning.
+External Runs have no Job or Execution. They retain provider, device, cwd, repository, title and activity timestamps;
+30 minutes of inactivity marks them finished. `collector.json` records acknowledged byte offsets and append-only
+transcript part sequences, so another pass or a growing file does not duplicate history. Task association is explicit
+through `run.link_task`, never inferred from cwd or repository.
+
 ### 13.3 Claude SessionStore adapter (§16.3)
 
 The official SessionStore exposes `append / load` and must preserve order and equality of stored data. Mirroring
@@ -859,6 +867,10 @@ FTS5 lives in D1. Local FTS is only an optional offline cache. PC1 and PC2 query
   important ToolResults.
 - Never index raw transcript JSON, credentials or unlimited Bash stdout. The index is a deletable, rebuildable
   projection.
+
+Implemented as (COLLECT-01): external Run titles and their first user message have a rebuildable search projection.
+External session metadata, transcripts and search hits retain the importing device owner's / workspace owner's
+access boundary. Linking a Run to a Task does not grant other members access to its private transcript.
 
 ```sql
 -- Example. Maps to the integer rowid of search_documents.
@@ -1181,9 +1193,12 @@ child IDs from observations is the adapter's job; an LLM claiming an execution i
 - Task rollups show Run time, tool count, usage, commits, PRs, failures, artifacts. Tokens of a Run touching several
   Tasks are never charged in full to each without basis; unallocatable usage stays unattributed.
 
-Implemented as (GIT-01): commits and PRs only, for executor-launched Runs in an environment checkout. The executor's
-`git.collected` observation is stored per Run in `run_git` and rolled up on `GET /v1/tasks/:id`; the external CLI hooks
-path, usage / failure / artifact rollups and token attribution are not built.
+Implemented as (GIT-01): commits and PRs are collected for executor-launched Runs in an environment checkout.
+`git.collected` is stored per Run in `run_git` and rolled up on `GET /v1/tasks/:id`.
+Implemented as (COLLECT-01): external CLI history is collected from read-only session files rather than provider
+hooks. `hive collect run` is a manual pass; `hive collect enable` opts the executor into a pass every 10 minutes,
+disabled by default. Activity's Sessions filter separates Jobs from External Runs, and the Run Inspector can link an
+external session to a Task. Usage / failure / artifact rollups and token attribution remain unimplemented.
 
 ## 21. UI views (§24)
 

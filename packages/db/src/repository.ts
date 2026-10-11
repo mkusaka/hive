@@ -118,12 +118,12 @@ export type ClaimFailure =
   | { ok: false; reason: "already_claimed"; jobState: string };
 export type ClaimResult = ({ ok: true; replayed: boolean } & Claim) | ClaimFailure;
 
-/** The device's active root Runs (`runs.device_id`); its background capacity is `devices.capacity_background`. */
+/** The device's active managed Job Runs (`runs.device_id`); external sessions never consume capacity. */
 const activeRootRunsSql = `SELECT COUNT(*) FROM runs
-  WHERE workspace_id = ? AND device_id = ? AND kind = 'root' AND state IN ${activeRunStates}`;
+  WHERE workspace_id = ? AND device_id = ? AND kind = 'job' AND state IN ${activeRunStates}`;
 
 /**
- * job.claim (§9.2 step 4): Job CAS, root Run, Execution, reservations, change rows and receipt in one batch. The
+ * job.claim (§9.2 step 4): Job CAS, Job Run, Execution, reservations, change rows and receipt in one batch. The
  * device's background capacity is checked inside the batch (after the new Run), so concurrent claims cannot exceed it.
  */
 export const claimJob = async (db: D1Database, input: ClaimInput): Promise<ClaimResult> => {
@@ -170,7 +170,7 @@ export const claimJob = async (db: D1Database, input: ClaimInput): Promise<Claim
         db
           .prepare(
             `INSERT INTO runs (id, workspace_id, job_id, kind, device_id, execution_generation, state, lease_expires_at)
-             VALUES (?, ?, ?, 'root', ?, ?, 'starting', ?)`,
+             VALUES (?, ?, ?, 'job', ?, ?, 'starting', ?)`,
           )
           .bind(claim.runId, workspaceId, jobId, deviceId, claim.generation, claim.leaseExpiresAt),
         db

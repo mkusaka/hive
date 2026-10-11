@@ -1,7 +1,12 @@
+import { readFile } from "node:fs/promises";
 import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vitest/config";
 
 const migrations = new URL("../../packages/db/migrations", import.meta.url).pathname;
+const collectMigration = await readFile(
+  new URL("../../packages/db/migrations/0027_collect_external_runs.sql", import.meta.url).pathname,
+  "utf8",
+);
 
 export default defineConfig({
   plugins: [
@@ -14,6 +19,7 @@ export default defineConfig({
         durableObjects: { REALTIME: { className: "Realtime", useSQLite: true } },
         bindings: {
           TEST_MIGRATIONS: await readD1Migrations(migrations),
+          COLLECT_MIGRATION: collectMigration,
           ACCESS_TEAM_DOMAIN: "test.cloudflareaccess.com",
           ACCESS_AUD: "test-aud",
         },

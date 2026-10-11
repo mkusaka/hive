@@ -1,12 +1,14 @@
 // hive Local Executor (Phase 1): `bun run apps/executor/src/main.ts --api-url ... --token-file ...
 // --state-dir ... [--once] [--concurrency N] --provider fake|claude|codex`.
 import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { claudeAdapter } from "./adapters/claude.ts";
 import { codexAdapter } from "./adapters/codex.ts";
 import { fakeAdapter } from "./adapters/fake.ts";
 import { executorHeartbeat, parseConcurrency } from "./capabilities.ts";
 import { createCloudClient } from "./cloudClient.ts";
+import { collectExternalRuns } from "./collector.ts";
 import { withGitCollector } from "./gitCollector.ts";
 import { fileJournal, transcriptReader } from "./journal.ts";
 import { runLoop } from "./runner.ts";
@@ -62,6 +64,15 @@ const result = await runLoop(
       sessions: sessionJournals(stateDir),
       provider: values.provider,
     }),
+    collect: async () => {
+      const enabled = await readFile(join(dirname(stateDir), "config.json"), "utf8")
+        .then(
+          (data) =>
+            (JSON.parse(data) as { collect?: { enabled?: unknown } }).collect?.enabled === true,
+        )
+        .catch(() => false);
+      if (enabled) await collectExternalRuns(cloud, { stateDir });
+    },
     adapter: withGitCollector(
       values.provider === "claude"
         ? claudeAdapter({ stateDir, sessionStore: sessionStore({ stateDir, cloud }) })
