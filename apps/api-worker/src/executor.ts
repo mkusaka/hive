@@ -29,6 +29,7 @@ import { hashSecret, newDeviceSecret } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
 import { capabilityExpiresAt, insertCapability } from "./auth/run.ts";
 import { HttpError } from "./errors.ts";
+import { indexLater, relatedQuery, searchDocuments } from "./search.ts";
 
 export const ExecutorEnvelope = commandEnvelope(ExecutorCommand);
 type Envelope = v.InferOutput<typeof ExecutorEnvelope>;
@@ -42,6 +43,7 @@ type Handler<T extends Command> = (
 
 /** docs/roadmap.md §1 defaults. */
 export const leaseSeconds = 90;
+const memoryContextBytes = 8 * 1024;
 const activeRunStates = new Set(["starting", "running", "waiting_approval", "stopping"]);
 const activeRunStatesSql = `(${[...activeRunStates].map((s) => `'${s}'`).join(", ")})`;
 
@@ -100,7 +102,14 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
   // The Run capability (§18.2) is committed with the claim. Task writes need a Task Job.
   const secret = newDeviceSecret();
   const tokenHash = await hashSecret(secret);
-  const scopes = ["agent.send", "agent.reply", "task.read", ...(row.task_id ? ["task.write"] : [])];
+  const scopes = [
+    "agent.send",
+    "agent.reply",
+    "task.read",
+    "memory.write",
+    "search.read",
+    ...(row.task_id ? ["task.write"] : []),
+  ];
   // Job state is not checked here: the claim CAS decides, and a replay must reach the stored receipt.
   const result = await claimJob(db, {
     workspaceId,
@@ -358,6 +367,7 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
             entityId: messageId,
             scope: itemScope,
           }),
+          indexLater(db, workspaceId, "message", messageId),
         ]
       : [];
   const result = await finishRun(db, {
@@ -474,7 +484,7 @@ export const getRunContext = async (
   input: { jobId: string; runId: string; executionGeneration: number },
 ): Promise<RunContext> => {
   await fencedRun(db, device, input);
-  const workspaceId = device.workspaceIds[0];
+  const workspaceId = device.workspaceIds[0]!;
   const row = await db
     .prepare(
       `SELECT b.id AS bot_id, b.name, b.instructions, b.tool_policy, j.placement, t.id AS task_id, t.key, t.title, t.description,
@@ -578,6 +588,55 @@ export const getRunContext = async (
       body: string;
       created_at: string;
     }>();
+  // Memory (§13.5): the Bot's, the Task's and the Channel's, newest first, within 8 KiB.
+  const { results: memoryRows } = await db
+    .prepare(
+      `SELECT id, scope_kind AS scopeKind, content, created_at AS createdAt FROM memories
+        WHERE workspace_id = ? AND deleted_at IS NULL
+          AND ((scope_kind = 'bot' AND scope_id = ?) OR (scope_kind = 'task' AND scope_id = ?)
+               OR (scope_kind = 'channel' AND scope_id = ?))
+        ORDER BY created_at DESC, id DESC LIMIT 20`,
+    )
+    .bind(workspaceId, row.bot_id, row.task_id, row.channel_id)
+    .all<RunContext["memories"][number]>();
+  const memories: RunContext["memories"] = [];
+  let bytes = 0;
+  for (const memory of memoryRows) {
+    bytes += new TextEncoder().encode(memory.content).length;
+    if (bytes > memoryContextBytes) break;
+    memories.push(memory);
+  }
+  // Related history: search hits for the trigger body within what this Run may read, never the trigger itself.
+  const match = row.item_id && row.body ? relatedQuery(row.body) : null;
+  const related = match
+    ? (
+        await searchDocuments(
+          db,
+          {
+            workspaceId,
+            scopes: [
+              `workspace:${workspaceId}`,
+              `bot:${row.bot_id}`,
+              ...(row.channel_id ? [`channel:${row.channel_id}`] : []),
+              ...(row.task_id ? [`task:${row.task_id}`] : []),
+            ],
+            allBotsAndTasks: false,
+          },
+          {
+            q: "",
+            match,
+            kinds: ["message", "task", "memory"],
+            limit: 5,
+            excludeMessageId: row.message_id,
+          },
+        )
+      ).map(({ sourceKind, sourceId, title, snippet }) => ({
+        sourceKind,
+        sourceId,
+        title,
+        snippet,
+      }))
+    : [];
   return {
     bot: {
       id: row.bot_id,
@@ -613,6 +672,8 @@ export const getRunContext = async (
       body: r.body,
       createdAt: r.created_at,
     })),
+    memories,
+    related,
   };
 };
 

@@ -2,6 +2,7 @@
 // Known gap: the design hands outbox rows to Cloudflare Queues and routes in a Queue consumer. Until
 // then this function is both, driven by the cron trigger and `POST /v1/executor/pump`.
 import {
+  type SearchKind,
   type FilterExpression,
   type FilterTarget,
   matchesEventType,
@@ -22,6 +23,7 @@ import {
 } from "@hive/db";
 import type { Notification } from "./realtime.ts";
 import { fireDueRoutines } from "./routines.ts";
+import { indexSource } from "./search.ts";
 
 const maxAttempts = 5;
 const leaseSeconds = 60;
@@ -208,6 +210,9 @@ export const pump = async (
         if (row.topic === "event.route") {
           const routed = await routeEvent(db, (row.payload as { eventId: string }).eventId);
           if (routed) input.notify?.(routed);
+        }
+        if (row.topic === "search.index") {
+          await indexSource(db, row.payload as { sourceKind: SearchKind; sourceId: string });
         }
         await markOutboxSent(db, settle);
         return "processed";

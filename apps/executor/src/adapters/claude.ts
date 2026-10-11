@@ -32,8 +32,8 @@ export const systemPrompt = ({ bot }: LaunchContext["context"]) =>
     .join("\n\n");
 
 /**
- * User message: Task, recent conversation (oldest first), then the trigger item's body (naming the sending Bot) or the
- * batch's items, then replies to this Job's earlier requests.
+ * User message: Task, recent conversation (oldest first), Memory, Related search hits, then the trigger item's body
+ * (naming the sending Bot) or the batch's items, then replies to this Job's earlier requests.
  */
 export const userPrompt = ({
   task,
@@ -41,12 +41,23 @@ export const userPrompt = ({
   inboxItem,
   batch,
   replies,
+  memories,
+  related,
 }: LaunchContext["context"]) => {
   const parts: string[] = [];
   if (task) parts.push(`Task ${task.key}: ${task.title}\n${task.description}`.trim());
   if (conversation?.recent.length) {
     const lines = conversation.recent.map((m) => `[${m.actorKind} ${m.actorId}] ${m.body}`);
     parts.push(`Recent conversation:\n${lines.join("\n")}`);
+  }
+  if (memories.length) {
+    parts.push(`Memory:\n${memories.map((m) => `- (${m.scopeKind}) ${m.content}`).join("\n")}`);
+  }
+  if (related.length) {
+    const lines = related.map(
+      (r) => `- (${r.sourceKind}) ${[r.title, r.snippet].filter(Boolean).join(": ")}`,
+    );
+    parts.push(`Related:\n${lines.join("\n")}`);
   }
   const request = batch
     ? batch.items.map((i, n) => `[${n + 1}] ${i.body}`).join("\n")

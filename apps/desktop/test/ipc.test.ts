@@ -104,6 +104,18 @@ describe("IPC handlers", () => {
     expect(requests).toHaveLength(1);
   });
 
+  it("passes a search query encoded by URLSearchParams and posts memory.write", async () => {
+    const { h, requests } = setup();
+    const path = `/v1/search?${new URLSearchParams({ workspaceId: "ws-1", q: "deploy staging レビュー*" })}`;
+    expect((await h.get(path)).ok).toBe(true);
+    const write = {
+      ...envelope,
+      command: { type: "memory.write", scopeKind: "bot", scopeId: "bot-1", content: "x" },
+    };
+    expect((await h.command(write)).ok).toBe(true);
+    expect(requests.map((r) => r.path)).toEqual([path, "/v1/commands"]);
+  });
+
   it("posts a valid agent.send envelope", async () => {
     const { h, requests } = setup();
     expect((await h.command(envelope)).ok).toBe(true);

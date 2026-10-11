@@ -1,22 +1,30 @@
 // IPC argument validation and the HTTP calls behind it. No `electron` import, so it runs under vitest.
 import { CliError, type Client } from "@hive/cli/client";
-import { AgentSend, ApprovalResolve, commandEnvelope, JobCancel, parse } from "@hive/contracts";
+import {
+  AgentSend,
+  ApprovalResolve,
+  commandEnvelope,
+  JobCancel,
+  MemoryWrite,
+  parse,
+} from "@hive/contracts";
 import * as v from "valibot";
 import type { ApiResult } from "../shared/api.ts";
 
 /**
  * A `/v1/...` path with an optional query. Path segments allow no `.` or `%`, so neither a literal nor an
- * encoded `..` can climb out of `/v1/`; `..` is rejected anywhere anyway.
+ * encoded `..` can climb out of `/v1/`; `..` is rejected anywhere anyway. The query allows URLSearchParams output
+ * (`+` for a space, `*`).
  */
 export const ApiPath = v.pipe(
   v.string(),
   v.maxLength(2048),
-  v.regex(/^\/v1(\/[\w-]+)+(\?[\w\-=&%.~]*)?$/, "must be a /v1/... path"),
+  v.regex(/^\/v1(\/[\w-]+)+(\?[\w\-=&%.~+*]*)?$/, "must be a /v1/... path"),
   v.check((path) => !path.includes(".."), "must not contain .."),
 );
 
 export const UiCommandSchema = commandEnvelope(
-  v.variant("type", [AgentSend, JobCancel, ApprovalResolve]),
+  v.variant("type", [AgentSend, JobCancel, ApprovalResolve, MemoryWrite]),
 );
 
 const invalid = (issues: string[]): ApiResult => ({

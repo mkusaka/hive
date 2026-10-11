@@ -32,6 +32,8 @@ export const context: RunContext = {
   },
   batch: null,
   replies: [],
+  memories: [],
+  related: [],
 };
 
 /**
@@ -67,6 +69,11 @@ export const fakeRunApi = (fail?: Error, approvalStates: ApprovalStatus["state"]
       calls.push({ getTask: taskId });
       if (fail) throw fail;
       return { id: taskId, revision: 3 };
+    },
+    search: async (q) => {
+      calls.push({ search: q });
+      if (fail) throw fail;
+      return { hits: [], indexedThrough: null, cursor: null };
     },
   };
   return { api, calls };

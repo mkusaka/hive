@@ -44,6 +44,7 @@ import {
   principalHeader,
   type Realtime,
 } from "./realtime.ts";
+import { listMemories, rebuildSearch, search, searchAccess } from "./search.ts";
 import { listChanges, permittedScopes } from "./sync.ts";
 
 export type Bindings = {
@@ -238,6 +239,51 @@ export const createApp = ({
     return c.json(task);
   });
 
+  app.get("/v1/run/search", async (c) => {
+    const run = runPrincipal(c);
+    if (!run.scopes.includes("search.read"))
+      throw new HttpError("FORBIDDEN", "capability lacks search.read");
+    return c.json(
+      await search(c.env.DB, await searchAccess(c.env.DB, run.workspaceId, run), {
+        q: c.req.query("q"),
+        kinds: c.req.query("kinds"),
+        limit: limitParam(c, 10, 50),
+      }),
+    );
+  });
+
+  // Search and Memory (§13.6, §14).
+  app.get("/v1/search", async (c) => {
+    const workspaceId = workspaceParam(c);
+    return c.json(
+      await search(c.env.DB, await searchAccess(c.env.DB, workspaceId, user(c)), {
+        q: c.req.query("q"),
+        kinds: c.req.query("kinds"),
+        limit: limitParam(c, 20, 100),
+        cursor: c.req.query("cursor"),
+      }),
+    );
+  });
+  app.get("/v1/memories", async (c) => {
+    const workspaceId = workspaceParam(c);
+    return c.json(
+      await listMemories(c.env.DB, await searchAccess(c.env.DB, workspaceId, user(c)), {
+        scopeKind: c.req.query("scopeKind"),
+        scopeId: c.req.query("scopeId"),
+      }),
+    );
+  });
+  app.post("/v1/admin/search/rebuild", async (c) => {
+    const workspaceId = workspaceParam(c);
+    const owner = await c.env.DB.prepare(
+      "SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role = 'owner'",
+    )
+      .bind(workspaceId, user(c).userId)
+      .first();
+    if (!owner) throw new HttpError("FORBIDDEN", "workspace owner required");
+    return c.json(await rebuildSearch(c.env.DB, workspaceId));
+  });
+
   app.get("/v1/operations/:id", async (c) => {
     const { userId, workspaceIds } = user(c);
     return c.json(await getOperation(c.env.DB, userId, workspaceIds, c.req.param("id")));
@@ -319,7 +365,7 @@ export const createApp = ({
         ? {
             principalKind: "user",
             principalId: principal.userId,
-            scopes: await permittedScopes(c.env.DB, workspaceId, principal.userId),
+            scopes: await permittedScopes(c.env.DB, workspaceId, principal),
           }
         : {
             principalKind: "device",

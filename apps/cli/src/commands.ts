@@ -1,7 +1,7 @@
 // Command bodies and watch loops (docs/architecture.md §22.3, §23). Web-standard APIs only: the api-worker
 // end-to-end test calls these inside workerd.
 /* oxlint-disable no-await-in-loop */
-import { type Client, CliError } from "./client.ts";
+import { type Client, CliError, invalid } from "./client.ts";
 
 export type Envelope = { operationId: string; idempotencyKey: string; workspaceId: string };
 export type Json = Record<string, unknown>;
@@ -308,3 +308,34 @@ export const waitForOperationJob = async (c: Client, operationId: string, opts: 
   }, opts);
   return watchJob(c, jobId, opts);
 };
+
+// --------------------------------------------------- Search and Memory (§13.6, §14)
+
+export const search = (c: Client, workspaceId: string, q: string, kinds?: string) =>
+  c.get(inWorkspace("search", workspaceId, { q, ...(kinds ? { kinds } : {}) }));
+
+/** `workspace`, or `<kind>:<id>` for channel / project / bot / task. */
+export const parseScope = (scope: string, workspaceId: string) => {
+  if (scope === "workspace") return { scopeKind: "workspace", scopeId: workspaceId };
+  const colon = scope.indexOf(":");
+  if (colon <= 0 || colon === scope.length - 1) {
+    throw invalid("--scope must be workspace or <channel|project|bot|task>:<id>");
+  }
+  return { scopeKind: scope.slice(0, colon), scopeId: scope.slice(colon + 1) };
+};
+
+export const memoryWrite = (
+  c: Client,
+  e: Envelope,
+  scope: { scopeKind: string; scopeId: string },
+  content: string,
+) => c.command(e, { type: "memory.write", ...scope, content });
+
+export const listMemories = (
+  c: Client,
+  workspaceId: string,
+  scope: { scopeKind: string; scopeId: string },
+) => c.get(inWorkspace("memories", workspaceId, scope));
+
+export const memoryDelete = (c: Client, e: Envelope, memoryId: string, expectedRevision: number) =>
+  c.command(e, { type: "memory.delete", memoryId, expectedRevision });

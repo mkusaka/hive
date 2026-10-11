@@ -31,6 +31,8 @@ bun run --cwd apps/desktop build   # out/{main,preload,renderer}
 | Inbox     | `GET /v1/inbox?botId=` for the picked Bot, with state badges                                                                                                                             |
 | Activity  | `GET /v1/jobs?limit=50` with state badges (incl. `waiting_device`, `recovery_required`) and a Cancel button for queued / waiting / active Jobs; selecting a Job shows `GET /v1/jobs/:id` |
 | Approvals | Pending approvals (`GET /v1/approvals?state=pending`): action, argument summary, cwd label, Bot, expires-in; Allow / Deny send `approval.resolve`. The nav shows the pending count       |
+| Search    | Query box → `GET /v1/search`: kind badge, title, snippet and the index's `indexed through` time; a message hit opens its channel in the Channel view                                     |
+| Memory    | Scope picker (Workspace, member channels, Bots) → `GET /v1/memories`, newest first; the form sends `memory.write` to the picked scope                                                    |
 | Devices   | Name, OS, last heartbeat, revoked                                                                                                                                                        |
 | Status    | Workspace, WebSocket state (connected / reconnecting), last sync cursor (tail), unsynced hint count                                                                                      |
 
@@ -68,12 +70,12 @@ img-src 'self'`. `'unsafe-inline'` styles are for Vite's dev-time `<style>` inje
 
 ## IPC surface (`src/shared/api.ts`)
 
-| `window.hive`      | Channel            | Validation / behavior                                                                                                                             |
-| ------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `api.get(path)`    | `hive:api.get`     | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, no `..` anywhere                                                                          |
-| `api.command(env)` | `hive:api.command` | `commandEnvelope(variant [AgentSend, JobCancel, ApprovalResolve])` from `@hive/contracts`: only `agent.send`, `job.cancel` and `approval.resolve` |
-| `getConfig()`      | `hive:config`      | `{apiUrl, workspaceId, problem, connection}`; no secrets                                                                                          |
-| `onRealtime(cb)`   | `hive:realtime`    | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                                                       |
+| `window.hive`      | Channel            | Validation / behavior                                                                                                                                   |
+| ------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `api.get(path)`    | `hive:api.get`     | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, the query also allows URLSearchParams' `+` and `*`, no `..` anywhere                            |
+| `api.command(env)` | `hive:api.command` | `commandEnvelope(variant [AgentSend, JobCancel, ApprovalResolve, MemoryWrite])`: only `agent.send`, `job.cancel`, `approval.resolve` and `memory.write` |
+| `getConfig()`      | `hive:config`      | `{apiUrl, workspaceId, problem, connection}`; no secrets                                                                                                |
+| `onRealtime(cb)`   | `hive:realtime`    | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                                                             |
 
 `api.*` never rejects: it resolves to `{ok: true, value}` or `{ok: false, error: {code, message, body?}}`, where
 `code` is the `ApiError` code (e.g. `CURSOR_EXPIRED`), `INVALID_ARGS` for rejected arguments, or a CLI client code
@@ -95,5 +97,7 @@ rejection, ApiError mapping, Access header injection).
 - Inbox state and Job ids are not linked in the UI; accepted / delivered / started / completed are shown only as
   the raw states of the operation, inbox item and Job.
 - No packaging or installer (electron-builder).
+- Search / Memory: one page of hits (no cursor paging), no kind filter, no memory delete or supersede; the Memory
+  view refetches only on its own changes (memory change rows do not refresh it).
 - Approvals: the Bash command summary is shown as text without a diff view or the full input (it never leaves the
   device); no OS notification for a new approval.

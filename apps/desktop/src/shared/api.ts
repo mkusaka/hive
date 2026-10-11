@@ -1,5 +1,11 @@
 // The typed surface the preload exposes as `window.hive` (docs/architecture.md §20.1, §21). Types only.
-import type { AgentSend, ApprovalResolve, commandEnvelope, JobCancel } from "@hive/contracts";
+import type {
+  AgentSend,
+  ApprovalResolve,
+  commandEnvelope,
+  JobCancel,
+  MemoryWrite,
+} from "@hive/contracts";
 import type * as v from "valibot";
 
 /** IPC never throws: an error thrown in `ipcMain.handle` reaches the renderer with its message only. */
@@ -7,13 +13,13 @@ export type ApiResult =
   | { ok: true; value: Record<string, unknown> }
   | { ok: false; error: { code: string; message: string; body?: unknown } };
 
-/** The commands the UI sends today: agent.send, job.cancel and approval.resolve. */
+/** The commands the UI sends today: agent.send, job.cancel, approval.resolve and memory.write. */
 export type UiCommand = v.InferInput<
   ReturnType<
     typeof commandEnvelope<
       v.VariantSchema<
         "type",
-        [typeof AgentSend, typeof JobCancel, typeof ApprovalResolve],
+        [typeof AgentSend, typeof JobCancel, typeof ApprovalResolve, typeof MemoryWrite],
         undefined
       >
     >

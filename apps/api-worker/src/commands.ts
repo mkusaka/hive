@@ -20,6 +20,8 @@ import {
   JobCancel,
   JobResolve,
   JobStart,
+  MemoryDelete,
+  MemoryWrite,
   type PlacementPolicy,
   ProjectCreate,
   RoutineCreate,
@@ -65,6 +67,7 @@ import type { Principal } from "./auth/principal.ts";
 import { HttpError } from "./errors.ts";
 import { eventColumns, type EventRow, type SubscriptionRow, subscriptionMatches } from "./pump.ts";
 import { occurrenceStatements, routineColumns, routineFrom, type RoutineRow } from "./routines.ts";
+import { indexLater } from "./search.ts";
 
 export const CommandEnvelope = commandEnvelope(
   v.variant("type", [
@@ -98,6 +101,8 @@ export const CommandEnvelope = commandEnvelope(
     RoutineResume,
     RoutineRun,
     ApprovalResolve,
+    MemoryWrite,
+    MemoryDelete,
   ]),
 );
 type Envelope = v.InferOutput<typeof CommandEnvelope>;
@@ -544,6 +549,7 @@ const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env
         deliveryMode: command.delivery,
       }),
       enqueueOutbox(db, { workspaceId, topic: "event.route", payload: { eventId } }),
+      indexLater(db, workspaceId, "message", messageId),
     ],
     response,
     [
@@ -687,6 +693,7 @@ const taskCas = (
       ),
     setGuard,
     clearGuard,
+    indexLater(db, input.workspaceId, "task", input.taskId),
   ];
 };
 
@@ -770,6 +777,7 @@ const taskCreate: TaskHandler<v.InferOutput<typeof TaskCreate>> = async (db, act
           command.priority,
           command.completionPolicy,
         ),
+      indexLater(db, workspaceId, "task", taskId),
     ],
     { operationId: env.operationId, status: "accepted", taskId, key },
     [taskChange(workspaceId, taskId, 1)],
@@ -1040,6 +1048,7 @@ const jobStart: Handler<v.InferOutput<typeof JobStart>> = async (db, user, env) 
         taskId: command.taskId,
         placement,
       }),
+      indexLater(db, workspaceId, "task", command.taskId),
     ],
     { operationId: env.operationId, status: "accepted", jobId, taskId: command.taskId, triggerKey },
     [
@@ -1784,6 +1793,232 @@ const approvalResolve: Handler<v.InferOutput<typeof ApprovalResolve>> = async (d
   return explainFailure(run, () => explainApproval(db, workspaceId, command.approvalId));
 };
 
+// ------------------------------------------------- Memory (docs/architecture.md §13.6)
+// Content never changes after write: a correction supersedes (tombstones) the old memory. Every revision is copied
+// to `memory_revisions`, and the batch enqueues `search.index` for each memory it touches.
+
+type MemoryWriteCommand = v.InferOutput<typeof MemoryWrite>;
+
+/** Immutable copy of the memory's current row. */
+const snapshotMemory = (db: D1Database, memoryId: string) =>
+  db
+    .prepare(
+      `INSERT INTO memory_revisions (memory_id, workspace_id, scope_kind, scope_id, content, source_kind, source_id,
+         created_by_actor_id, revision, supersedes_id, deleted_at)
+       SELECT id, workspace_id, scope_kind, scope_id, content, source_kind, source_id, created_by_actor_id, revision,
+              supersedes_id, deleted_at
+         FROM memories WHERE id = ?`,
+    )
+    .bind(memoryId);
+
+/** Change rows: a Channel memory syncs to that Channel, every other scope to the Workspace. */
+const memoryChange = (
+  workspaceId: string,
+  memory: { id: string; scopeKind: string; scopeId: string },
+  op: "upsert" | "delete",
+  revision?: number,
+): Change => ({
+  entityKind: "memory",
+  entityId: memory.id,
+  op,
+  ...(revision === undefined ? {} : { revision }),
+  scope: memory.scopeKind === "channel" ? `channel:${memory.scopeId}` : `workspace:${workspaceId}`,
+});
+
+/** Tombstone `memoryId` (revision CAS) with its snapshot and index row; `where` adds conditions. */
+const tombstoneMemory = (
+  db: D1Database,
+  input: { workspaceId: string; memoryId: string; where: string },
+  ...params: unknown[]
+) => {
+  const now = new Date().toISOString();
+  const [setGuard, clearGuard] = guard(db);
+  return [
+    db
+      .prepare(
+        `UPDATE memories SET deleted_at = ?, revision = revision + 1, updated_at = ?
+          WHERE workspace_id = ? AND id = ? AND deleted_at IS NULL AND ${input.where}`,
+      )
+      .bind(now, now, input.workspaceId, input.memoryId, ...params),
+    setGuard,
+    clearGuard,
+    snapshotMemory(db, input.memoryId),
+    indexLater(db, input.workspaceId, "memory", input.memoryId),
+  ];
+};
+
+const loadMemory = async (db: D1Database, workspaceId: string, memoryId: string) => {
+  const row = await db
+    .prepare(
+      "SELECT scope_kind, scope_id, revision, deleted_at FROM memories WHERE workspace_id = ? AND id = ?",
+    )
+    .bind(workspaceId, memoryId)
+    .first<{ scope_kind: string; scope_id: string; revision: number; deleted_at: string | null }>();
+  if (!row) throw new HttpError("NOT_FOUND", "memory not found");
+  return row;
+};
+
+/** Why a memory CAS failed: deleted, or another revision. */
+const explainMemory = async (
+  db: D1Database,
+  workspaceId: string,
+  memoryId: string,
+  expectedRevision?: number,
+) => {
+  const row = await loadMemory(db, workspaceId, memoryId);
+  if (row.deleted_at !== null) {
+    return new HttpError("INVALID_INPUT", "memory is deleted", false, "deleted");
+  }
+  if (expectedRevision !== undefined && row.revision !== expectedRevision) {
+    return new HttpError(
+      "REVISION_CONFLICT",
+      `memory revision is ${row.revision}; refetch and retry`,
+      false,
+      "stale_revision",
+    );
+  }
+  return null;
+};
+
+/** The write itself; the caller has checked that the writer may use the scope. */
+const memoryWrite = async (
+  db: D1Database,
+  writer: { receiptActorId: string; actorId: string; sourceKind: "user" | "bot"; sourceId: string },
+  env: Envelope & { command: MemoryWriteCommand },
+) => {
+  const { workspaceId, command } = env;
+  if (command.supersedesId) {
+    const old = await loadMemory(db, workspaceId, command.supersedesId);
+    if (old.scope_kind !== command.scopeKind || old.scope_id !== command.scopeId) {
+      throw new HttpError("INVALID_INPUT", "supersedesId must be a memory of the same scope");
+    }
+  }
+  const memoryId = crypto.randomUUID();
+  const memory = { id: memoryId, scopeKind: command.scopeKind, scopeId: command.scopeId };
+  const run = receipt(
+    db,
+    writer.receiptActorId,
+    env,
+    [
+      db
+        .prepare(
+          `INSERT INTO memories (id, workspace_id, scope_kind, scope_id, content, source_kind, source_id,
+             created_by_actor_id, revision, supersedes_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+        )
+        .bind(
+          memoryId,
+          workspaceId,
+          command.scopeKind,
+          command.scopeId,
+          command.content,
+          writer.sourceKind,
+          writer.sourceId,
+          writer.actorId,
+          command.supersedesId ?? null,
+        ),
+      snapshotMemory(db, memoryId),
+      indexLater(db, workspaceId, "memory", memoryId),
+      ...(command.supersedesId
+        ? tombstoneMemory(db, { workspaceId, memoryId: command.supersedesId, where: "1" })
+        : []),
+    ],
+    { operationId: env.operationId, status: "accepted", memoryId, revision: 1 },
+    [
+      memoryChange(workspaceId, memory, "upsert", 1),
+      // The superseded revision is unknown when the batch is built.
+      ...(command.supersedesId
+        ? [memoryChange(workspaceId, { ...memory, id: command.supersedesId }, "delete")]
+        : []),
+    ],
+  );
+  return command.supersedesId
+    ? explainFailure(run, () => explainMemory(db, workspaceId, command.supersedesId!))
+    : run;
+};
+
+/** A user may write to the Workspace, a Channel they are a member of, or an existing Project / Bot / Task. */
+const userMayUseMemoryScope = async (
+  db: D1Database,
+  user: User,
+  workspaceId: string,
+  scope: { kind: string; id: string },
+) => {
+  if (scope.kind === "workspace") {
+    if (scope.id !== workspaceId)
+      throw new HttpError("INVALID_INPUT", "scopeId must be the workspace id");
+    return;
+  }
+  const exists =
+    scope.kind === "channel"
+      ? await db
+          .prepare(
+            `SELECT 1 FROM channel_members m JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+              WHERE m.workspace_id = ? AND m.channel_id = ? AND a.user_id = ?`,
+          )
+          .bind(workspaceId, scope.id, user.userId)
+          .first()
+      : await db
+          .prepare(`SELECT 1 FROM ${scope.kind}s WHERE workspace_id = ? AND id = ?`)
+          .bind(workspaceId, scope.id)
+          .first();
+  if (!exists) {
+    throw scope.kind === "channel"
+      ? new HttpError("FORBIDDEN", "not a member of this channel")
+      : new HttpError("NOT_FOUND", `${scope.kind} not found`);
+  }
+};
+
+const userMemoryWrite: Handler<MemoryWriteCommand> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  await userMayUseMemoryScope(db, user, workspaceId, {
+    kind: command.scopeKind,
+    id: command.scopeId,
+  });
+  const actorId = await userActorId(db, workspaceId, user.userId);
+  return memoryWrite(
+    db,
+    { receiptActorId: user.userId, actorId, sourceKind: "user", sourceId: user.userId },
+    env,
+  );
+};
+
+const memoryDelete: Handler<v.InferOutput<typeof MemoryDelete>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const memory = await loadMemory(db, workspaceId, command.memoryId);
+  await userMayUseMemoryScope(db, user, workspaceId, {
+    kind: memory.scope_kind,
+    id: memory.scope_id,
+  });
+  const run = receipt(
+    db,
+    user.userId,
+    env,
+    tombstoneMemory(
+      db,
+      { workspaceId, memoryId: command.memoryId, where: "revision = ?" },
+      command.expectedRevision,
+    ),
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      memoryId: command.memoryId,
+      revision: command.expectedRevision + 1,
+    },
+    [
+      memoryChange(
+        workspaceId,
+        { id: command.memoryId, scopeKind: memory.scope_kind, scopeId: memory.scope_id },
+        "delete",
+        command.expectedRevision + 1,
+      ),
+    ],
+  );
+  return explainFailure(run, () =>
+    explainMemory(db, workspaceId, command.memoryId, command.expectedRevision),
+  );
+};
+
 const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>> } = {
   "workspace.create": workspaceCreate,
   "device.register": deviceRegister,
@@ -1815,6 +2050,8 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "routine.resume": routineResume,
   "routine.run": routineRun,
   "approval.resolve": approvalResolve,
+  "memory.write": userMemoryWrite,
+  "memory.delete": memoryDelete,
 };
 
 export const runCommand = (db: D1Database, principal: Principal, envelope: Envelope) => {
@@ -1971,6 +2208,7 @@ const runAgentSend: RunHandler<v.InferOutput<typeof RunAgentSend>> = async (db, 
         hop,
       }),
       enqueueOutbox(db, { workspaceId, topic: "event.route", payload: { eventId } }),
+      indexLater(db, workspaceId, "message", messageId),
     ],
     response,
     [
@@ -2039,6 +2277,7 @@ const runAgentReply: RunHandler<v.InferOutput<typeof AgentReply>> = async (db, r
         deliveryMode: "wake",
         hop: run.hop,
       }),
+      indexLater(db, workspaceId, "message", messageId),
       // Not guarded: the requester may still be running (then its `waiting` result sees this reply).
       db
         .prepare(
@@ -2127,6 +2366,32 @@ const runApprovalRequest: RunHandler<v.InferOutput<typeof ApprovalRequest>> = as
   );
 };
 
+/**
+ * A Run writes only to its own Bot, its Task or its Conversation's Channel. Workspace (and Project) scope would carry
+ * what the Run read out of its sources' ACL: that promotion goes through policy, not a Run (AT-33).
+ */
+const runMemoryWrite: RunHandler<MemoryWriteCommand> = async (db, run, env) => {
+  requireScope(run, "memory.write");
+  const { scopeKind, scopeId } = env.command;
+  const own = { bot: run.botId, task: run.taskId, channel: run.channelId } as Record<
+    string,
+    string | null
+  >;
+  if (!(scopeKind in own) || own[scopeKind] === null || own[scopeKind] !== scopeId) {
+    throw new HttpError(
+      "FORBIDDEN",
+      "a run may write memory only to its bot, task or channel; wider scopes need promotion",
+      false,
+      "scope_not_permitted",
+    );
+  }
+  return memoryWrite(
+    db,
+    { receiptActorId: run.runId, actorId: run.botActorId, sourceKind: "bot", sourceId: run.runId },
+    env as unknown as Envelope & { command: MemoryWriteCommand },
+  );
+};
+
 const taskHandlers = {
   "task.create": taskCreate,
   "task.assign": taskAssign,
@@ -2181,6 +2446,9 @@ export const runRunCommand = (db: D1Database, run: Run, envelope: RunEnvelopeVal
   }
   if (command.type === "approval.request") {
     return runApprovalRequest(db, run, envelope as RunEnvelopeValue & { command: typeof command });
+  }
+  if (command.type === "memory.write") {
+    return runMemoryWrite(db, run, envelope as RunEnvelopeValue & { command: typeof command });
   }
   return runTaskCommand(db, run, envelope as RunEnvelopeValue & { command: typeof command });
 };

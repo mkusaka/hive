@@ -1,6 +1,7 @@
 // HTTP delta sync over `change_log` (docs/architecture.md §12.2, §12.3).
 import { parse } from "@hive/contracts";
 import * as v from "valibot";
+import type { Principal } from "./auth/principal.ts";
 import { HttpError } from "./errors.ts";
 
 const Cursor = v.strictObject({
@@ -45,15 +46,30 @@ export const headCursor = async (db: D1Database, workspaceId: string) => {
   return encodeCursor({ workspaceId, ...row });
 };
 
-/** `workspace:<id>` plus `channel:<id>` for every channel the user's actor is a member of. */
-export const permittedScopes = async (db: D1Database, workspaceId: string, userId: string) => {
+/**
+ * A user: `workspace:<id>` plus `channel:<id>` for every channel their actor is a member of. A Run: `workspace:<id>`,
+ * its Conversation's Channel and its own `bot:<id>` / `task:<id>` (search only: change rows never carry those).
+ */
+export const permittedScopes = async (
+  db: D1Database,
+  workspaceId: string,
+  principal: { kind: "user"; userId: string } | Extract<Principal, { kind: "run" }>,
+) => {
+  if (principal.kind === "run") {
+    return [
+      `workspace:${workspaceId}`,
+      `bot:${principal.botId}`,
+      ...(principal.channelId ? [`channel:${principal.channelId}`] : []),
+      ...(principal.taskId ? [`task:${principal.taskId}`] : []),
+    ];
+  }
   const { results } = await db
     .prepare(
       `SELECT m.channel_id FROM channel_members m
          JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
         WHERE m.workspace_id = ? AND a.user_id = ?`,
     )
-    .bind(workspaceId, userId)
+    .bind(workspaceId, principal.userId)
     .all<{ channel_id: string }>();
   return [`workspace:${workspaceId}`, ...results.map((r) => `channel:${r.channel_id}`)];
 };
@@ -87,7 +103,9 @@ export const listChanges = async (
     .bind(workspaceId, cursor.seq, limit + 1)
     .all<{ seq: number; scope: string }>();
   const scanned = results.slice(0, limit);
-  const allowed = new Set(await permittedScopes(db, workspaceId, input.userId));
+  const allowed = new Set(
+    await permittedScopes(db, workspaceId, { kind: "user", userId: input.userId }),
+  );
   return {
     changes: scanned.filter((row) => allowed.has(row.scope)),
     cursor: encodeCursor({ ...cursor, seq: scanned.at(-1)?.seq ?? cursor.seq }),

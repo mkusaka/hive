@@ -31,14 +31,19 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK) and `fake
 ## Claude provider
 
 - **Prompt.** `systemPrompt` = "You are <bot name>, a bot in a hive workspace." plus the Bot's `instructions`. The
-  user message = the Task (if any), the Conversation's recent messages (oldest first) and the trigger item's body.
+  user message = the Task (if any), the Conversation's recent messages (oldest first), a "Memory" section (the
+  context's memories with their scope) and a "Related" section (search hits with source kind and snippet), then the
+  trigger item's body. Plain text.
 - **Tools.** The Bot's tool policy (below) decides the native tools; `settingSources: []` (no user / project
   settings, hooks or CLAUDE.md), `strictMcpConfig`, `maxTurns: 4`. With a Run capability, `mcpServers: {hive}` is an
   in-process SDK MCP server (`src/tools.ts`) whose tools are in `allowedTools`; without one (a Run resumed after a
   restart: the token is returned once and not journaled) there are no hive tools and no approvals.
 - **Hive tools.** `hive_send_request {botId | botName, text}`, `hive_notify {botId | botName, text}`,
   `hive_wait_for_reply {requestMessageId}`, `hive_reply {text}` (only when the trigger item is a request from another
-  Bot), `hive_task_get {taskId}` and `hive_task_update {status?: "completed", assignee?}` (only for a Task Job). They
+  Bot), `hive_task_get {taskId}` and `hive_task_update {status?: "completed", assignee?}` (only for a Task Job),
+  `hive_memory_write {content, scope: bot | task | channel}` (the scope id is the context's Bot, Task or
+  Conversation channel; `task` / `channel` only when the context has one) and `hive_memory_search {q}`
+  (`GET /v1/run/search`, the Run's scopes only). They
   call `/v1/run/*` with the capability (`cloud.forRun`); the token never enters a prompt. Inputs are Zod shapes,
   which the SDK turns into the model's JSON Schema and validates before a handler runs. A cloud error comes back
   as tool text with `isError`, never as an exception in the SDK loop.

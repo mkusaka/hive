@@ -243,6 +243,63 @@ const specs: Record<string, Spec> = {
     run: async (c) =>
       cmd.watchApprovals(c.client(), c.workspace(), { ...c.wait(), onApproval: c.print }),
   },
+  search: {
+    usage: "<query> [--kinds message,task,memory]",
+    args: 1,
+    options: { kinds: str },
+    run: async (c) =>
+      c.print(
+        await cmd.search(
+          c.client(),
+          c.workspace(),
+          c.args[0]!,
+          c.values.kinds as string | undefined,
+        ),
+      ),
+  },
+  "memory write": {
+    usage:
+      "--scope <workspace|channel:<id>|project:<id>|bot:<id>|task:<id>> (--content <text> | --file <path|->)",
+    options: { scope: str, content: str, file: str },
+    run: async (c) => {
+      const { content, file } = c.values;
+      if ((content === undefined) === (file === undefined))
+        throw invalid("exactly one of --content, --file is required");
+      const text = typeof file === "string" ? await c.deps.readInput(file) : (content as string);
+      c.print(
+        await cmd.memoryWrite(
+          c.client(),
+          c.envelope(),
+          cmd.parseScope(need(c.values, "scope"), c.workspace()),
+          text,
+        ),
+      );
+    },
+  },
+  "memory list": {
+    usage: "--scope <workspace|channel:<id>|project:<id>|bot:<id>|task:<id>>",
+    options: { scope: str },
+    run: async (c) =>
+      c.print(
+        await cmd.listMemories(
+          c.client(),
+          c.workspace(),
+          cmd.parseScope(need(c.values, "scope"), c.workspace()),
+        ),
+      ),
+  },
+  "memory delete": {
+    // A memory's content never changes, so a live one is at revision 1.
+    usage: "<memory-id> [--revision <n>]",
+    args: 1,
+    options: { revision: { type: "string", default: "1" } },
+    run: async (c) => {
+      const revision = Number(c.values.revision);
+      if (!Number.isInteger(revision) || revision < 1)
+        throw invalid("--revision must be a positive integer");
+      c.print(await cmd.memoryDelete(c.client(), c.envelope(), c.args[0]!, revision));
+    },
+  },
   "agent send": {
     usage: "<bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]",
     args: 1,
@@ -590,8 +647,11 @@ const line = (value: unknown) =>
 
 /** Runs one `hive` invocation and returns its exit code (§23). */
 export const run = async (argv: string[], deps: Deps): Promise<number> => {
-  const [group, action, ...rest] = argv;
-  const spec = specs[`${group} ${action}`];
+  // Two-word commands (`memory write`), else one-word ones (`search <query>`).
+  const two = `${argv[0]} ${argv[1]}`;
+  const name = two in specs ? two : (argv[0] ?? "");
+  const rest = argv.slice(name.split(" ").length);
+  const spec = specs[name];
   if (!spec) {
     deps.stderr(usage());
     return 2;
@@ -612,8 +672,7 @@ export const run = async (argv: string[], deps: Deps): Promise<number> => {
     if (values.format !== "json" && values.format !== "text")
       throw invalid("--format must be json or text");
     json = values.format === "json";
-    if (positionals.length !== (spec.args ?? 0))
-      throw invalid(`usage: hive ${group} ${action} ${spec.usage}`);
+    if (positionals.length !== (spec.args ?? 0)) throw invalid(`usage: hive ${name} ${spec.usage}`);
     const creds = await deps.loadCredentials();
     const apiUrl = () => {
       const url = (values["api-url"] as string | undefined) ?? creds.apiUrl;

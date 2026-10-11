@@ -21,6 +21,10 @@ hive device env add --name <name> --repo <url> --path <local checkout root>
 hive approval list [--state pending|approved|denied|expired]   # default pending
 hive approval resolve <approval-id> (--allow | --deny) [--reason <text>]
 hive approval watch [--timeout <s>]                # prints each new pending approval once, polls every 2 s
+hive search <query> [--kinds message,task,memory]   # GET /v1/search; 1-2 characters take the bounded short path
+hive memory write --scope <workspace|channel:<id>|project:<id>|bot:<id>|task:<id>> (--content <text> | --file <path|->)
+hive memory list --scope <...>                         # live memories of the scope, newest first
+hive memory delete <memory-id> [--revision <n>]        # tombstone; a live memory is at revision 1
 hive agent send <bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]
 hive event emit <type> [--data-file <path|->] [--subject <kind:id>]
 hive op get <operation-id>
@@ -77,6 +81,9 @@ a fresh UUID per invocation).
   `<config dir>/hive/executor/environments.json` first (the local path never leaves the device), then registers
   `{deviceId (from the stored device token), name, repository}` in the cloud. A Bot created with
   `--environment <name> --cwd-mode environment` then runs in that checkout on devices that registered the name.
+- **`search`** and **`memory`** follow `apps/api-worker/README.md`, Search and memory. `search` is the one
+  one-word command: the dispatcher tries `<group> <action>`, then `<group>`. `memory delete` defaults `--revision` to
+  1 because a memory's content never changes (corrections supersede it); a deleted one is 422 (exit 2).
 - **`approval resolve`** is one-use: a second resolve, an expired approval or one whose Run is no longer current is
   409 (exit 4).
 - **`subscription create`** sends the file's JSON object as the `subscription.create` command, for example

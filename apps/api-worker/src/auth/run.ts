@@ -50,6 +50,7 @@ type Row = {
   bot_id: string;
   actor_id: string;
   conversation_id: string | null;
+  channel_id: string | null;
   hop: number | null;
   correlation_id: string | null;
   task_id: string | null;
@@ -64,12 +65,13 @@ export const authenticateRun = async (request: Request, env: Bindings): Promise<
   // Fencing (§10.3): the Run must still be active at the generation the capability was issued for.
   const { results } = await env.DB.prepare(
     `SELECT c.token_hash, c.scopes, c.execution_generation, r.workspace_id, r.job_id, j.bot_id, b.actor_id,
-            i.conversation_id, i.hop, j.correlation_id, j.task_id, t.project_id
+            i.conversation_id, cv.channel_id, i.hop, j.correlation_id, j.task_id, t.project_id
        FROM run_capabilities c
        JOIN runs r ON r.workspace_id = c.workspace_id AND r.id = c.run_id
        JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
        JOIN bots b ON b.workspace_id = j.workspace_id AND b.id = j.bot_id
        LEFT JOIN inbox_items i ON i.workspace_id = j.workspace_id AND 'inbox:' || i.id = j.trigger_key
+       LEFT JOIN conversations cv ON cv.workspace_id = i.workspace_id AND cv.id = i.conversation_id
        LEFT JOIN tasks t ON t.workspace_id = j.workspace_id AND t.id = j.task_id
       WHERE c.run_id = ? AND c.revoked_at IS NULL AND c.expires_at > ?
         AND r.execution_generation = c.execution_generation
@@ -93,6 +95,7 @@ export const authenticateRun = async (request: Request, env: Bindings): Promise<
     workspaceIds: [match.workspace_id],
     executionGeneration: match.execution_generation,
     conversationId: match.conversation_id,
+    channelId: match.channel_id,
     hop: match.hop ?? 0,
     correlationId: match.correlation_id ?? match.job_id,
     taskId: match.task_id,

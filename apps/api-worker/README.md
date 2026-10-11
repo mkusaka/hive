@@ -25,12 +25,16 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/tasks/:id`                                             | Access assertion (user)                | A Task with prerequisites, dependents, Results and Jobs                                         |
 | `GET /v1/subscriptions?workspaceId=`                            | Access assertion (user)                | Subscriptions of the Workspace with their spec (max 500); see Subscriptions below               |
 | `GET /v1/approvals?workspaceId=&state=`                         | Access assertion (user)                | Newest-first approvals (max 100), optionally one state; see Tools and approvals                 |
+| `GET /v1/search?workspaceId=&q=&kinds=&limit=&cursor=`          | Access assertion (user)                | Full-text search over permitted scopes (limit 1..100, default 20); see Search and memory        |
+| `GET /v1/memories?workspaceId=&scopeKind=&scopeId=`             | Access assertion (user)                | Live memories of one scope, newest first (max 200; channel needs membership)                    |
+| `POST /v1/admin/search/rebuild?workspaceId=`                    | Access assertion (user, owner)         | Drops the Workspace's search documents and re-enqueues every source (AT-38)                     |
 | `GET /v1/sync/changes?cursor=`                                  | Access assertion (user)                | Permitted changes after the cursor (limit 1..500, default 100); see Sync below                  |
 | `GET /v1/realtime?workspaceId=`                                 | Access assertion, or device Bearer     | WebSocket upgrade to the Workspace's Realtime DO; see Realtime below                            |
 | `POST /v1/run/commands`                                         | `Authorization: Bearer cap.<run>.<s>`  | Run command intake for the in-run hive tools; see Bot messaging                                 |
 | `GET /v1/run/me`                                                | `Authorization: Bearer cap.<run>.<s>`  | The Run principal (`RunPrincipal`)                                                              |
 | `GET /v1/run/tasks/:id`                                         | `Authorization: Bearer cap.<run>.<s>`  | A Task of the Run's own Task's Project (`task.read`; 403 otherwise)                             |
 | `GET /v1/run/approvals/:id`                                     | `Authorization: Bearer cap.<run>.<s>`  | The Run's own approval at its generation (`ApprovalStatus`), polled by the executor             |
+| `GET /v1/run/search?q=&kinds=&limit=`                           | `Authorization: Bearer cap.<run>.<s>`  | Search within the Run's scopes (`search.read`; limit 1..50, default 10)                         |
 | `GET /v1/executor/me`                                           | `Authorization: Bearer <device-token>` | Returns the device principal                                                                    |
 | `POST /v1/executor/pump`                                        | `Authorization: Bearer <device-token>` | Runs the outbox pump and time-driven work once; returns counts (see Outbox pump)                |
 | `POST /v1/executor/commands`                                    | `Authorization: Bearer <device-token>` | Executor command intake (see below)                                                             |
@@ -51,8 +55,8 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
   the same key is 409 `IDEMPOTENCY_CONFLICT`.
 - **Command types:** `workspace.create`, `device.register`, `device.revoke`, `channel.create`, `bot.create`,
   `agent.send`, `event.emit`, the Work commands, the Subscription / integration commands, the Routine commands,
-  `job.cancel` / `job.resolve` below, and `bot.update`, `device.environment.register`, `approval.resolve` (Tools and
-  approvals).
+  `job.cancel` / `job.resolve` below, `bot.update`, `device.environment.register`, `approval.resolve` (Tools and
+  approvals), and `memory.write` / `memory.delete` (Search and memory).
 - **Actors.** A user's `actors` row is created by `workspace.create` together with the membership (the only path
   that creates a membership today), unique per `(workspace_id, user_id)`. Messages and channel membership use it.
 - **`channel.create`** creates the channel, its main conversation and an `owner` channel membership for the caller.
@@ -317,6 +321,7 @@ expired, parked}`; the last two count Workspaces.
 - Routing twice is a no-op (consumer receipt PK; UNIQUE trigger key as backstop). A failed row keeps its lease
   and is retried when it expires; after 5 attempts it is marked `dead`. Topics without a consumer yet
   (`run.finished`) are marked `sent`.
+- `search.index {sourceKind, sourceId}` rows are handled by the search indexer (see Search and memory).
 
 It runs from the `scheduled()` cron trigger (every minute) and from `POST /v1/executor/pump`.
 
@@ -329,7 +334,8 @@ Bot-to-bot requests (docs/architecture.md §8, §18.2; AT-03, AT-26, AT-29).
   the claim batch. Like a device token it is returned once: a replayed claim has `capability: null`. `run.lease.renew`
   extends `expires_at`; `run.result.submit` revokes it. Auth (`auth/run.ts`) requires the hash, not revoked, not
   expired and the Run still active at that generation; anything else is 401. Scopes: `agent.send`, `agent.reply`,
-  `task.read`, plus `task.write` for a Task Job. The principal's `hop` is its trigger item's, its `correlationId`
+  `task.read`, `memory.write`, `search.read`, plus `task.write` for a Task Job. The principal also carries its
+  Conversation's `channelId` (memory and search scopes). The principal's `hop` is its trigger item's, its `correlationId`
   the Job's (or the Job id when it has none).
 - **`POST /v1/run/commands`**, same envelope; the receipt is keyed by the Run.
   - `agent.send {recipientBotId | recipientBotName, message: {kind: request | notification, text},
@@ -384,6 +390,48 @@ canonical tool input), argsSummary (≤ 2 KiB), cwdLabel}`. One batch inserts a 
   current (`run_not_current`) to `expired`, which the executor treats as deny, and resumes their Run
   (`approvalsExpired` counts Workspaces).
 
+## Search and memory
+
+D1 FTS5 search projection and explicit Memory (docs/architecture.md §13.5, §13.6, §14; SEARCH-01).
+
+- **Indexing.** The batch that writes a message (`agent.send`, the Bot reply of `run.result.submit`, run
+  `agent.send` / `agent.reply`), a Task (`task.create`, every Task CAS, `job.start`) or a memory enqueues
+  `search.index {sourceKind, sourceId}`. The pump's indexer (`src/search.ts`) reads the source's current state and
+  upserts its `search_documents` row only if `source_revision >= ` the indexed one (messages use `seq`, Tasks and
+  memories `revision`), so an older read never overwrites a newer one. The FTS rows follow through triggers. A
+  deleted memory becomes a tombstone (`deleted_at`, empty title / body); since the indexer only ever writes current
+  state, a late `search.index` row cannot resurrect it (AT-39). No consumer receipt: the guarded upsert is
+  idempotent. A cancelled Task stays indexed. Task documents are titled `<key> <title>`.
+- **Scopes.** A message document has its Conversation's `channel:<id>` (a `botpair:` channel for bot-to-bot
+  messages); a Task `workspace:<id>`; a memory `channel:<id>`, `bot:<id>`, `task:<id>`, or `workspace:<id>` for
+  Workspace and Project memories. `permittedScopes(principal)` (`src/sync.ts`) is shared with sync: a user gets the
+  Workspace and their channels, and search adds every `bot:` / `task:` scope (Bots and Tasks are Workspace-visible);
+  a Run gets the Workspace, its Conversation's channel, its own `bot:` and its Task's `task:`.
+- **`GET /v1/search`.** `q` of 3+ code points is matched with FTS5 `MATCH` as one quoted phrase (`"` doubled), never
+  as FTS syntax, ranked by `bm25`, with `snippet()` (matches in `[` `]`, ≤ 200 characters). A shorter `q` (trigram
+  needs 3) takes the short path: a `LIKE` substring match on title / body over the 200 newest permitted documents
+  only, never an unbounded scan; that covers Task key prefixes. `kinds` defaults to `message,task,memory`. The
+  response is `{hits: [{sourceKind, sourceId, title, snippet, scope, sourceRevision}], indexedThrough, cursor}`;
+  `indexedThrough` is the Workspace's newest `indexed_at` (AT-32) and `cursor` an offset, set when the page is full.
+  A hit's source must be re-fetched through its normal route; Task / Job state never comes from search.
+- **`memory.write {scopeKind, scopeId, content (≤ 16 KiB), supersedesId?}`.** A user may write to the Workspace, a
+  channel they are a member of (403) or an existing Project / Bot / Task (404). A Run (`memory.write` capability
+  scope) may write only to its own Bot, its Task or its Conversation's channel; anything else, Workspace scope
+  included, is 403 `scope_not_permitted`: promotion beyond the source's ACL needs policy (AT-33). One batch inserts
+  the memory (revision 1), its `memory_revisions` copy, the `search.index` row and a `memory` change row (scope:
+  the channel for a channel memory, else the Workspace). `supersedesId` (same scope only, 422 otherwise) tombstones
+  the old memory in the same batch.
+- **`memory.delete {memoryId, expectedRevision}`** (user, same scope rule): revision CAS to a tombstone (409
+  `stale_revision`, 422 `deleted`), with its revision copy and `search.index` row. Content never changes, so a
+  live memory is at revision 1.
+- **Run context.** `memories`: up to 20 live memories of the Bot, the Task and the Conversation's channel, newest
+  first, cut at 8 KiB. `related`: up to 5 hits for the trigger item's body within the Run's scopes, never the
+  trigger message: its words of 3+ characters (split on whitespace and punctuation, at most 8) each quoted and
+  ORed; a body without such a word gets none.
+- **Rebuild** (`POST /v1/admin/search/rebuild`, Workspace owner, 403 otherwise): one batch deletes the Workspace's
+  documents and enqueues a `search.index` row per message, Task and memory (`INSERT ... SELECT`); the pump indexes
+  them 50 per pass. Other Workspaces are untouched (AT-38).
+
 ## Known gaps
 
 - **No Queues yet.** The design (docs/architecture.md §6.1, §6.3) hands outbox rows to Cloudflare Queues and
@@ -433,6 +481,17 @@ canonical tool input), argsSummary (≤ 2 KiB), cwdLabel}`. One batch inserts a 
   identity is not compared across devices, and no environment list route exists. `approval.request` uses a fresh
   idempotency key per call and the executor never retries it, so a lost response leaves an orphan `pending` approval
   (and the Run `waiting_approval`) until the 10 min expiry.
+- **Search and memory.** G-06 is executed on miniflare only (2026-10-11): trigram tokenizer, Japanese substrings,
+  external-content triggers, short-query fallback, ACL and rebuild; real D1 (tokenizer, triggers, export of the
+  virtual table) is pending. No NFKC projection, summaries / compaction jobs, memory promotion policy, extracted
+  memory candidates, `memory.propose` / `memory.promote`, index lag metrics, or `search_document_scopes` table (one
+  scope per document). The cursor is an offset, so concurrent indexing can shift pages. Rebuild is one batch over
+  the whole Workspace, and documents are one chunk per source. `related` uses a plain word split, so a Japanese
+  request without spaces is one phrase. Memory has no confidence / valid time / approval state yet. Bot and Task memories are
+  Workspace-visible to users in search and `GET /v1/memories`, even when a Run wrote them from a private channel:
+  §13.6 inheritance of the source's read restrictions waits for the promotion / ACL policy. Bot-pair messages are
+  indexed under their `botpair:` channel, so users never find them in search although `GET /v1/bot-conversations`
+  shows them.
 - **Bot channel membership.** `agent.send` does not require the recipient Bot to be a member of the channel;
   `bot.create` adds no membership.
 

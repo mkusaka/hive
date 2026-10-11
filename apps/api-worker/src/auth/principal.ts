@@ -13,6 +13,8 @@ export type Principal =
       executionGeneration: number;
       /** The trigger Inbox item's Conversation and hop (§8.2); a Job without one has hop 0. */
       conversationId: string | null;
+      /** That Conversation's Channel (a `botpair:` Channel for a bot-to-bot conversation). */
+      channelId: string | null;
       hop: number;
       /** The Job's correlation id, or the Job id when it has none (it started a chain). */
       correlationId: string;

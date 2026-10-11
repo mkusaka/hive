@@ -583,6 +583,67 @@ export type ApprovalStatus = {
   decisionReason: string | null;
 };
 
+// ------------------------------------------------- Memory and search (docs/architecture.md §13.6, §14)
+
+export const memoryScopeKinds = ["workspace", "channel", "project", "bot", "task"] as const;
+
+/**
+ * Explicit knowledge in one scope; `scopeId` is the Workspace / Channel / Project / Bot / Task id. A Run may write only
+ * to its own Bot, its Task or its Conversation's Channel: Workspace scope is a promotion and needs policy (AT-33).
+ * `supersedesId` tombstones a memory of the same scope in the same batch.
+ */
+export const MemoryWrite = v.strictObject({
+  type: v.literal("memory.write"),
+  scopeKind: v.picklist(memoryScopeKinds),
+  scopeId: v.pipe(v.string(), v.minLength(1)),
+  content: v.pipe(
+    v.string(),
+    v.minLength(1),
+    v.check((s) => utf8Bytes(s) <= 16 * 1024, "content must be at most 16 KiB"),
+  ),
+  supersedesId: v.optional(v.pipe(v.string(), v.minLength(1))),
+});
+
+/** Tombstone; a memory's content never changes, so a live memory is at revision 1 unless superseded. */
+export const MemoryDelete = v.strictObject({
+  type: v.literal("memory.delete"),
+  memoryId: v.pipe(v.string(), v.minLength(1)),
+  expectedRevision: Revision,
+});
+
+export type Memory = {
+  id: string;
+  scopeKind: (typeof memoryScopeKinds)[number];
+  scopeId: string;
+  content: string;
+  sourceKind: "user" | "bot" | "system";
+  sourceId: string;
+  revision: number;
+  supersedesId: string | null;
+  createdAt: string;
+};
+
+export const searchKinds = ["message", "task", "memory"] as const;
+export type SearchKind = (typeof searchKinds)[number];
+export type SearchHit = {
+  sourceKind: SearchKind;
+  sourceId: string;
+  title: string;
+  /** At most 200 characters; matches are wrapped in `[` `]`. */
+  snippet: string;
+  scope: string;
+  sourceRevision: number;
+};
+/**
+ * `GET /v1/search` / `GET /v1/run/search`. `indexedThrough` is the newest `indexed_at` of the Workspace's index (null
+ * when empty): search is a lagging projection (AT-32); Task / Job state comes from the normal queries.
+ */
+export type SearchResult = {
+  hits: SearchHit[];
+  indexedThrough: string | null;
+  cursor: string | null;
+};
+
 /** Task writes need the `task.write` scope and a target in the Run's Task's Project. */
 export const RunCommand = v.variant("type", [
   RunAgentSend,
@@ -592,6 +653,7 @@ export const RunCommand = v.variant("type", [
   TaskAssign,
   TaskPlan,
   TaskComplete,
+  MemoryWrite,
 ]);
 export type RunCommand = v.InferInput<typeof RunCommand>;
 export type ExecutorCommand = v.InferInput<typeof ExecutorCommand>;
@@ -656,6 +718,10 @@ export type RunContext = {
     body: string;
     createdAt: string;
   }[];
+  /** Up to 20 live memories of the Bot, the Task and the Conversation's Channel, newest first, at most 8 KiB. */
+  memories: { id: string; scopeKind: string; content: string; createdAt: string }[];
+  /** Up to 5 search hits for the trigger item's body (never the trigger message itself). */
+  related: { sourceKind: SearchKind; sourceId: string; title: string; snippet: string }[];
 };
 
 /**

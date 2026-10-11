@@ -1,11 +1,12 @@
-// Phase 2 UI slice: Channel / Inbox / Activity / Approvals / Devices views and a status bar (docs/architecture.md §21).
+// Phase 2 UI slice: Channel / Inbox / Activity / Approvals / Search / Memory / Devices views and a status bar
+// (docs/architecture.md §21).
 /* oxlint-disable no-await-in-loop */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HiveConfig } from "../../shared/api.ts";
 import { createSync, type ListKey, type SyncStatus } from "./sync.ts";
 
 type Row = Record<string, unknown> & { id: string };
-type View = "channel" | "inbox" | "activity" | "approvals" | "devices";
+type View = "channel" | "inbox" | "activity" | "approvals" | "search" | "memory" | "devices";
 
 const get = async (path: string) => {
   const result = await window.hive.api.get(path);
@@ -172,7 +173,9 @@ export const App = () => {
   return (
     <div className="app">
       <nav>
-        {(["channel", "inbox", "activity", "approvals", "devices"] as const).map((v) => (
+        {(
+          ["channel", "inbox", "activity", "approvals", "search", "memory", "devices"] as const
+        ).map((v) => (
           <button key={v} className={v === view ? "active" : ""} onClick={() => setView(v)}>
             {v[0]!.toUpperCase() + v.slice(1)}
             {v === "approvals" && approvals.length > 0 && (
@@ -259,6 +262,16 @@ export const App = () => {
             resolve={(id, d) => void resolveApproval(ws, id, d)}
           />
         )}
+        {view === "search" && (
+          <SearchView
+            ws={ws}
+            openChannel={(id) => {
+              setChannelId(id);
+              setView("channel");
+            }}
+          />
+        )}
+        {view === "memory" && <MemoryView ws={ws} channels={channels} bots={bots} />}
         {view === "devices" && (
           <section>
             <h2>Devices</h2>
@@ -442,6 +455,141 @@ const ChannelView = (props: {
           </p>
         )}
       </div>
+    </section>
+  );
+};
+
+const failure = (result: { ok: false; error: { code: string; message: string } }) =>
+  `${result.error.code}: ${result.error.message}`;
+
+/**
+ * Full-text search (§14). Results come from a lagging projection, so `indexedThrough` is shown (AT-32); a message hit
+ * opens its channel.
+ */
+const SearchView = (props: { ws: string; openChannel: (channelId: string) => void }) => {
+  const [q, setQ] = useState("");
+  const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const run = async () => {
+    const res = await window.hive.api.get(inWorkspace("search", props.ws, { q }));
+    if (!res.ok) return setError(failure(res));
+    setError(null);
+    setResult(res.value);
+  };
+  const hits = (result?.hits ?? []) as Row[];
+  return (
+    <section>
+      <h2>Search</h2>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          void run();
+        }}
+      >
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Search"
+          aria-label="Query"
+        />
+        <button disabled={!q.trim()}>Search</button>
+      </form>
+      {error && <p className="error">{error}</p>}
+      {result && <p className="meta">indexed through {text(result.indexedThrough)}</p>}
+      <ul className="list">
+        {hits.map((h) => {
+          const scope = String(h.scope);
+          const channel =
+            h.sourceKind === "message" && scope.startsWith("channel:") ? scope.slice(8) : null;
+          return (
+            <li key={`${String(h.sourceKind)}:${String(h.sourceId)}`}>
+              <button disabled={!channel} onClick={() => channel && props.openChannel(channel)}>
+                <Badge state={h.sourceKind} /> {h.title ? `${text(h.title)} ` : ""}
+                {text(h.snippet)}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+};
+
+/** Memories of one scope (§13.6), newest first, and a form that writes one. */
+const MemoryView = (props: { ws: string; channels: Row[]; bots: Row[] }) => {
+  const [scope, setScope] = useState(`workspace:${props.ws}`);
+  const [memories, setMemories] = useState<Row[]>([]);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [scopeKind, scopeId] = [
+    scope.slice(0, scope.indexOf(":")),
+    scope.slice(scope.indexOf(":") + 1),
+  ];
+  const load = useCallback(async () => {
+    const res = await window.hive.api.get(
+      inWorkspace("memories", props.ws, { scopeKind, scopeId }),
+    );
+    if (!res.ok) return setError(failure(res));
+    setError(null);
+    setMemories(res.value.memories as Row[]);
+  }, [props.ws, scopeKind, scopeId]);
+  useEffect(() => void load(), [load]);
+  const write = async () => {
+    const res = await window.hive.api.command({
+      operationId: crypto.randomUUID(),
+      idempotencyKey: crypto.randomUUID(),
+      workspaceId: props.ws,
+      command: {
+        type: "memory.write",
+        scopeKind: scopeKind as "workspace",
+        scopeId,
+        content: draft,
+      },
+    });
+    if (!res.ok) return setError(failure(res));
+    setDraft("");
+    void load();
+  };
+  return (
+    <section>
+      <h2>
+        Memory{" "}
+        <select value={scope} onChange={(e) => setScope(e.target.value)} aria-label="Scope">
+          <option value={`workspace:${props.ws}`}>workspace</option>
+          {props.channels.map((c) => (
+            <option key={c.id} value={`channel:${c.id}`}>
+              # {text(c.name)}
+            </option>
+          ))}
+          {props.bots.map((b) => (
+            <option key={b.id} value={`bot:${b.id}`}>
+              bot {text(b.name)}
+            </option>
+          ))}
+        </select>
+      </h2>
+      {error && <p className="error">{error}</p>}
+      <ul className="list">
+        {memories.map((m) => (
+          <li key={m.id}>
+            <span className="meta">{text(m.createdAt)}</span> {text(m.content)}
+          </li>
+        ))}
+      </ul>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          void write();
+        }}
+      >
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="Remember…"
+          aria-label="Memory"
+        />
+        <button disabled={!draft}>Add</button>
+      </form>
     </section>
   );
 };

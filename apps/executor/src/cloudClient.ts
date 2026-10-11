@@ -11,6 +11,7 @@ import type {
   RunCommand,
   RunContext,
   RunObservation,
+  SearchResult,
 } from "@hive/contracts";
 
 // No parameter properties: Node's type stripping rejects them.
@@ -34,6 +35,8 @@ export type RunApi = {
   getTask(taskId: string): Promise<Record<string, unknown>>;
   /** The Run's own approval (§19), polled while a tool call waits for a human. */
   getApproval(approvalId: string): Promise<ApprovalStatus>;
+  /** Search limited to what the Run may read (its Workspace, Channel, Bot and Task scopes). */
+  search(q: string): Promise<SearchResult>;
 };
 
 export type CloudClient = {
@@ -169,6 +172,8 @@ export const createCloudClient = ({
           undefined,
           capabilityToken,
         ),
+      search: (q) =>
+        request("GET", `/v1/run/search?${new URLSearchParams({ q })}`, undefined, capabilityToken),
     }),
   };
 };

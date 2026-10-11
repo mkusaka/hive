@@ -947,6 +947,92 @@ export const resourceReservations = sqliteTable(
   ],
 );
 
+// ------------------------------------------------------- Memory and search
+
+export const memoryScopeKinds = ["workspace", "channel", "project", "bot", "task"] as const;
+const memorySourceKinds = ["user", "bot", "system"] as const;
+
+// Memory columns shared by the current row and its immutable revisions (docs/architecture.md §13.6).
+const memorySpec = () => ({
+  workspaceId: workspaceId(),
+  scopeKind: text("scope_kind", { enum: memoryScopeKinds }).notNull(),
+  scopeId: text("scope_id").notNull(),
+  content: text("content").notNull(),
+  sourceKind: text("source_kind", { enum: memorySourceKinds }).notNull(),
+  sourceId: text("source_id").notNull(),
+  createdByActorId: text("created_by_actor_id").notNull(),
+  revision: integer("revision").notNull(),
+  supersedesId: text("supersedes_id"),
+  deletedAt: text("deleted_at"),
+});
+
+/**
+ * current state. Explicit `memory.write` knowledge in one scope (`scope_id` is the Workspace, Channel, Project, Bot or
+ * Task id). Content never changes: a correction is a new memory that supersedes (tombstones) the old one. Deletes are
+ * tombstones (`deleted_at`, `revision` bump), copied to `memory_revisions` like every revision.
+ */
+export const memories = sqliteTable(
+  "memories",
+  {
+    id: text("id").primaryKey(),
+    ...memorySpec(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    scoped(t),
+    index("memories_scope").on(t.workspaceId, t.scopeKind, t.scopeId),
+    oneOf("memories_scope_kind", t.scopeKind, memoryScopeKinds),
+    oneOf("memories_source_kind", t.sourceKind, memorySourceKinds),
+    check("memories_content_size", sql`length(CAST(${t.content} AS BLOB)) <= 16384`),
+    foreignKey({
+      columns: [t.workspaceId, t.createdByActorId],
+      foreignColumns: [actors.workspaceId, actors.id],
+    }),
+  ],
+);
+
+/** immutable history. One copy per memory revision; no FK so it outlives the current row. */
+export const memoryRevisions = sqliteTable(
+  "memory_revisions",
+  {
+    memoryId: text("memory_id").notNull(),
+    ...memorySpec(),
+    createdAt: createdAt(),
+  },
+  (t) => [primaryKey({ columns: [t.memoryId, t.revision] })],
+);
+
+const searchSourceKinds = ["message", "task", "memory"] as const;
+
+/**
+ * rebuildable projection (docs/architecture.md §14). One row per indexed source chunk; the FTS5 table `search_fts`
+ * (hand-written migration `0012_search_fts`: external content, trigram tokenizer, sync triggers) indexes `title` and
+ * `body` by `rowid`. `scope` is the ACL scope: `workspace:<id>`, `channel:<id>`, `bot:<id>` or `task:<id>`.
+ * `source_revision` never goes backwards; a tombstone (`deleted_at`) has an empty title and body.
+ */
+export const searchDocuments = sqliteTable(
+  "search_documents",
+  {
+    rowid: integer("rowid").primaryKey(),
+    workspaceId: workspaceId(),
+    sourceKind: text("source_kind", { enum: searchSourceKinds }).notNull(),
+    sourceId: text("source_id").notNull(),
+    sourceRevision: integer("source_revision").notNull(),
+    chunkKey: text("chunk_key").notNull(),
+    title: text("title").notNull(),
+    body: text("body").notNull(),
+    scope: text("scope").notNull(),
+    deletedAt: text("deleted_at"),
+    indexedAt: text("indexed_at").notNull(),
+  },
+  (t) => [
+    unique().on(t.sourceKind, t.sourceId, t.chunkKey),
+    index("search_documents_workspace").on(t.workspaceId, t.indexedAt),
+    oneOf("search_documents_source_kind", t.sourceKind, searchSourceKinds),
+  ],
+);
+
 // ---------------------------------------------------------- Infrastructure
 
 /** immutable history. `actor_id` is the authenticated principal (actor or device id). */

@@ -81,7 +81,13 @@ describe("hive tools", () => {
   });
 
   it("offers hive_reply only for a request from another Bot, and task tools only for a Task", async () => {
-    expect(names(context)).toEqual(["hive_send_request", "hive_notify", "hive_wait_for_reply"]);
+    expect(names(context)).toEqual([
+      "hive_send_request",
+      "hive_notify",
+      "hive_wait_for_reply",
+      "hive_memory_write",
+      "hive_memory_search",
+    ]);
     expect(names(fromBot)).toContain("hive_reply");
 
     const { api, calls } = fakeRunApi();
@@ -101,6 +107,45 @@ describe("hive tools", () => {
     expect(task.calls).toEqual([
       { getTask: "task-1" },
       { type: "task.complete", taskId: "task-1", expectedRevision: 3 },
+    ]);
+  });
+});
+
+describe("memory tools", () => {
+  it("write to the Run's own bot / channel / task scope ids and search through the Run", async () => {
+    const { api, calls } = fakeRunApi();
+    const tools = hiveTools(context, api);
+    // No Task in this context: only bot and channel scopes are offered.
+    const write = tools.find((t) => t.name === "hive_memory_write")!;
+    expect(Object.keys((write.inputSchema as { scope: { enum: object } }).scope.enum)).toEqual([
+      "bot",
+      "channel",
+    ]);
+    await handler(tools, "hive_memory_write")({ content: "prefers short answers", scope: "bot" });
+    await handler(tools, "hive_memory_write")({ content: "standup at 10", scope: "channel" });
+    await handler(tools, "hive_memory_search")({ q: "standup" });
+    expect(calls).toEqual([
+      {
+        type: "memory.write",
+        scopeKind: "bot",
+        scopeId: "bot-1",
+        content: "prefers short answers",
+      },
+      { type: "memory.write", scopeKind: "channel", scopeId: "chan-1", content: "standup at 10" },
+      { search: "standup" },
+    ]);
+
+    const task = fakeRunApi();
+    const withTask = {
+      ...context,
+      task: { id: "task-1", key: "APP-1", title: "t", description: "" },
+    };
+    await handler(
+      hiveTools(withTask, task.api),
+      "hive_memory_write",
+    )({ content: "x", scope: "task" });
+    expect(task.calls).toEqual([
+      { type: "memory.write", scopeKind: "task", scopeId: "task-1", content: "x" },
     ]);
   });
 });
@@ -197,6 +242,8 @@ describe("claudeAdapter with hive tools", () => {
       "mcp__hive__hive_send_request",
       "mcp__hive__hive_notify",
       "mcp__hive__hive_wait_for_reply",
+      "mcp__hive__hive_memory_write",
+      "mcp__hive__hive_memory_search",
     ]);
     expect(options).toMatchObject({ tools: [], permissionMode: "default", strictMcpConfig: true });
     expect(Object.keys(options.mcpServers ?? {})).toEqual(["hive"]);
@@ -233,5 +280,39 @@ describe("claudeAdapter with hive tools", () => {
     await agent.waitForExit();
     expect(calls[0]!.prompt).toContain("Request from bot asker (request):\nwhat is 2+2?");
     expect(calls[0]!.prompt).toContain("Replies to your requests:\n[bot math] 4");
+  });
+
+  it("renders Memory and Related before the request", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hive-tools-"));
+    const calls: { prompt: string }[] = [];
+    const queryFn: QueryFn = async function* (params) {
+      calls.push(params);
+      yield* [] as SDKMessage[];
+    };
+    const agent = await claudeAdapter({ stateDir: dir, queryFn }).start({
+      runId: "run-3",
+      jobId: "job-3",
+      executionGeneration: 1,
+      inboxItemId: "inbox-1",
+      context: {
+        ...context,
+        memories: [{ id: "m-1", scopeKind: "bot", content: "staging is stage-3", createdAt: "" }],
+        related: [
+          {
+            sourceKind: "message",
+            sourceId: "msg-0",
+            title: "",
+            snippet: "the [staging] deploy failed",
+          },
+        ],
+      },
+      run: null,
+      observe: async () => {},
+    });
+    await agent.waitForExit();
+    const prompt = calls[0]!.prompt;
+    expect(prompt).toContain("Memory:\n- (bot) staging is stage-3");
+    expect(prompt).toContain("Related:\n- (message) the [staging] deploy failed");
+    expect(prompt.indexOf("Related:")).toBeLessThan(prompt.indexOf("Request:"));
   });
 });

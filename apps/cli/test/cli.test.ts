@@ -546,3 +546,39 @@ describe("tools and approvals", () => {
     expect(h.out.map((line) => (JSON.parse(line) as { id: string }).id)).toEqual(["a-1", "a-2"]);
   });
 });
+
+describe("search and memory", () => {
+  it("search / memory write / list / delete", async () => {
+    const h = harness(() => Response.json({ hits: [], memories: [], indexedThrough: null }), {
+      stdin: "from stdin",
+    });
+    expect(await h.hive("search", "レビュー", "--kinds", "message,task")).toBe(0);
+    expect(h.calls[0]!.path).toBe(
+      `/v1/search?workspaceId=ws-1&q=${encodeURIComponent("レビュー")}&kinds=message%2Ctask`,
+    );
+    expect(await h.hive("memory", "write", "--scope", "bot:b-1", "--content", "x")).toBe(0);
+    expect(commandOf(h.calls[1]!)).toEqual({
+      type: "memory.write",
+      scopeKind: "bot",
+      scopeId: "b-1",
+      content: "x",
+    });
+    expect(await h.hive("memory", "write", "--scope", "workspace", "--file", "-")).toBe(0);
+    expect(commandOf(h.calls[2]!)).toMatchObject({
+      scopeKind: "workspace",
+      scopeId: "ws-1",
+      content: "from stdin",
+    });
+    expect(await h.hive("memory", "list", "--scope", "channel:c-1")).toBe(0);
+    expect(h.calls[3]!.path).toBe("/v1/memories?workspaceId=ws-1&scopeKind=channel&scopeId=c-1");
+    expect(await h.hive("memory", "delete", "m-1")).toBe(0);
+    expect(commandOf(h.calls[4]!)).toEqual({
+      type: "memory.delete",
+      memoryId: "m-1",
+      expectedRevision: 1,
+    });
+    expect(await h.hive("memory", "write", "--scope", "bot", "--content", "x")).toBe(2);
+    expect(await h.hive("memory", "write", "--scope", "workspace")).toBe(2);
+    expect(await h.hive("search")).toBe(2);
+  });
+});

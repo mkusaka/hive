@@ -150,6 +150,40 @@ export const hiveTools = (context: RunContext, run: RunApi) => {
       ),
     );
   }
+  // Memory (§13.6): only the Run's own scopes; Workspace scope is a promotion the Run cannot make (AT-33).
+  const scopes: Record<string, string> = { bot: context.bot.id };
+  if (task) scopes.task = task.id;
+  if (context.conversation) scopes.channel = context.conversation.channelId;
+  const scopeKinds = Object.keys(scopes) as [string, ...string[]];
+  tools.push(
+    tool(
+      "hive_memory_write",
+      `Remember a fact for later runs, in scope ${scopeKinds.join(" / ")}: bot = only you, task = this Task, ` +
+        "channel = everyone in this conversation's channel.",
+      {
+        content: z
+          .string()
+          .min(1)
+          .max(16 * 1024),
+        scope: z.enum(scopeKinds),
+      },
+      async (args) =>
+        cloud(() =>
+          run.command({
+            type: "memory.write",
+            scopeKind: args.scope as "bot" | "task" | "channel",
+            scopeId: scopes[args.scope]!,
+            content: args.content,
+          }),
+        ),
+    ),
+    tool(
+      "hive_memory_search",
+      "Search memories, messages and tasks you may read (3+ characters for full-text search).",
+      { q: z.string().min(1).max(200) },
+      async (args) => cloud(() => run.search(args.q)),
+    ),
+  );
   return tools;
 };
 

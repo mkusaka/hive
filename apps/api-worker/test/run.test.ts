@@ -82,7 +82,13 @@ describe("run capability", () => {
       .bind(run.runId)
       .first<{ token_hash: string; scopes: string; expires_at: string }>();
     expect(row!.token_hash).toBe(await hashSecret(token.split(".")[2]!));
-    expect(JSON.parse(row!.scopes)).toEqual(["agent.send", "agent.reply", "task.read"]);
+    expect(JSON.parse(row!.scopes)).toEqual([
+      "agent.send",
+      "agent.reply",
+      "task.read",
+      "memory.write",
+      "search.read",
+    ]);
 
     const me = await s.as(token).get("/v1/run/me");
     expect(me.status).toBe(200);
