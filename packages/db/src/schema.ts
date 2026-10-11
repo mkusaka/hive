@@ -91,6 +91,21 @@ export const sidebarPrefs = sqliteTable(
   ],
 );
 
+/** current state. One FCM registration token per app instance, owned by its user rather than a Workspace. */
+export const mobilePushTokens = sqliteTable(
+  "mobile_push_tokens",
+  {
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    instanceId: text("instance_id").notNull(),
+    token: text("token").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [primaryKey({ columns: [t.userId, t.instanceId] }), unique().on(t.token)],
+);
+
 const actorKinds = ["user", "bot", "service"] as const;
 
 /** current state */

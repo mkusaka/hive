@@ -15,6 +15,8 @@
     "@hive/cli": "workspace:*",
     "@hive/contracts": "workspace:*",
     "@hive/executor": "workspace:*",
+    "@hive/sync": "workspace:*",
+    "@hive/ui-text": "workspace:*",
     "@tiptap/core": "3.31.4",
     "@tiptap/extension-mention": "3.31.4",
     "@tiptap/extension-placeholder": "3.31.4",

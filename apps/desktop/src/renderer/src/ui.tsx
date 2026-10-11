@@ -1,6 +1,6 @@
 // Shared renderer helpers: API access, small presentational pieces (badge, avatar blob, stroke icons, menu).
 import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { avatarColor } from "./format.ts";
+import { avatarColor } from "@hive/ui-text";
 
 export type Row = Record<string, unknown> & { id: string };
 

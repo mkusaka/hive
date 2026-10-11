@@ -290,12 +290,17 @@ export const AgentSend = v.strictObject({
 /** A Bot mention inside a message body (Slack's `<@U123>`, namespaced): stored by id, shown by name. */
 export const mentionToken = (botId: string) => `<@bot:${botId}>`;
 const mentionPattern = /<@bot:([^>\s]+)>/g;
+const userMentionPattern = /<@user:([^>\s]+)>/g;
 /** The mentioned Bot ids, each once, in order of first appearance. */
 export const mentionedBotIds = (text: string) => [
   ...new Set(Array.from(text.matchAll(mentionPattern), (m) => m[1]!)),
 ];
 /** Addresses every member Bot of the Channel (ROUTE-02); `@everyone` / `@all` in the composer. */
 export const everyoneToken = "<@everyone>";
+/** The mentioned User ids, each once, in order of first appearance. */
+export const mentionedUserIds = (text: string) => [
+  ...new Set(Array.from(text.matchAll(userMentionPattern), (m) => m[1]!)),
+];
 /** Tokens → `@name`, `@unknown` for an id `names` does not know; `<@everyone>` → `@everyone`. */
 export const renderMentions = (text: string, names: ReadonlyMap<string, string>) =>
   text
@@ -337,9 +342,10 @@ export type AttachmentSummary = { id: string; name: string; contentType: string;
  * A user's Channel message (docs/architecture.md §7.2). In a Channel's main conversation every member Bot gets the
  * Inbox item + Job that `agent.send` with `request` / `wake` gives (ROUTE-02, group chat); a `<@bot:ID>` mention or a
  * Reply on a Bot's message narrows that to the addressed Bots (a mentioned non-member joins), `<@everyone>` is every
- * member; a Bot with a queued or active Job there gets no second Job. `mentions`, when given, must equal the tokens. With `conversationId` (a DM) instead of `channelId`, the DM's Bot is always the recipient.
- * `threadOf` (a message of that Channel / DM) posts the reply in the message's thread, created on the first reply;
- * in a Channel thread every Bot that already took part in it is woken too, mentioned or not.
+ * member; a Bot with a queued or active Job there gets no second Job. User mention tokens notify Channel members.
+ * `mentions`, when given, must equal the Bot tokens. With `conversationId` (a DM) instead of `channelId`, the DM's
+ * Bot is always the recipient. `threadOf` (a message of that Channel / DM) posts the reply in the message's thread,
+ * created on the first reply; in a Channel thread every Bot that already took part in it is woken too, mentioned or not.
  */
 export const MessagePost = v.pipe(
   v.strictObject({

@@ -3,7 +3,7 @@
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { FilterExpression, parse, type FilterExpression as Filter } from "@hive/contracts";
 import type { ExecutorProvider, UiCommand } from "../../shared/api.ts";
-import { type Schedule, scheduleLine } from "./format.ts";
+import { type Schedule, scheduleLine } from "@hive/ui-text";
 import { Avatar, failure, Icon, inWorkspace, MemoryList, Menu, type Row, text } from "./ui.tsx";
 import { SetUpPc } from "./welcome.tsx";
 

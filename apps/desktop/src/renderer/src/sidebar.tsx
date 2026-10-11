@@ -4,7 +4,7 @@
 import type { SidebarPrefs } from "@hive/contracts";
 import { useCallback, useEffect, useRef, useState, type DragEvent, type ReactNode } from "react";
 import { Inlines, type Names } from "./chat.tsx";
-import { parseInline } from "./format.ts";
+import { parseInline } from "@hive/ui-text";
 import { Avatar, Icon, Menu, type Row, text } from "./ui.tsx";
 
 export type View =

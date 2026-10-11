@@ -1,10 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  avatarColor,
-  parseInline,
-  parseMarkdown,
-  scheduleLine,
-} from "../src/renderer/src/format.ts";
+import { avatarColor, parseInline, parseMarkdown, scheduleLine } from "@hive/ui-text";
 
 const p = (text: string) => ({ kind: "p", inlines: [{ kind: "text", text }] });
 

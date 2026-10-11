@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ApiResult } from "../src/shared/api.ts";
-import { allLists, createSync, type ListKey, type SyncStatus } from "../src/renderer/src/sync.ts";
+import { allLists, createSync, type ApiResult, type ListKey, type SyncStatus } from "@hive/sync";
 
 const ok = (value: Record<string, unknown>): ApiResult => ({ ok: true, value });
 const page = (cursor: string, changes: { scope: string; entityKind: string }[], hasMore = false) =>
@@ -108,5 +107,37 @@ describe("sync controller", () => {
     await h.sync.hint();
     expect(h.statuses.at(-1)).toMatchObject({ cursor: "H0", unsynced: 1 });
     expect(h.statuses.at(-1)?.error).toContain("down");
+  });
+
+  it("does not advance the cursor when an asynchronous list refresh fails, so foreground sync retries the change", async () => {
+    const statuses: SyncStatus[] = [];
+    const paths: string[] = [];
+    let fail = false;
+    const sync = createSync({
+      workspaceId: "ws-1",
+      get: async (path) => {
+        paths.push(path);
+        return path.includes("cursor=")
+          ? page("C1", [{ scope: "channel:ch-1", entityKind: "message" }])
+          : page("H0", []);
+      },
+      refetch: async () => {
+        if (fail) throw new Error("list unavailable");
+      },
+      onStatus: (status) => {
+        statuses.push(status);
+      },
+    });
+    await sync.pull();
+    fail = true;
+    await sync.hint();
+    expect(statuses.at(-1)).toMatchObject({ cursor: "H0", unsynced: 1 });
+    fail = false;
+    await sync.pull();
+    expect(paths.slice(1)).toEqual([
+      "/v1/sync/changes?workspaceId=ws-1&cursor=H0",
+      "/v1/sync/changes?workspaceId=ws-1&cursor=H0",
+    ]);
+    expect(statuses.at(-1)).toEqual({ cursor: "C1", unsynced: 0, error: null });
   });
 });

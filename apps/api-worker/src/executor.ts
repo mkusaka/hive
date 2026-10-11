@@ -203,11 +203,13 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
   if (!row) throw new HttpError("NOT_FOUND", "job not found");
   const channelAccess = await db
     .prepare(
-      `SELECT c.kind, m.role FROM jobs j
+      `SELECT parent.kind, m.role FROM jobs j
          LEFT JOIN inbox_items i ON i.workspace_id = j.workspace_id AND j.trigger_key = 'inbox:' || i.id
          LEFT JOIN conversations c ON c.workspace_id = i.workspace_id AND c.id = i.conversation_id
+         LEFT JOIN conversations parent ON parent.workspace_id = c.workspace_id
+                                       AND parent.id = COALESCE(c.parent_conversation_id, c.id)
          JOIN bots b ON b.workspace_id = j.workspace_id AND b.id = j.bot_id
-         LEFT JOIN channel_members m ON m.workspace_id = b.workspace_id AND m.channel_id = c.channel_id
+         LEFT JOIN channel_members m ON m.workspace_id = b.workspace_id AND m.channel_id = parent.channel_id
                                     AND m.actor_id = b.actor_id
         WHERE j.workspace_id = ? AND j.id = ?`,
     )
@@ -847,13 +849,20 @@ export const getRunContext = async (
   ) {
     const membership = await db
       .prepare(
-        `SELECT m.role FROM bots b LEFT JOIN channel_members m
-           ON m.workspace_id = b.workspace_id AND m.channel_id = ? AND m.actor_id = b.actor_id
+        `SELECT parent.kind, m.role FROM bots b
+         JOIN conversations c ON c.workspace_id = b.workspace_id AND c.id = ?
+         JOIN conversations parent ON parent.workspace_id = c.workspace_id
+                                  AND parent.id = COALESCE(c.parent_conversation_id, c.id)
+         LEFT JOIN channel_members m ON m.workspace_id = b.workspace_id
+                                    AND m.channel_id = parent.channel_id AND m.actor_id = b.actor_id
          WHERE b.workspace_id = ? AND b.id = ?`,
       )
-      .bind(row.channel_id, workspaceId, row.bot_id)
-      .first<{ role: string | null }>();
-    if (!membership || membership.role === null || membership.role === "viewer") {
+      .bind(row.conversation_id, workspaceId, row.bot_id)
+      .first<{ kind: string; role: string | null }>();
+    if (
+      !membership ||
+      (membership.kind !== "dm" && (membership.role === null || membership.role === "viewer"))
+    ) {
       throw new HttpError("FORBIDDEN", "viewer bots cannot run channel jobs");
     }
   }

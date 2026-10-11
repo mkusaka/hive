@@ -1,7 +1,15 @@
 // Pure formatting for the chat UI: a small safe Markdown subset (as data, rendered by React without HTML), Routine
 // schedule lines and avatar colors.
 import type { FilterExpression } from "@hive/contracts";
-import type { JSONContent } from "@tiptap/core";
+
+/** The editor's JSON data shape; no editor, DOM or native runtime dependency. */
+type JSONContent = {
+  type?: string;
+  text?: string;
+  attrs?: Record<string, unknown>;
+  marks?: { type: string }[];
+  content?: JSONContent[];
+};
 
 /** The mention id of `<@everyone>`: every member Bot of the Channel (ROUTE-02). */
 export const everyone = "everyone";

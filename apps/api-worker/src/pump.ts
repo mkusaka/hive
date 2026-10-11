@@ -260,10 +260,12 @@ export const routeEvent = async (db: D1Database, eventId: string): Promise<Notif
   if (data.channelId) {
     const member = await db
       .prepare(
-        `SELECT c.kind, m.role FROM conversations c
+        `SELECT parent.kind, m.role FROM conversations c
            JOIN bots b ON b.workspace_id = c.workspace_id AND b.id = ?
+           JOIN conversations parent ON parent.workspace_id = c.workspace_id
+                                    AND parent.id = COALESCE(c.parent_conversation_id, c.id)
            LEFT JOIN channel_members m ON m.workspace_id = b.workspace_id AND m.actor_id = b.actor_id
-                                      AND m.channel_id = c.channel_id
+                                      AND m.channel_id = parent.channel_id
           WHERE c.workspace_id = ? AND c.id = ?`,
       )
       .bind(data.recipientBotId, workspaceId, data.conversationId)

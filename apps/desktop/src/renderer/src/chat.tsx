@@ -17,7 +17,7 @@ import {
   useState,
 } from "react";
 import type { AttachmentTarget } from "../../shared/api.ts";
-import { everyone, type Inline, parseMarkdown, toMarkdown } from "./format.ts";
+import { everyone, type Inline, parseMarkdown, toMarkdown } from "@hive/ui-text";
 import { Avatar, Icon, type Row, text } from "./ui.tsx";
 
 /** Bot id → name, for mention tokens. */

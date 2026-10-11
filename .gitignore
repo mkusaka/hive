@@ -157,3 +157,12 @@ infra/.terraform/
 infra/*.tfstate*
 infra/*.tfvars
 !infra/example.tfvars
+
+# Expo native output and local Android smoke environment
+apps/mobile/.expo/
+apps/mobile/android/
+apps/mobile/ios/
+apps/mobile/.android-sdk/
+apps/mobile/.android/
+apps/mobile/.gradle/
+apps/mobile/google-services.json

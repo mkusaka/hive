@@ -7,5 +7,6 @@ declare namespace Cloudflare {
     ACCESS_AUD: string;
     TEST_MIGRATIONS: import("cloudflare:test").D1Migration[];
     COLLECT_MIGRATION: string;
+    FCM_SERVICE_ACCOUNT_JSON?: string;
   }
 }

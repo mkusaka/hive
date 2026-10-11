@@ -824,6 +824,10 @@ the sidebar Status indicator turn amber. An old sync head in an idle Workspace i
 Search `indexedThrough` is the latest indexed timestamp (the same marker as search results); `lagMs` is the
 age of the oldest outstanding indexing outbox row, zero when indexing has no backlog.
 
+Implemented as (MOBILE-01): `packages/sync` is the portable controller shared by desktop and Android. HTTP and
+list refresh are injected; refresh is awaited before committing a cursor, so failed list reads are retried.
+Android closes realtime while backgrounded, pulls HTTP on every foreground transition and reconciles periodically.
+
 ### 12.4 Authorization and connections (§15.4)
 
 - Being in a Workspace does not mean receiving signals for all private Channels. Each connection records its
@@ -1354,6 +1358,26 @@ external session to a Task. Usage / failure / artifact rollups and token attribu
   HTTPS on open. Notification payloads carry only identifiers and minimal display info, never secrets or approval
   credentials. Push is never the sync source of truth [S25]. Always-on WebSocket is not guaranteed (force-stop,
   battery control). Approval validity is checked when the API receives the answer, not at notification time.
+
+### Implemented as (MOBILE-01)
+
+`apps/mobile` is an Expo-managed Android client with plain navigation: Welcome/system-browser sign-in, workspace
+selection, Channels/DMs with sidebar preferences, Markdown conversations and threads, approvals, Activity/cancel,
+Search, read-only Task/Run details and confirmed sign-out. `packages/ui-text` replaces the desktop-local formatter;
+both native and React views render its data without injecting HTML.
+
+`packages/access` holds fetch-based discovery/DCR/PKCE/exchange/refresh without Node imports; CLI/desktop retain the
+loopback listener. Android supplies Expo Crypto PKCE primitives and stores grants in SecureStore. The primary redirect
+is an HTTPS App Link at `/mobile/callback`, with the public `/.well-known/assetlinks.json` association from configured
+package/signing fingerprints; a dev-only `hive://callback` build flag is available. G-03 (real Access/App Links/refresh)
+is not executed.
+
+`mobile_push_tokens` (migration 0029) binds native FCM tokens to user/app instances. The Worker sends FCM HTTP v1 using
+`FCM_SERVICE_ACCOUNT_JSON`; absent secret disables push only. Approval requests, authorized `<@user:USER_ID>` mentions,
+and Bot replies in DMs/DM threads produce identifier-only data `{kind, id}` and generic visible text. Notification taps
+pull HTTP and resolve an ACL-checked `/v1/mobile/targets/:kind/:id` before navigating. Push never carries approval
+credentials or authorizes an answer; `approval.resolve` still checks expiry, generation and one-use validity.
+Android has no Agent Runtime and performs no executor-device registration.
 
 ## 22. API contract (§25)
 

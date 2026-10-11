@@ -2,7 +2,7 @@
 import { act, fireEvent, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { dayLabel, mentionItems } from "../../src/renderer/src/chat.tsx";
-import { parseMarkdown, toMarkdown } from "../../src/renderer/src/format.ts";
+import { parseMarkdown, toMarkdown } from "@hive/ui-text";
 import { renderApp, sidebar } from "./fakeHive.ts";
 import { channels, messages } from "./fixtures.ts";
 

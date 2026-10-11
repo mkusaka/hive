@@ -16,6 +16,7 @@
     "./service": "./src/service.ts"
   },
   "dependencies": {
+    "@hive/access": "workspace:*",
     "@hive/contracts": "workspace:*",
     "@hive/executor": "workspace:*",
     "oauth4webapi": "3.8.8"

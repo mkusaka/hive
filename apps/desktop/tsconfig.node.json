@@ -3,14 +3,6 @@
   "compilerOptions": {
     "types": ["node"]
   },
-  "include": [
-    "src/main",
-    "src/preload",
-    "src/shared",
-    "src/renderer/src/sync.ts",
-    "src/renderer/src/format.ts",
-    "test",
-    "*.ts"
-  ],
+  "include": ["src/main", "src/preload", "src/shared", "src/renderer/src/sync.ts", "test", "*.ts"],
   "exclude": ["test/ui"]
 }
