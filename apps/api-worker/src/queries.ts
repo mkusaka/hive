@@ -1,4 +1,5 @@
 // Read routes for a user principal, scoped to the user's Workspaces (docs/architecture.md §22.2).
+import { displayState } from "@hive/db";
 import { HttpError } from "./errors.ts";
 
 const notFound = (what: string) => new HttpError("NOT_FOUND", `${what} not found`);
@@ -42,8 +43,8 @@ export const getJob = async (db: D1Database, wsIds: string[], id: string) => {
   if (wsIds.length === 0) throw notFound("job");
   const job = await db
     .prepare(
-      `SELECT id, workspace_id AS workspaceId, bot_id AS botId, state, revision, trigger_key AS triggerKey,
-              placement, created_at AS createdAt, updated_at AS updatedAt
+      `SELECT id, workspace_id AS workspaceId, bot_id AS botId, task_id AS taskId, state, revision,
+              trigger_key AS triggerKey, placement, created_at AS createdAt, updated_at AS updatedAt
          FROM jobs WHERE id = ? AND workspace_id IN (${placeholders(wsIds)})`,
     )
     .bind(id, ...wsIds)
@@ -114,7 +115,7 @@ export const listDevices = async (db: D1Database, workspaceId: string) => {
 export const listJobs = async (db: D1Database, workspaceId: string, limit: number) => {
   const { results } = await db
     .prepare(
-      `SELECT id, bot_id AS botId, state, revision, trigger_key AS triggerKey,
+      `SELECT id, bot_id AS botId, task_id AS taskId, state, revision, trigger_key AS triggerKey,
               created_at AS createdAt, updated_at AS updatedAt
          FROM jobs WHERE workspace_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`,
     )
@@ -149,4 +150,141 @@ export const listMessages = async (
     .bind(input.workspaceId, input.channelId, input.limit)
     .all();
   return { messages: results };
+};
+
+// ------------------------------------------------- Projects and Tasks (§4)
+
+export const listProjects = async (db: D1Database, workspaceId: string) => {
+  const { results } = await db
+    .prepare(
+      `SELECT id, key, name, status, primary_channel_id AS primaryChannelId, created_at AS createdAt,
+              updated_at AS updatedAt
+         FROM projects WHERE workspace_id = ? ORDER BY key LIMIT 500`,
+    )
+    .bind(workspaceId)
+    .all();
+  return { projects: results };
+};
+
+const taskStatuses = ["pending", "in_progress", "completed", "cancelled"];
+const taskColumns = `t.id, t.workspace_id AS workspaceId, t.project_id AS projectId, p.key AS projectKey,
+  t.parent_task_id AS parentTaskId, t.key, t.title, t.description, t.status, t.assignee_kind, t.assignee_id,
+  t.priority, t.revision, t.scope_revision AS scopeRevision, t.completion_policy AS completionPolicy,
+  t.created_at AS createdAt, t.updated_at AS updatedAt`;
+type TaskRow = {
+  id: string;
+  status: string;
+  assignee_kind: string | null;
+  assignee_id: string | null;
+};
+type Prerequisite = { dependentId: string; id: string; key: string; status: string };
+
+/** `display` is computed (§4.1): the status, or `ready` / `blocked` while `pending`. */
+const toTask = (
+  { assignee_kind, assignee_id, ...task }: TaskRow,
+  prerequisites: Prerequisite[],
+) => {
+  const prereqs = prerequisites.map(({ id, key, status }) => ({ id, key, status }));
+  return {
+    ...task,
+    assignee: assignee_kind ? { kind: assignee_kind, id: assignee_id } : null,
+    display: displayState(task, prereqs),
+    prerequisites: prereqs,
+  };
+};
+
+const prerequisitesOf = async (db: D1Database, workspaceId: string, dependentId?: string) =>
+  (
+    await db
+      .prepare(
+        `SELECT d.dependent_task_id AS dependentId, p.id, p.key, p.status FROM task_dependencies d
+           JOIN tasks p ON p.workspace_id = d.workspace_id AND p.id = d.prerequisite_task_id
+          WHERE d.workspace_id = ? ${dependentId ? "AND d.dependent_task_id = ?" : ""}
+          ORDER BY p.key`,
+      )
+      .bind(workspaceId, ...(dependentId ? [dependentId] : []))
+      .all<Prerequisite>()
+  ).results;
+
+// ponytail: bounded at 500 Tasks and reads the Workspace's whole dependency table; page with a cursor later.
+export const listTasks = async (
+  db: D1Database,
+  workspaceId: string,
+  filter: { projectKey?: string; status?: string },
+) => {
+  if (filter.status !== undefined && !taskStatuses.includes(filter.status)) {
+    throw new HttpError("INVALID_INPUT", `status must be one of ${taskStatuses.join(", ")}`);
+  }
+  const { results } = await db
+    .prepare(
+      `SELECT ${taskColumns} FROM tasks t
+         LEFT JOIN projects p ON p.workspace_id = t.workspace_id AND p.id = t.project_id
+        WHERE t.workspace_id = ? AND (? IS NULL OR p.key = ?) AND (? IS NULL OR t.status = ?)
+        ORDER BY t.created_at, t.id LIMIT 500`,
+    )
+    .bind(
+      workspaceId,
+      filter.projectKey ?? null,
+      filter.projectKey ?? null,
+      filter.status ?? null,
+      filter.status ?? null,
+    )
+    .all<TaskRow>();
+  const prerequisites = await prerequisitesOf(db, workspaceId);
+  return {
+    tasks: results.map((task) =>
+      toTask(
+        task,
+        prerequisites.filter((p) => p.dependentId === task.id),
+      ),
+    ),
+  };
+};
+
+/** One Task with its prerequisites, dependents, Results and Jobs. */
+export const getTask = async (db: D1Database, wsIds: string[], id: string) => {
+  if (wsIds.length === 0) throw notFound("task");
+  const task = await db
+    .prepare(
+      `SELECT ${taskColumns} FROM tasks t
+         LEFT JOIN projects p ON p.workspace_id = t.workspace_id AND p.id = t.project_id
+        WHERE t.id = ? AND t.workspace_id IN (${placeholders(wsIds)})`,
+    )
+    .bind(id, ...wsIds)
+    .first<TaskRow & { workspaceId: string }>();
+  if (!task) throw notFound("task");
+  const { workspaceId } = task;
+  const [prerequisites, dependents, results, jobs] = await Promise.all([
+    prerequisitesOf(db, workspaceId, id),
+    db
+      .prepare(
+        `SELECT t.id, t.key, t.status FROM task_dependencies d
+           JOIN tasks t ON t.workspace_id = d.workspace_id AND t.id = d.dependent_task_id
+          WHERE d.workspace_id = ? AND d.prerequisite_task_id = ? ORDER BY t.key`,
+      )
+      .bind(workspaceId, id)
+      .all(),
+    db
+      .prepare(
+        `SELECT id, execution_id AS executionId, run_id AS runId, scope_revision AS scopeRevision, state,
+                summary, created_at AS createdAt
+           FROM task_results WHERE workspace_id = ? AND task_id = ? ORDER BY created_at, id`,
+      )
+      .bind(workspaceId, id)
+      .all(),
+    db
+      .prepare(
+        `SELECT id, bot_id AS botId, state, revision, trigger_key AS triggerKey, created_at AS createdAt,
+                updated_at AS updatedAt
+           FROM jobs WHERE workspace_id = ? AND task_id = ? ORDER BY created_at, id`,
+      )
+      .bind(workspaceId, id)
+      .all(),
+  ]);
+  return {
+    ...toTask(task, prerequisites),
+    dependents: dependents.results,
+    results: results.results,
+    jobs: jobs.results,
+  };
 };

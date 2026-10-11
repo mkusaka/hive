@@ -252,7 +252,137 @@ export const bots = sqliteTable(
   ],
 );
 
-// ------------------------------------------------------------------ Inputs
+// -------------------------------------------------------------------- Work
+
+const projectStatuses = ["active", "paused", "archived"] as const;
+
+/** current state. `task_counter` numbers the Project's Task keys (`<key>-<n>`). */
+export const projects = sqliteTable(
+  "projects",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    key: text("key").notNull(),
+    name: text("name").notNull(),
+    status: text("status", { enum: projectStatuses }).notNull().default("active"),
+    // Default notification target only; grants nothing (docs/architecture.md §2.1).
+    primaryChannelId: text("primary_channel_id"),
+    taskCounter: integer("task_counter").notNull().default(0),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    scoped(t),
+    unique().on(t.workspaceId, t.key),
+    oneOf("projects_status", t.status, projectStatuses),
+    foreignKey({
+      columns: [t.workspaceId, t.primaryChannelId],
+      foreignColumns: [channels.workspaceId, channels.id],
+    }),
+  ],
+);
+
+export const taskStatuses = ["pending", "in_progress", "completed", "cancelled"] as const;
+export const completionPolicies = ["declaration", "human", "checks", "children"] as const;
+const assigneeKinds = ["user", "bot"] as const;
+
+/**
+ * current state (docs/architecture.md §3.2, §4). `blocked` / `ready` are computed (dag.ts), never stored.
+ * `revision` bumps on every edit; `scope_revision` on requirement / dependency changes.
+ */
+export const tasks = sqliteTable(
+  "tasks",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    projectId: text("project_id"),
+    parentTaskId: text("parent_task_id"),
+    key: text("key").notNull(),
+    title: text("title").notNull(),
+    description: text("description").notNull().default(""),
+    status: text("status", { enum: taskStatuses }).notNull().default("pending"),
+    assigneeKind: text("assignee_kind", { enum: assigneeKinds }),
+    assigneeId: text("assignee_id"),
+    priority: integer("priority").notNull().default(0),
+    revision: integer("revision").notNull().default(1),
+    scopeRevision: integer("scope_revision").notNull().default(1),
+    completionPolicy: text("completion_policy", { enum: completionPolicies })
+      .notNull()
+      .default("declaration"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    scoped(t),
+    unique().on(t.workspaceId, t.key),
+    oneOf("tasks_status", t.status, taskStatuses),
+    oneOf("tasks_assignee_kind", t.assigneeKind, assigneeKinds),
+    check("tasks_assignee", sql`(${t.assigneeKind} IS NULL) = (${t.assigneeId} IS NULL)`),
+    oneOf("tasks_completion_policy", t.completionPolicy, completionPolicies),
+    foreignKey({
+      columns: [t.workspaceId, t.projectId],
+      foreignColumns: [projects.workspaceId, projects.id],
+    }),
+    foreignKey({ columns: [t.workspaceId, t.parentTaskId], foreignColumns: [t.workspaceId, t.id] }),
+  ],
+);
+
+/** current state. Start dependency: `dependent` starts after `prerequisite` completes (§2.2). */
+export const taskDependencies = sqliteTable(
+  "task_dependencies",
+  {
+    workspaceId: workspaceId(),
+    prerequisiteTaskId: text("prerequisite_task_id").notNull(),
+    dependentTaskId: text("dependent_task_id").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.prerequisiteTaskId, t.dependentTaskId] }),
+    index("task_dependencies_dependent").on(t.dependentTaskId),
+    check("task_dependencies_not_self", sql`${t.prerequisiteTaskId} <> ${t.dependentTaskId}`),
+    foreignKey({
+      columns: [t.workspaceId, t.prerequisiteTaskId],
+      foreignColumns: [tasks.workspaceId, tasks.id],
+    }),
+    foreignKey({
+      columns: [t.workspaceId, t.dependentTaskId],
+      foreignColumns: [tasks.workspaceId, tasks.id],
+    }),
+  ],
+);
+
+const resultStates = ["succeeded", "failed"] as const;
+
+/** immutable history. One per submitted Run of a Task Job, for the Execution's scope revision. */
+export const taskResults = sqliteTable(
+  "task_results",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    taskId: text("task_id").notNull(),
+    executionId: text("execution_id").notNull(),
+    runId: text("run_id").notNull(),
+    scopeRevision: integer("scope_revision").notNull(),
+    state: text("state", { enum: resultStates }).notNull(),
+    summary: text("summary").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("task_results_task").on(t.taskId),
+    oneOf("task_results_state", t.state, resultStates),
+    foreignKey({
+      columns: [t.workspaceId, t.taskId],
+      foreignColumns: [tasks.workspaceId, tasks.id],
+    }),
+    foreignKey({
+      columns: [t.workspaceId, t.executionId],
+      foreignColumns: [executions.workspaceId, executions.id],
+    }),
+    foreignKey({ columns: [t.workspaceId, t.runId], foreignColumns: [runs.workspaceId, runs.id] }),
+  ],
+);
+
+// ----------------------------------------------------------------- Inputs
 
 /** immutable history. Envelope columns of @hive/contracts `eventEnvelope`. */
 export const events = sqliteTable(
@@ -398,6 +528,9 @@ export const jobs = sqliteTable(
     triggerKey: text("trigger_key").notNull(),
     placement: text("placement", { mode: "json" }).notNull(),
     inboxBatchId: text("inbox_batch_id"),
+    // Explicit Task Jobs (job.start). Added by ALTER TABLE, which can only add a single-column FK: a composite
+    // (workspace_id, task_id) FK would rebuild `jobs`, and dropping it fails on the `runs` rows that reference it.
+    taskId: text("task_id").references((): AnySQLiteColumn => tasks.id),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -468,7 +601,10 @@ export const runs = sqliteTable(
 
 const executionStates = ["active", "submitted", "finished", "failed", "interrupted"] as const;
 
-/** current state. Minimal for Phase 1; tasks arrive with WORK-01. */
+/**
+ * current state. A Run working on a Task: `task_id` and the Task's `scope_revision` are copied from the Job at
+ * claim time, so a Result is for the requirements the Run started on.
+ */
 export const executions = sqliteTable(
   "executions",
   {
@@ -476,6 +612,7 @@ export const executions = sqliteTable(
     workspaceId: workspaceId(),
     runId: text("run_id").notNull(),
     taskId: text("task_id"),
+    taskScopeRevision: integer("task_scope_revision"),
     state: text("state", { enum: executionStates }).notNull().default("active"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
@@ -485,6 +622,10 @@ export const executions = sqliteTable(
     index("executions_run").on(t.runId),
     oneOf("executions_state", t.state, executionStates),
     foreignKey({ columns: [t.workspaceId, t.runId], foreignColumns: [runs.workspaceId, runs.id] }),
+    foreignKey({
+      columns: [t.workspaceId, t.taskId],
+      foreignColumns: [tasks.workspaceId, tasks.id],
+    }),
   ],
 );
 

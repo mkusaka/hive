@@ -29,6 +29,20 @@
       "when": 1791681509724,
       "tag": "0003_change_log",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1791683868656,
+      "tag": "0004_work",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1791683869503,
+      "tag": "0005_execution_task_fk",
+      "breakpoints": true
     }
   ]
 }

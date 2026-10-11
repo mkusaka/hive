@@ -10,6 +10,7 @@ export const BotId = id("BotId");
 export const ChannelId = id("ChannelId");
 export const JobId = id("JobId");
 export const RunId = id("RunId");
+export const TaskId = id("TaskId");
 export type WorkspaceId = v.InferOutput<typeof WorkspaceId>;
 export type UserId = v.InferOutput<typeof UserId>;
 export type DeviceId = v.InferOutput<typeof DeviceId>;
@@ -17,6 +18,7 @@ export type BotId = v.InferOutput<typeof BotId>;
 export type ChannelId = v.InferOutput<typeof ChannelId>;
 export type JobId = v.InferOutput<typeof JobId>;
 export type RunId = v.InferOutput<typeof RunId>;
+export type TaskId = v.InferOutput<typeof TaskId>;
 
 // Scoped by workspace + authenticated actor on the server (docs/architecture.md §6.2).
 export const IdempotencyKey = v.pipe(
@@ -118,6 +120,69 @@ export const AgentSend = v.strictObject({
     text: v.pipe(v.string(), v.minLength(1), v.maxLength(64 * 1024)),
   }),
   delivery: v.picklist(["wake", "notify"]),
+});
+
+// ---------------------------------------------------- Work (docs/architecture.md §4)
+// Task edits carry the Task's `expectedRevision`; a stale one is 409 REVISION_CONFLICT.
+
+const Revision = v.pipe(v.number(), v.integer(), v.minValue(1));
+/** Display-key prefix: Task keys are `<projectKey>-<n>`. */
+export const ProjectKey = v.pipe(v.string(), v.regex(/^[A-Z][A-Z0-9]{1,9}$/));
+
+export const ProjectCreate = v.strictObject({
+  type: v.literal("project.create"),
+  key: ProjectKey,
+  name: Name,
+});
+
+/** Needs `projectKey` or `parentTaskId`; a subtask stays in its parent's Project (§2.1). */
+export const TaskCreate = v.strictObject({
+  type: v.literal("task.create"),
+  projectKey: v.optional(ProjectKey),
+  parentTaskId: v.optional(TaskId),
+  title: Name,
+  description: v.optional(v.pipe(v.string(), v.maxLength(64 * 1024)), ""),
+  priority: v.optional(v.pipe(v.number(), v.integer()), 0),
+  completionPolicy: v.optional(
+    v.picklist(["declaration", "human", "checks", "children"]),
+    "declaration",
+  ),
+});
+
+export const TaskAssign = v.strictObject({
+  type: v.literal("task.assign"),
+  taskId: TaskId,
+  assignee: v.nullable(v.strictObject({ kind: v.picklist(["user", "bot"]), id: Name })),
+  expectedRevision: Revision,
+});
+
+/** Edits start dependencies; bumps `scope_revision`. A cycle is 422 INVALID_INPUT (AT-18). */
+export const TaskPlan = v.strictObject({
+  type: v.literal("task.plan"),
+  taskId: TaskId,
+  addPrerequisites: v.optional(v.array(TaskId), []),
+  removePrerequisites: v.optional(v.array(TaskId), []),
+  expectedRevision: Revision,
+});
+
+export const TaskComplete = v.strictObject({
+  type: v.literal("task.complete"),
+  taskId: TaskId,
+  expectedRevision: Revision,
+});
+
+export const TaskCancel = v.strictObject({
+  type: v.literal("task.cancel"),
+  taskId: TaskId,
+  expectedRevision: Revision,
+});
+
+/** Explicit Task execution (§23): a queued Job for the Bot, optionally pinned to one device. */
+export const JobStart = v.strictObject({
+  type: v.literal("job.start"),
+  taskId: TaskId,
+  botId: BotId,
+  deviceId: v.optional(DeviceId),
 });
 
 // UTF-8 size. No TextEncoder: contracts stay runtime-neutral (`types: []`). A lone surrogate counts 3,

@@ -9,7 +9,7 @@ const iso = (ms = Date.now()) => new Date(ms).toISOString();
 const activeRunStates = "('starting', 'running', 'waiting_approval', 'stopping')";
 
 /** [set, clear] around a statement that must change exactly one row. Each pair in a batch needs its own id. */
-const guard = (db: D1Database, operationId: string = crypto.randomUUID()) =>
+export const guard = (db: D1Database, operationId: string = crypto.randomUUID()) =>
   [
     db
       .prepare("INSERT INTO atomic_guards (operation_id, ok) VALUES (?, changes())")
@@ -162,9 +162,15 @@ export const claimJob = async (db: D1Database, input: ClaimInput): Promise<Claim
              VALUES (?, ?, ?, 'root', ?, ?, 'starting', ?)`,
           )
           .bind(claim.runId, workspaceId, jobId, deviceId, claim.generation, claim.leaseExpiresAt),
+        // A Task Job's Execution records the Task and its current scope revision (§3.1).
         db
-          .prepare("INSERT INTO executions (id, workspace_id, run_id) VALUES (?, ?, ?)")
-          .bind(claim.executionId, workspaceId, claim.runId),
+          .prepare(
+            `INSERT INTO executions (id, workspace_id, run_id, task_id, task_scope_revision)
+             SELECT ?, ?, ?, j.task_id, t.scope_revision
+               FROM jobs j LEFT JOIN tasks t ON t.workspace_id = j.workspace_id AND t.id = j.task_id
+              WHERE j.workspace_id = ? AND j.id = ?`,
+          )
+          .bind(claim.executionId, workspaceId, claim.runId, workspaceId, jobId),
         appendChange(db, {
           workspaceId,
           entityKind: "job",
@@ -606,22 +612,34 @@ export const insertInboxItem = (db: D1Database, input: InboxInput) =>
       input.deliveryMode,
     );
 
-/** A queued Job; UNIQUE (workspace_id, trigger_key) makes it idempotent. Placement is the Bot's snapshot. */
+/**
+ * A queued Job; UNIQUE (workspace_id, trigger_key) makes it idempotent. Placement is `placement` when given,
+ * else the Bot's policy snapshot.
+ */
 export const createJob = (
   db: D1Database,
-  input: { id: string; workspaceId: string; botId: string; triggerKey: string },
+  input: {
+    id: string;
+    workspaceId: string;
+    botId: string;
+    triggerKey: string;
+    taskId?: string;
+    placement?: unknown;
+  },
 ) =>
   db
     .prepare(
-      `INSERT INTO jobs (id, workspace_id, bot_id, state, trigger_key, placement)
-       VALUES (?, ?, ?, 'queued', ?,
-         (SELECT placement_policy FROM bots WHERE workspace_id = ? AND id = ?))`,
+      `INSERT INTO jobs (id, workspace_id, bot_id, state, trigger_key, task_id, placement)
+       VALUES (?, ?, ?, 'queued', ?, ?,
+         COALESCE(?, (SELECT placement_policy FROM bots WHERE workspace_id = ? AND id = ?)))`,
     )
     .bind(
       input.id,
       input.workspaceId,
       input.botId,
       input.triggerKey,
+      input.taskId ?? null,
+      input.placement === undefined ? null : JSON.stringify(input.placement),
       input.workspaceId,
       input.botId,
     );

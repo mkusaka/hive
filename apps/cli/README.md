@@ -24,7 +24,17 @@ hive inbox list --bot <bot-id>
 hive channel list | hive bot list | hive device list   # bootstrap lists of the workspace
 hive sync changes [--cursor <cursor>]                  # without --cursor: the bootstrap cursor
 hive executor run [--once]                             # Local Executor (fake provider) with the stored token
+hive project create --key <KEY> --name <name>
+hive task create (--project <KEY> | --parent <task>) --title <title> [--priority <n>]
+hive task list [--project <KEY>] [--status <status>]
+hive task plan <task> --after <task>...                # adds prerequisites
+hive task assign <task> (--bot <bot-id> | --user <user-id> | --none)
+hive task complete <task>
+hive job start --task <task> --bot <bot-id> [--device <device-id>] [--wait [--timeout <s>]]
 ```
+
+`<task>` is a key (`APP-1`) or an id. The CLI lists the Workspace's Tasks to resolve it and sends the Task's
+current revision as `expectedRevision`; a concurrent edit is 409 (exit 4), so rerun the command.
 
 Global options: `--format text|json` (default `text`), `--api-url <url>` (default `apiUrl` from the credentials
 file), `--workspace <id>` (default `workspaceId`), `--idempotency-key <key>` and `--operation-id <id>` (default:
@@ -92,4 +102,5 @@ end-to-end loop is `apps/api-worker/test/cli.test.ts`.
   `--operation-id` / `--idempotency-key` by hand.
 - No offline queue (`--offline-queue`, exit 8).
 - No installed `hive` binary on PATH yet: run it through Bun (alias above).
-- Only the Phase 1 commands above; no `job start`, `event inspect`, `task`, `subscription`.
+- No `event inspect`, `subscription`, `task cancel` or `task plan --remove` yet. `job start --wait` watches the
+  Job, not the Task; complete the Task with `task complete`.

@@ -61,6 +61,68 @@ export const listDevices = (c: Client, workspaceId: string) =>
 export const syncChanges = (c: Client, workspaceId: string, cursor?: string) =>
   c.get(inWorkspace("sync/changes", workspaceId, cursor ? { cursor } : {}));
 
+// ------------------------------------------------- Projects and Tasks (§4)
+
+export const projectCreate = (c: Client, e: Envelope, input: { key: string; name: string }) =>
+  c.command(e, { type: "project.create", ...input });
+
+export const taskCreate = (
+  c: Client,
+  e: Envelope,
+  input: { projectKey?: string; parentTaskId?: string; title: string; priority?: number },
+) => c.command(e, { type: "task.create", ...input });
+
+export const listTasks = (
+  c: Client,
+  workspaceId: string,
+  filter: { projectKey?: string; status?: string } = {},
+) =>
+  c.get(
+    inWorkspace(
+      "tasks",
+      workspaceId,
+      Object.fromEntries(Object.entries(filter).filter(([, v]) => v !== undefined)) as Record<
+        string,
+        string
+      >,
+    ),
+  );
+
+export type TaskRef = { id: string; key: string; revision: number };
+
+/** A Task by key (`APP-123`) or id, with its current revision for `expectedRevision`. */
+export const findTask = async (c: Client, workspaceId: string, ref: string) => {
+  const { tasks } = (await listTasks(c, workspaceId)) as { tasks: TaskRef[] };
+  const task = tasks.find((t) => t.key === ref || t.id === ref);
+  if (!task) throw new CliError("NOT_FOUND", 7, `task not found: ${ref}`);
+  return task;
+};
+
+export const taskPlan = (c: Client, e: Envelope, task: TaskRef, addPrerequisites: string[]) =>
+  c.command(e, {
+    type: "task.plan",
+    taskId: task.id,
+    addPrerequisites,
+    expectedRevision: task.revision,
+  });
+
+export const taskAssign = (
+  c: Client,
+  e: Envelope,
+  task: TaskRef,
+  assignee: { kind: "user" | "bot"; id: string } | null,
+) =>
+  c.command(e, { type: "task.assign", taskId: task.id, assignee, expectedRevision: task.revision });
+
+export const taskComplete = (c: Client, e: Envelope, task: TaskRef) =>
+  c.command(e, { type: "task.complete", taskId: task.id, expectedRevision: task.revision });
+
+export const jobStart = (
+  c: Client,
+  e: Envelope,
+  input: { taskId: string; botId: string; deviceId?: string },
+) => c.command(e, { type: "job.start", ...input });
+
 /** `failed` / `cancelled` exit 5. `recovery_required` is not terminal here: it needs a human (§10). */
 export const terminalJobStates = ["succeeded", "failed", "cancelled"];
 

@@ -59,3 +59,46 @@ it("workspace → device → channel → bot → agent send → executor → job
     expect.objectContaining({ id: accepted.inboxItemId, state: "processed" }),
   ]);
 });
+
+it("project → task → job start → executor → task complete", async () => {
+  const client = createClient({ apiUrl, accessJwt: await assertion(crypto.randomUUID()), fetch });
+  const workspaceId = crypto.randomUUID();
+  const envelope = () => ({
+    operationId: crypto.randomUUID(),
+    idempotencyKey: crypto.randomUUID(),
+    workspaceId,
+  });
+  await hive.workspaceCreate(client, envelope(), "home");
+  const { deviceToken } = await hive.deviceRegister(client, envelope(), {
+    name: "pc1",
+    os: "darwin",
+    agentVersion: "0.0.0",
+  });
+  const { botId } = await hive.botCreate(client, envelope(), "coder");
+  await hive.projectCreate(client, envelope(), { key: "APP", name: "app" });
+  const { key } = await hive.taskCreate(client, envelope(), { projectKey: "APP", title: "build" });
+  expect(key).toBe("APP-1");
+
+  // `hive job start --task APP-1`: the key resolves to the id through the list.
+  const task = await hive.findTask(client, workspaceId, key as string);
+  const started = await hive.jobStart(client, envelope(), {
+    taskId: task.id,
+    botId: botId as string,
+  });
+  const entries: JournalEntry[] = [];
+  const ran = await runOnce({
+    cloud: createCloudClient({ apiUrl, token: deviceToken as string, fetch }),
+    journal: { append: async (e) => void entries.push(e), readAll: async () => entries },
+    adapter: fakeAdapter({ delayMs: 10 }),
+  });
+  expect(ran).toMatchObject({ jobId: started.jobId, state: "succeeded" });
+
+  // Run success leaves the Task in progress until it is declared complete.
+  const running = await hive.findTask(client, workspaceId, "APP-1");
+  expect(running).toMatchObject({ status: "in_progress" });
+  await hive.taskComplete(client, envelope(), running);
+  const { tasks } = await hive.listTasks(client, workspaceId, { projectKey: "APP" });
+  expect(tasks).toEqual([
+    expect.objectContaining({ key: "APP-1", status: "completed", display: "completed" }),
+  ]);
+});

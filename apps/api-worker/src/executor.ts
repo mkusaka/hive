@@ -148,6 +148,31 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
       workspaceId,
       command.runId,
     );
+  // A Task Job's Execution gets an immutable Task Result for its scope revision. Task status is not touched:
+  // Run success is not Task completion (AT-16). The Execution still goes `finished` / `failed`, not `submitted`.
+  const execution = await db
+    .prepare(
+      "SELECT id FROM executions WHERE workspace_id = ? AND run_id = ? AND task_id IS NOT NULL",
+    )
+    .bind(workspaceId, command.runId)
+    .first<{ id: string }>();
+  const resultId = crypto.randomUUID();
+  const taskResult = execution
+    ? [
+        db
+          .prepare(
+            `INSERT INTO task_results (id, workspace_id, task_id, execution_id, run_id, scope_revision, state, summary)
+             SELECT ?, workspace_id, task_id, id, run_id, task_scope_revision, ?, ? FROM executions WHERE id = ?`,
+          )
+          .bind(resultId, command.state, command.summary, execution.id),
+        appendChange(db, {
+          workspaceId,
+          entityKind: "task_result",
+          entityId: resultId,
+          scope: `workspace:${workspaceId}`,
+        }),
+      ]
+    : [];
   const result = await finishRun(db, {
     runId: command.runId,
     deviceId: device.deviceId,
@@ -158,6 +183,7 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
     operationId: env.idempotencyKey,
     statements: item
       ? [
+          ...taskResult,
           inboxOutcome,
           appendChange(db, {
             workspaceId,
@@ -166,7 +192,7 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
             scope: itemScope,
           }),
         ]
-      : [inboxOutcome],
+      : [...taskResult, inboxOutcome],
   });
   if (!result.ok) throw staleGeneration();
   const response: RunResultAccepted = { ok: true };

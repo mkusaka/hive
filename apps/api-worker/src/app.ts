@@ -19,12 +19,15 @@ import { pump } from "./pump.ts";
 import {
   getJob,
   getOperation,
+  getTask,
   listBots,
   listChannels,
   listDevices,
   listInbox,
   listJobs,
   listMessages,
+  listProjects,
+  listTasks,
 } from "./queries.ts";
 import {
   type Attachment,
@@ -189,6 +192,19 @@ export const createApp = ({
   app.get("/v1/devices", async (c) => c.json(await listDevices(c.env.DB, workspaceParam(c))));
   app.get("/v1/jobs", async (c) =>
     c.json(await listJobs(c.env.DB, workspaceParam(c), limitParam(c, 50, 200))),
+  );
+
+  app.get("/v1/projects", async (c) => c.json(await listProjects(c.env.DB, workspaceParam(c))));
+  app.get("/v1/tasks", async (c) =>
+    c.json(
+      await listTasks(c.env.DB, workspaceParam(c), {
+        projectKey: c.req.query("projectKey"),
+        status: c.req.query("status"),
+      }),
+    ),
+  );
+  app.get("/v1/tasks/:id", async (c) =>
+    c.json(await getTask(c.env.DB, user(c).workspaceIds, c.req.param("id"))),
   );
 
   app.get("/v1/sync/changes", async (c) =>

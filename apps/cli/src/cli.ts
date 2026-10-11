@@ -209,6 +209,103 @@ const specs: Record<string, Spec> = {
     options: { bot: str },
     run: async (c) => c.print(await cmd.listInbox(c.client(), need(c.values, "bot"))),
   },
+  "project create": {
+    usage: "--key <KEY> --name <name>",
+    options: { key: str, name: str },
+    run: async (c) =>
+      c.print(
+        await cmd.projectCreate(c.client(), c.envelope(), {
+          key: need(c.values, "key"),
+          name: need(c.values, "name"),
+        }),
+      ),
+  },
+  "task create": {
+    usage: "(--project <key> | --parent <task>) --title <title> [--priority <n>]",
+    options: { project: str, parent: str, title: str, priority: str },
+    run: async (c) => {
+      const priority = c.values.priority === undefined ? undefined : Number(c.values.priority);
+      if (priority !== undefined && !Number.isInteger(priority))
+        throw invalid("--priority must be an integer");
+      const parent = c.values.parent as string | undefined;
+      c.print(
+        await cmd.taskCreate(c.client(), c.envelope(), {
+          projectKey: c.values.project as string | undefined,
+          parentTaskId: parent && (await cmd.findTask(c.client(), c.workspace(), parent)).id,
+          title: need(c.values, "title"),
+          priority,
+        }),
+      );
+    },
+  },
+  "task list": {
+    usage: "[--project <key>] [--status <status>]",
+    options: { project: str, status: str },
+    run: async (c) =>
+      c.print(
+        await cmd.listTasks(c.client(), c.workspace(), {
+          projectKey: c.values.project as string | undefined,
+          status: c.values.status as string | undefined,
+        }),
+      ),
+  },
+  "task plan": {
+    usage: "<task> --after <task>...",
+    args: 1,
+    options: { after: { type: "string", multiple: true } },
+    run: async (c) => {
+      const after = (c.values.after as string[] | undefined) ?? [];
+      if (after.length === 0) throw invalid("--after is required");
+      const ws = c.workspace();
+      const task = await cmd.findTask(c.client(), ws, c.args[0]!);
+      const ids = await Promise.all(
+        after.map(async (ref) => (await cmd.findTask(c.client(), ws, ref)).id),
+      );
+      c.print(await cmd.taskPlan(c.client(), c.envelope(), task, ids));
+    },
+  },
+  "task assign": {
+    usage: "<task> (--bot <bot-id> | --user <user-id> | --none)",
+    args: 1,
+    options: { bot: str, user: str, none: flag },
+    run: async (c) => {
+      const { bot, user, none } = c.values;
+      if ([bot, user, none || undefined].filter((v) => v !== undefined).length !== 1)
+        throw invalid("exactly one of --bot, --user, --none is required");
+      const assignee = none
+        ? null
+        : bot
+          ? { kind: "bot" as const, id: bot as string }
+          : { kind: "user" as const, id: user as string };
+      const task = await cmd.findTask(c.client(), c.workspace(), c.args[0]!);
+      c.print(await cmd.taskAssign(c.client(), c.envelope(), task, assignee));
+    },
+  },
+  "task complete": {
+    usage: "<task>",
+    args: 1,
+    run: async (c) => {
+      const task = await cmd.findTask(c.client(), c.workspace(), c.args[0]!);
+      c.print(await cmd.taskComplete(c.client(), c.envelope(), task));
+    },
+  },
+  "job start": {
+    usage: "--task <task> --bot <bot-id> [--device <device-id>] [--wait [--timeout <s>]]",
+    options: { task: str, bot: str, device: str, wait: flag, timeout: str },
+    run: async (c) => {
+      const task = await cmd.findTask(c.client(), c.workspace(), need(c.values, "task"));
+      const started = await cmd.jobStart(c.client(), c.envelope(), {
+        taskId: task.id,
+        botId: need(c.values, "bot"),
+        deviceId: c.values.device as string | undefined,
+      });
+      c.print(started);
+      if (!c.values.wait) return;
+      const job = await cmd.watchJob(c.client(), String(started.jobId), c.wait());
+      c.print(job);
+      return exitForJob(job);
+    },
+  },
   "executor run": {
     usage: "[--once]",
     options: { once: flag },

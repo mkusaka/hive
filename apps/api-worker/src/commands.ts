@@ -9,18 +9,30 @@ import {
   DeviceRevoke,
   EventEmit,
   type EventEmitAccepted,
+  JobStart,
+  type PlacementPolicy,
+  ProjectCreate,
+  TaskAssign,
+  TaskCancel,
+  TaskComplete,
+  TaskCreate,
+  TaskPlan,
   userEventType,
   WorkspaceCreate,
 } from "@hive/contracts";
 import {
   appendChange,
+  createJob,
   digest,
   enqueueOutbox,
+  guard,
   IdempotencyConflict,
   insertEvent,
   insertInboxItem,
   insertMessage,
+  readiness,
   withOperationReceipt,
+  wouldCreateCycle,
 } from "@hive/db";
 import * as v from "valibot";
 import { hashSecret, newDeviceSecret } from "./auth/device.ts";
@@ -36,6 +48,13 @@ export const CommandEnvelope = commandEnvelope(
     BotCreate,
     AgentSend,
     EventEmit,
+    ProjectCreate,
+    TaskCreate,
+    TaskAssign,
+    TaskPlan,
+    TaskComplete,
+    TaskCancel,
+    JobStart,
   ]),
 );
 type Envelope = v.InferOutput<typeof CommandEnvelope>;
@@ -191,22 +210,32 @@ const userActorId = async (db: D1Database, workspaceId: string, userId: string) 
   return row.id;
 };
 
-/** Maps a batch failure caused by UNIQUE (workspace_id, name) to 422. A replay never reaches the batch. */
+/**
+ * On a failed batch (not an idempotency conflict), throws `explain()`'s error when it names the cause, else the
+ * original error. The batch already rolled back, so `explain` re-reads state instead of parsing SQL errors.
+ * A replay never reaches the batch.
+ */
+const explainFailure = <T>(run: Promise<T>, explain: () => Promise<HttpError | null>) =>
+  run.catch(async (error: unknown) => {
+    if (error instanceof IdempotencyConflict) throw error;
+    throw (await explain()) ?? error;
+  });
+
+/** Maps a batch failure caused by UNIQUE (workspace_id, <column>) to 422. */
 const uniqueName = <T>(
   db: D1Database,
-  table: "channels" | "bots",
+  table: "channels" | "bots" | "projects",
   workspaceId: string,
   name: string,
   run: Promise<T>,
+  column: "name" | "key" = "name",
 ) =>
-  run.catch(async (error: unknown) => {
-    if (error instanceof IdempotencyConflict) throw error;
+  explainFailure(run, async () => {
     const taken = await db
-      .prepare(`SELECT 1 FROM ${table} WHERE workspace_id = ? AND name = ?`)
+      .prepare(`SELECT 1 FROM ${table} WHERE workspace_id = ? AND ${column} = ?`)
       .bind(workspaceId, name)
       .first();
-    if (taken) throw new HttpError("INVALID_INPUT", `name already exists: ${name}`);
-    throw error;
+    return taken ? new HttpError("INVALID_INPUT", `${column} already exists: ${name}`) : null;
   });
 
 const channelCreate: Handler<v.InferOutput<typeof ChannelCreate>> = async (db, user, env) => {
@@ -398,6 +427,480 @@ const eventEmit: Handler<v.InferOutput<typeof EventEmit>> = async (db, user, env
   );
 };
 
+// --------------------------------------------------- Work (docs/architecture.md §4)
+// State conditions (revision, status, readiness, results) live in the guarded UPDATE, not in a pre-check, so a
+// replay reaches the stored receipt and a concurrent change rolls the batch back. `explainTask` names the cause.
+
+type TaskRow = {
+  id: string;
+  project_id: string | null;
+  status: string;
+  revision: number;
+  scope_revision: number;
+  completion_policy: string;
+};
+const openStatuses = "('pending', 'in_progress')";
+
+const loadTask = async (db: D1Database, workspaceId: string, taskId: string) => {
+  const task = await db
+    .prepare(
+      `SELECT id, project_id, status, revision, scope_revision, completion_policy FROM tasks
+        WHERE workspace_id = ? AND id = ?`,
+    )
+    .bind(workspaceId, taskId)
+    .first<TaskRow>();
+  if (!task) throw new HttpError("NOT_FOUND", `task not found: ${taskId}`);
+  return task;
+};
+
+const prerequisiteStatuses = async (db: D1Database, workspaceId: string, taskId: string) =>
+  (
+    await db
+      .prepare(
+        `SELECT p.status FROM task_dependencies d
+           JOIN tasks p ON p.workspace_id = d.workspace_id AND p.id = d.prerequisite_task_id
+          WHERE d.workspace_id = ? AND d.dependent_task_id = ?`,
+      )
+      .bind(workspaceId, taskId)
+      .all<{ status: string }>()
+  ).results;
+
+const notReady = `EXISTS (SELECT 1 FROM task_dependencies d
+  JOIN tasks p ON p.workspace_id = d.workspace_id AND p.id = d.prerequisite_task_id
+ WHERE d.workspace_id = tasks.workspace_id AND d.dependent_task_id = tasks.id AND p.status <> 'completed')`;
+
+/** The common causes of a failed Task CAS: revision moved on, or the Task is no longer open. */
+const explainTask = async (
+  db: D1Database,
+  workspaceId: string,
+  taskId: string,
+  expectedRevision?: number,
+) => {
+  const task = await loadTask(db, workspaceId, taskId);
+  if (expectedRevision !== undefined && task.revision !== expectedRevision) {
+    return new HttpError(
+      "REVISION_CONFLICT",
+      `task revision is ${task.revision}; refetch and retry`,
+      false,
+      "stale_revision",
+    );
+  }
+  if (task.status !== "pending" && task.status !== "in_progress") {
+    return new HttpError("INVALID_INPUT", `task is ${task.status}`, false, "invalid_status");
+  }
+  return null;
+};
+
+/** `UPDATE tasks ... WHERE <id> AND revision = ? AND <extra>` that must change one row, plus its guard. */
+const taskCas = (
+  db: D1Database,
+  input: {
+    workspaceId: string;
+    taskId: string;
+    expectedRevision: number;
+    set: string;
+    where?: string;
+  },
+  ...params: unknown[]
+) => {
+  const [setGuard, clearGuard] = guard(db);
+  return [
+    db
+      .prepare(
+        `UPDATE tasks SET ${input.set}, revision = revision + 1, updated_at = ?
+          WHERE workspace_id = ? AND id = ? AND revision = ? ${input.where ? `AND ${input.where}` : ""}`,
+      )
+      .bind(
+        ...params,
+        new Date().toISOString(),
+        input.workspaceId,
+        input.taskId,
+        input.expectedRevision,
+      ),
+    setGuard,
+    clearGuard,
+  ];
+};
+
+const taskChange = (workspaceId: string, taskId: string, revision?: number): Change => ({
+  entityKind: "task",
+  entityId: taskId,
+  ...(revision === undefined ? {} : { revision }),
+  scope: `workspace:${workspaceId}`,
+});
+
+const projectCreate: Handler<v.InferOutput<typeof ProjectCreate>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const projectId = crypto.randomUUID();
+  const run = receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare("INSERT INTO projects (id, workspace_id, key, name) VALUES (?, ?, ?, ?)")
+        .bind(projectId, workspaceId, command.key, command.name),
+    ],
+    { operationId: env.operationId, status: "accepted", projectId, key: command.key },
+    [{ entityKind: "project", entityId: projectId, scope: `workspace:${workspaceId}` }],
+  );
+  return uniqueName(db, "projects", workspaceId, command.key, run, "key");
+};
+
+/** The key `<projectKey>-<n>` comes from the Project's counter, advanced by CAS in the same batch. */
+const taskCreate: Handler<v.InferOutput<typeof TaskCreate>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const parent = command.parentTaskId
+    ? await loadTask(db, workspaceId, command.parentTaskId)
+    : null;
+  if (!command.projectKey && !parent) {
+    throw new HttpError("INVALID_INPUT", "projectKey or parentTaskId is required");
+  }
+  const project = await db
+    .prepare(
+      `SELECT id, key, task_counter FROM projects WHERE workspace_id = ? AND ${
+        command.projectKey ? "key = ?" : "id = ?"
+      }`,
+    )
+    .bind(workspaceId, command.projectKey ?? parent?.project_id ?? null)
+    .first<{ id: string; key: string; task_counter: number }>();
+  if (!project) throw new HttpError("NOT_FOUND", "project not found");
+  if (parent && parent.project_id !== project.id) {
+    throw new HttpError("INVALID_INPUT", "a subtask stays in its parent's project");
+  }
+  const taskId = crypto.randomUUID();
+  const n = project.task_counter + 1;
+  const key = `${project.key}-${n}`;
+  const [setGuard, clearGuard] = guard(db);
+  const run = receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE projects SET task_counter = ?, updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND task_counter = ?`,
+        )
+        .bind(n, new Date().toISOString(), workspaceId, project.id, project.task_counter),
+      setGuard,
+      clearGuard,
+      db
+        .prepare(
+          `INSERT INTO tasks (id, workspace_id, project_id, parent_task_id, key, title, description, priority,
+             completion_policy)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          taskId,
+          workspaceId,
+          project.id,
+          parent?.id ?? null,
+          key,
+          command.title,
+          command.description,
+          command.priority,
+          command.completionPolicy,
+        ),
+    ],
+    { operationId: env.operationId, status: "accepted", taskId, key },
+    [taskChange(workspaceId, taskId, 1)],
+  );
+  // ponytail: a concurrent task.create in the same Project loses the counter CAS and gets a retryable 409.
+  return explainFailure(
+    run,
+    async () =>
+      new HttpError(
+        "REVISION_CONFLICT",
+        "project task counter moved on; retry",
+        true,
+        "concurrent_create",
+      ),
+  );
+};
+
+const taskAssign: Handler<v.InferOutput<typeof TaskAssign>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  await loadTask(db, workspaceId, command.taskId);
+  const { assignee } = command;
+  if (assignee) {
+    const exists = await db
+      .prepare(
+        assignee.kind === "bot"
+          ? "SELECT 1 FROM bots WHERE workspace_id = ? AND id = ?"
+          : "SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?",
+      )
+      .bind(workspaceId, assignee.id)
+      .first();
+    if (!exists) throw new HttpError("NOT_FOUND", `assignee ${assignee.kind} not found`);
+  }
+  const cas = { workspaceId, taskId: command.taskId, expectedRevision: command.expectedRevision };
+  const run = receipt(
+    db,
+    user,
+    env,
+    taskCas(
+      db,
+      { ...cas, set: "assignee_kind = ?, assignee_id = ?" },
+      assignee?.kind ?? null,
+      assignee?.id ?? null,
+    ),
+    { operationId: env.operationId, status: "accepted", taskId: command.taskId },
+    [taskChange(workspaceId, command.taskId, command.expectedRevision + 1)],
+  );
+  return explainFailure(run, () =>
+    explainTask(db, workspaceId, command.taskId, command.expectedRevision),
+  );
+};
+
+/**
+ * Removes, then adds start dependencies; any cycle through dependencies or parent/child is 422 (AT-18). Bumps
+ * `scope_revision`, so earlier Results no longer satisfy completion.
+ */
+const taskPlan: Handler<v.InferOutput<typeof TaskPlan>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const { taskId } = command;
+  await loadTask(db, workspaceId, taskId);
+  await Promise.all(command.addPrerequisites.map((id) => loadTask(db, workspaceId, id)));
+  // ponytail: reads the Workspace's whole graph, and the CAS covers only this Task's revision, so two
+  // concurrent plans on different Tasks can still close a cycle; add `workspaces.control_revision` (§11.2).
+  const [deps, parents] = await Promise.all([
+    db
+      .prepare(
+        `SELECT prerequisite_task_id AS prerequisite, dependent_task_id AS dependent
+           FROM task_dependencies WHERE workspace_id = ?`,
+      )
+      .bind(workspaceId)
+      .all<{ prerequisite: string; dependent: string }>(),
+    db
+      .prepare(
+        `SELECT id AS child, parent_task_id AS parent FROM tasks
+          WHERE workspace_id = ? AND parent_task_id IS NOT NULL`,
+      )
+      .bind(workspaceId)
+      .all<{ child: string; parent: string }>(),
+  ]);
+  const removed = new Set<string>(command.removePrerequisites);
+  const edges = deps.results.filter(
+    (e) => !(e.dependent === taskId && removed.has(e.prerequisite)),
+  );
+  for (const prerequisite of command.addPrerequisites) {
+    const edge = { prerequisite, dependent: taskId };
+    if (wouldCreateCycle(edges, parents.results, edge)) {
+      throw new HttpError(
+        "INVALID_INPUT",
+        `dependency cycle: ${prerequisite} → ${taskId}`,
+        false,
+        "cycle",
+      );
+    }
+    edges.push(edge);
+  }
+  const dependency = (prerequisite: string, op: "upsert" | "delete"): Change => ({
+    entityKind: "task_dependency",
+    entityId: `${prerequisite}:${taskId}`,
+    op,
+    scope: `workspace:${workspaceId}`,
+  });
+  const run = receipt(
+    db,
+    user,
+    env,
+    [
+      ...taskCas(db, {
+        workspaceId,
+        taskId,
+        expectedRevision: command.expectedRevision,
+        set: "scope_revision = scope_revision + 1",
+      }),
+      ...command.removePrerequisites.map((id) =>
+        db
+          .prepare(
+            `DELETE FROM task_dependencies
+              WHERE workspace_id = ? AND prerequisite_task_id = ? AND dependent_task_id = ?`,
+          )
+          .bind(workspaceId, id, taskId),
+      ),
+      ...command.addPrerequisites.map((id) =>
+        db
+          .prepare(
+            `INSERT INTO task_dependencies (workspace_id, prerequisite_task_id, dependent_task_id)
+             VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
+          )
+          .bind(workspaceId, id, taskId),
+      ),
+    ],
+    { operationId: env.operationId, status: "accepted", taskId },
+    [
+      taskChange(workspaceId, taskId, command.expectedRevision + 1),
+      ...command.removePrerequisites.map((id) => dependency(id, "delete")),
+      ...command.addPrerequisites.map((id) => dependency(id, "upsert")),
+    ],
+  );
+  return explainFailure(run, () => explainTask(db, workspaceId, taskId, command.expectedRevision));
+};
+
+/** `declaration` policy only: a succeeded Result for the current `scope_revision` must exist (§4.3). */
+const taskComplete: Handler<v.InferOutput<typeof TaskComplete>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  await loadTask(db, workspaceId, command.taskId);
+  const run = receipt(
+    db,
+    user,
+    env,
+    taskCas(db, {
+      workspaceId,
+      taskId: command.taskId,
+      expectedRevision: command.expectedRevision,
+      set: "status = 'completed'",
+      where: `status IN ${openStatuses} AND completion_policy = 'declaration'
+        AND EXISTS (SELECT 1 FROM task_results r
+          WHERE r.workspace_id = tasks.workspace_id AND r.task_id = tasks.id
+            AND r.state = 'succeeded' AND r.scope_revision = tasks.scope_revision)`,
+    }),
+    { operationId: env.operationId, status: "accepted", taskId: command.taskId },
+    [taskChange(workspaceId, command.taskId, command.expectedRevision + 1)],
+  );
+  return explainFailure(run, async () => {
+    const common = await explainTask(db, workspaceId, command.taskId, command.expectedRevision);
+    if (common) return common;
+    const task = await loadTask(db, workspaceId, command.taskId);
+    if (task.completion_policy !== "declaration") {
+      return new HttpError(
+        "INVALID_INPUT",
+        `completion policy ${task.completion_policy} is not supported yet`,
+        false,
+        "unsupported_policy",
+      );
+    }
+    return new HttpError(
+      "INVALID_INPUT",
+      `no succeeded result for scope revision ${task.scope_revision}`,
+      false,
+      "no_result",
+    );
+  });
+};
+
+/** Does not stop running Jobs of the Task (no job.cancel yet). */
+const taskCancel: Handler<v.InferOutput<typeof TaskCancel>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  await loadTask(db, workspaceId, command.taskId);
+  const run = receipt(
+    db,
+    user,
+    env,
+    taskCas(db, {
+      workspaceId,
+      taskId: command.taskId,
+      expectedRevision: command.expectedRevision,
+      set: "status = 'cancelled'",
+      where: `status IN ${openStatuses}`,
+    }),
+    { operationId: env.operationId, status: "accepted", taskId: command.taskId },
+    [taskChange(workspaceId, command.taskId, command.expectedRevision + 1)],
+  );
+  return explainFailure(run, () =>
+    explainTask(db, workspaceId, command.taskId, command.expectedRevision),
+  );
+};
+
+/**
+ * A queued Job for the Task (§23 `hive job start`). The guarded UPDATE requires an open, ready Task (prerequisites
+ * all completed) and moves `pending` to `in_progress`. Trigger key `task:<id>:<scope_revision>:<n>`, n = prior Jobs
+ * of the Task + 1: a retry gets a new Job, an identical double submit replays the receipt.
+ */
+const jobStart: Handler<v.InferOutput<typeof JobStart>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const task = await loadTask(db, workspaceId, command.taskId);
+  const bot = await db
+    .prepare("SELECT placement_policy FROM bots WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, command.botId)
+    .first<{ placement_policy: string }>();
+  if (!bot) throw new HttpError("NOT_FOUND", "bot not found");
+  let placement: PlacementPolicy | undefined;
+  if (command.deviceId) {
+    const device = await db
+      .prepare("SELECT 1 FROM devices WHERE workspace_id = ? AND id = ? AND revoked_at IS NULL")
+      .bind(workspaceId, command.deviceId)
+      .first();
+    if (!device) throw new HttpError("NOT_FOUND", "device not found");
+    const policy = JSON.parse(bot.placement_policy) as PlacementPolicy;
+    // Safety constraints are intersected (§10.2): the pin must be inside the Bot's allowed devices.
+    if (policy.allowedDeviceIds.length > 0 && !policy.allowedDeviceIds.includes(command.deviceId)) {
+      throw new HttpError(
+        "INVALID_INPUT",
+        "the bot's placement does not allow this device",
+        false,
+        "not_eligible",
+      );
+    }
+    placement = {
+      ...policy,
+      mode: "pinned",
+      allowedDeviceIds: [command.deviceId],
+      preferredDeviceIds: [command.deviceId],
+    };
+  }
+  const prior = await db
+    .prepare("SELECT COUNT(*) AS n FROM jobs WHERE workspace_id = ? AND task_id = ?")
+    .bind(workspaceId, command.taskId)
+    .first<{ n: number }>();
+  const jobId = crypto.randomUUID();
+  const triggerKey = `task:${command.taskId}:${task.scope_revision}:${(prior?.n ?? 0) + 1}`;
+  const [setGuard, clearGuard] = guard(db);
+  const now = new Date().toISOString();
+  const run = receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE tasks
+              SET revision = revision + (status = 'pending'), status = 'in_progress', updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND status IN ${openStatuses} AND NOT ${notReady}`,
+        )
+        .bind(now, workspaceId, command.taskId),
+      setGuard,
+      clearGuard,
+      createJob(db, {
+        id: jobId,
+        workspaceId,
+        botId: command.botId,
+        triggerKey,
+        taskId: command.taskId,
+        placement,
+      }),
+    ],
+    { operationId: env.operationId, status: "accepted", jobId, taskId: command.taskId, triggerKey },
+    [
+      { entityKind: "job", entityId: jobId, revision: 1, scope: `workspace:${workspaceId}` },
+      // The revision is unknown when the batch is built: it bumps only for `pending`.
+      taskChange(workspaceId, command.taskId),
+    ],
+  );
+  return explainFailure(run, async () => {
+    const common = await explainTask(db, workspaceId, command.taskId);
+    if (common) return common;
+    if (readiness(await prerequisiteStatuses(db, workspaceId, command.taskId)) === "blocked") {
+      return new HttpError(
+        "INVALID_INPUT",
+        "task is blocked by its prerequisites",
+        false,
+        "blocked",
+      );
+    }
+    // The trigger key's n was taken by a concurrent job.start.
+    return new HttpError(
+      "REVISION_CONFLICT",
+      "concurrent job.start; retry",
+      true,
+      "concurrent_start",
+    );
+  });
+};
+
 const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>> } = {
   "workspace.create": workspaceCreate,
   "device.register": deviceRegister,
@@ -406,6 +909,13 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "bot.create": botCreate,
   "agent.send": agentSend,
   "event.emit": eventEmit,
+  "project.create": projectCreate,
+  "task.create": taskCreate,
+  "task.assign": taskAssign,
+  "task.plan": taskPlan,
+  "task.complete": taskComplete,
+  "task.cancel": taskCancel,
+  "job.start": jobStart,
 };
 
 export const runCommand = (db: D1Database, principal: Principal, envelope: Envelope) => {
