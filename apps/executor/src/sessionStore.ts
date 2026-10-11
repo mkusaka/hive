@@ -102,6 +102,19 @@ export const sessionStore = ({
   };
 };
 
+/** The session ids a Run transcript's `system/init` messages name. */
+export const transcriptSessionIds = (bytes: Uint8Array) =>
+  new Set(
+    parse(new TextDecoder().decode(bytes)).flatMap((m) =>
+      m.type === "system" && m.subtype === "init" && typeof m.session_id === "string"
+        ? [m.session_id]
+        : [],
+    ),
+  );
+
+/** `<sessionId>[.<subpath>].jsonl`: the file name `sessionStore` writes. */
+export const sessionFileName = /^([A-Za-z0-9_-]+)(?:\.([^.]+))?\.jsonl$/;
+
 /**
  * The session journals a Run used: every session its transcript's `system/init` names, main and sub-agent files.
  * What the uploader mirrors after the Run.
@@ -112,20 +125,14 @@ export const sessionJournals = (stateDir: string) => {
   return async (runId: string) => {
     const bytes = await transcript(runId);
     if (!bytes) return [];
-    const ids = new Set(
-      parse(new TextDecoder().decode(bytes)).flatMap((m) =>
-        m.type === "system" && m.subtype === "init" && typeof m.session_id === "string"
-          ? [m.session_id]
-          : [],
-      ),
-    );
+    const ids = transcriptSessionIds(bytes);
     const files = await readdir(dir).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return [];
       throw error;
     });
     const journals = [];
     for (const name of files.toSorted()) {
-      const match = /^([A-Za-z0-9_-]+)(?:\.([^.]+))?\.jsonl$/.exec(name);
+      const match = sessionFileName.exec(name);
       if (!match || !ids.has(match[1]!)) continue;
       const session: SessionStreamKey = {
         sessionId: match[1]!,

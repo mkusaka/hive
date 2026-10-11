@@ -11,10 +11,12 @@ import { saveEnvironment } from "@hive/executor/environments";
 import { fakeAdapter } from "@hive/executor/adapters/fake";
 import { withGitCollector } from "@hive/executor/gitCollector";
 import { fileJournal, transcriptReader } from "@hive/executor/journal";
+import { pruneRunData } from "@hive/executor/retention";
 import { runLoop } from "@hive/executor/runner";
 import { sessionJournals, sessionStore } from "@hive/executor/sessionStore";
 import { transcriptUploader } from "@hive/executor/uploader";
 import { systemBrowser } from "./accessLogin.ts";
+import { rotateLogs } from "./service.ts";
 import type { Credentials, Deps } from "./cli.ts";
 
 const dir = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "hive");
@@ -37,6 +39,8 @@ const writePrivate = async (path: string, data: string) => {
   await writeFile(path, data, { mode: 0o600 });
   await chmod(path, 0o600);
 };
+
+const rotate = () => rotateLogs().catch((error) => console.error("log rotation failed", error));
 
 export const deps: Deps = {
   fetch: (input, init) => fetch(input, init),
@@ -70,6 +74,13 @@ export const deps: Deps = {
   stdout: (line) => console.log(line),
   stderr: (line) => console.error(line),
   runExecutor: async (cloud, once, provider, concurrency) => {
+    // Retention (docs/roadmap.md LOG-01): Run data once before the journal opens, the service logs now and hourly.
+    await pruneRunData(executorDir).catch((error) =>
+      console.error("run data pruning failed", error),
+    );
+    await rotate();
+    const timer = setInterval(rotate, 60 * 60 * 1000);
+    timer.unref();
     const journal = await fileJournal(executorDir);
     return runLoop(
       {
@@ -100,6 +111,6 @@ export const deps: Deps = {
       },
       // docs/roadmap.md §1: executor Job reconcile every 30 s (no WebSocket yet).
       { once, pollMs: 30_000, concurrency },
-    );
+    ).finally(() => clearInterval(timer));
   },
 };

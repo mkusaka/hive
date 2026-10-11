@@ -149,6 +149,10 @@ hive executor uninstall                                     # bootout + removes 
 - The desktop app owns the same agent and reinstalls it with its own program (Electron in headless executor mode)
   on every start; after `hive executor install` the next app start replaces the CLI program, keeping provider and
   concurrency (`apps/desktop/README.md`, Executor service).
+- Logs: `executor run` rotates `stdout.log` / `stderr.log` at start and every hour. A file over 5 MiB is copied to
+  `.1` (older copies shift to `.2`, `.3`; a fourth is dropped) and truncated in place, because launchd keeps it open
+  in append mode; lines written between the copy and the truncate are lost. Local Run data retention:
+  `apps/executor/README.md`, Local retention.
 - Other platforms: the three commands exit 2 with "not supported yet".
 
 ## Credentials
@@ -220,7 +224,8 @@ hive executor uninstall                                     # bootout + removes 
 
 `test/cli.test.ts` (Node): argv → request bodies, stdin data, exit codes, `job watch`, output formats, Access
 header precedence, service-token headers. `test/accessLogin.test.ts`: login, PKCE pairing, refresh and
-`invalid_grant` against a fake Access (stubbed `fetch`, real loopback callback). The
+`invalid_grant` against a fake Access (stubbed `fetch`, real loopback callback). `test/rotateLogs.test.ts`: log
+rotation in a temp dir. The
 end-to-end loop is `apps/api-worker/test/cli.test.ts`.
 
 ## Known gaps

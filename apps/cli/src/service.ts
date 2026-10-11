@@ -2,7 +2,17 @@
 // agent, so it keeps running after the UI or terminal closes and starts again at login. The program is the CLI
 // (`bun main.ts executor run`) or the desktop app in its headless executor mode. macOS only for now.
 import { execFile } from "node:child_process";
-import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -14,6 +24,36 @@ const configDir = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config")
 const logDir = join(configDir, "executor", "logs");
 const plistFile = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
 const logs = { stdout: join(logDir, "stdout.log"), stderr: join(logDir, "stderr.log") };
+
+const ignoreMissing = (error: NodeJS.ErrnoException) => {
+  if (error.code !== "ENOENT") throw error;
+};
+
+/**
+ * Copy-truncate rotation: launchd holds the logs open in append mode, so a file over `maxBytes` is copied to `.1`
+ * (`.1` → `.2` → `.3`, older dropped) and truncated in place. Lines written between the copy and the truncate are lost.
+ */
+export const rotateLogs = async (
+  files = [logs.stdout, logs.stderr],
+  maxBytes = 5 * 1024 * 1024,
+) => {
+  for (const file of files) {
+    // oxlint-disable-next-line no-await-in-loop
+    const size = await stat(file).then(
+      (s) => s.size,
+      () => 0,
+    );
+    if (size <= maxBytes) continue;
+    for (let i = 2; i >= 1; i--) {
+      // oxlint-disable-next-line no-await-in-loop
+      await rename(`${file}.${i}`, `${file}.${i + 1}`).catch(ignoreMissing);
+    }
+    // oxlint-disable-next-line no-await-in-loop
+    await copyFile(file, `${file}.1`);
+    // oxlint-disable-next-line no-await-in-loop
+    await truncate(file, 0);
+  }
+};
 
 /**
  * The environment the executor needs; launchd starts agents with almost none. The Claude variables carry the login a

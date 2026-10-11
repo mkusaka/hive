@@ -22,6 +22,7 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK), `codex` 
   (`claim`, `intent`, `result`, `uploaded`). The intent is written before the adapter starts (§20.2).
   `transcriptReader(stateDir)` reads `<state-dir>/transcripts/<runId>.jsonl` (null when absent).
 - `src/uploader.ts`: transcript upload (see Transcript upload).
+- `src/retention.ts`: `pruneRunData`, local Run data retention (see Local retention).
 - `src/adapters/fake.ts`: exits after `FAKE_DELAY_MS` (default 50) with code 0 and summary
   `fake: handled inbox item <id>`; `FAKE_FAIL=1` exits 1. It is idempotent, so reconcile may simply start it again.
 - `src/adapters/claude.ts`: one SDK `query()` per Run (see below).
@@ -148,7 +149,25 @@ failed: ...`.
 - **ACK.** `{kind: "uploaded", runId, lastPartSeq}` is journaled only after `complete` succeeded. A failure is retried
   3 times (1 s, 2 s backoff), then logged; the Run stays `persistence: pending` until the next start. The poll loop
   never fails because of an upload.
-- **Retention.** The local transcript file is kept; there is no local cleanup yet.
+- **Retention.** The local transcript file is kept until the retention sweep (see Local retention).
+
+## Local retention
+
+`pruneRunData(stateDir)` (LOG-01) runs once when `hive executor run` starts, before the journal is opened and the
+loop reconciles, so nothing appends meanwhile. Rules, with a 30-day cutoff:
+
+- **Pruned Run.** Its journal has a `claim`, its last `result` is not `stale_generation`, and an `uploaded` entry
+  after that result was journaled more than 30 days ago (its `at`). Its `transcripts/<runId>.jsonl`, its
+  `runs/<runId>/` scratch dir and its journal lines are deleted. Never pruned: an active Run (no result), an
+  unconfirmed `stale_generation`, a Run pending upload, a `missing` Run (the uploader skips it, so it is never
+  `uploaded`), anything the journal does not know.
+- **Session journals.** `sessions/<sessionId>[.<subpath>].jsonl` is deleted when no remaining transcript names that
+  session in `system/init` and the file was last written more than 30 days ago. The cloud keeps the uploaded snapshot,
+  so a later resume `load`s it from there.
+- **Journal compaction.** After the deletions, `journal.jsonl` is rewritten without the pruned Runs' lines (and
+  without a torn last line) to `journal.jsonl.tmp`, fsynced and renamed over it. A crash before the rename leaves the
+  old journal; the next start prunes the same Runs again.
+- A failing sweep is logged and the executor starts anyway. The standalone `src/main.ts` does not run it.
 
 ## Tool policy and approvals
 
@@ -224,7 +243,8 @@ aborts the wait. The provider response never reaches the model. Codex gets the s
 `test/uploader.test.ts` covers the splitter and the uploader's ACK / retry rules; `test/claude.test.ts` drives the Claude adapter with a fake `queryFn` (SDK message shapes, no subprocess);
 `test/codex.test.ts` drives the Codex adapter against `test/fakeCodex.mjs`, a scripted app-server spawned with
 `process.execPath` (happy path, journaling order, approvals, deny, outside paths, stop, kill, crash, hive tools);
-`test/tools.test.ts` covers the hive tools and the `waiting` exit; `test/toolPolicy.test.ts` the SDK options, the
+`test/tools.test.ts` covers the hive tools and the `waiting` exit; `test/retention.test.ts` the retention rules on a
+fake state dir; `test/toolPolicy.test.ts` the SDK options, the
 path hook, the approval gate and the environment cwd; the end-to-end
 loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (workerd).
 
@@ -232,8 +252,8 @@ loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (
 
 - No process supervisor: the adapter runs in-process; no PID / start identity in the journal, so reconcile can only
   resume idempotent adapters.
-- Transcripts are uploaded after the Run, not streamed while it runs; no artifact upload, no local retention
-  cleanup and no SessionStore adapter (G-07), so no cross-device resume. A failed upload is retried only at the
+- Transcripts are uploaded after the Run, not streamed while it runs; no artifact upload and no SessionStore
+  adapter (G-07), so no cross-device resume. A failed upload is retried only at the
   next start.
 - No OS sandbox and no Bash path restriction. External writes are brokered only through `hive_slack_post` /
   `hive_github_comment`: a GitHub or Slack token reachable from Bash bypasses the broker's duplicate prevention

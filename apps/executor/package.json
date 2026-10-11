@@ -14,7 +14,8 @@
     "./sessionStore": "./src/sessionStore.ts",
     "./environments": "./src/environments.ts",
     "./gitCollector": "./src/gitCollector.ts",
-    "./capabilities": "./src/capabilities.ts"
+    "./capabilities": "./src/capabilities.ts",
+    "./retention": "./src/retention.ts"
   },
   "scripts": {
     "start": "bun run src/main.ts"
