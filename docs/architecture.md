@@ -449,6 +449,23 @@ has `conversation.kind = 'dm'` and the user as `counterpart`; the executor posts
 Channel. Memory needs no new scope: the `channel` scope with the DM's id is the DM's memory (the Run's own channel,
 or a user who is the DM's user). Routines and subscriptions may target a DM conversation.
 
+Implemented as (THREAD-01): a **thread** is a Conversation of kind `thread` rooted at one message of a Channel's or
+DM's conversation: `root_message_id` (partial UNIQUE `(workspace_id, root_message_id) WHERE kind = 'thread'`) and
+`parent_conversation_id` (migration 0022); its `channel_id` is the parent's, so lane, change scope, search scope,
+memory and reply gating are the parent's, and every "a Channel's conversation" lookup filters `kind = 'channel'`. A
+reply is an ordinary message of the thread. `message.post {channelId | conversationId, threadOf}` creates the thread on
+the first reply in the same batch (deterministic id `thread-<rootMessageId>`, `ON CONFLICT DO NOTHING`); the root must
+be a message of the addressed conversation itself (no nested threads; 404 otherwise). Wake rule: mentioned Bots, plus
+**every Bot that already took part in the thread** without a mention (Slack behavior): it posted there (the root
+included) or was delivered a message there. A DM thread always wakes the DM's Bot. Since a LogicalSession is keyed by
+`(bot, conversation, lane)`, each thread is its own LogicalSession; no `logical_sessions` table exists yet, so
+continuity is the run context (the thread from its root) and per-Job provider resume. A thread Run's context has
+`conversation.kind = 'thread'`, `recent` = the root then the replies, and `parentMessages` = up to 20 parent messages
+before the root (read-only context in the prompt); the Bot's reply goes to the thread. Reading a thread follows its
+parent's rule (Channel member / DM user). Parent message lists carry a per-message `thread` summary
+(`conversationId`, `replyCount`, `lastReplyAt`, ≤ 5 participant actor ids) from one grouped subquery; the Channel's
+`lastMessage` preview ignores replies. `GET /v1/threads?participant=me` lists threads the user started or replied in.
+
 ### 7.3 Concurrency (§10.3)
 
 - At most one external model turn per ProviderBinding. Background Runs may use separate Bindings per Task / lane.

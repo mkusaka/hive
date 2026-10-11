@@ -48,6 +48,7 @@ import {
   listChannelMembers,
   listRoutines,
   listSubscriptions,
+  listThreads,
   listTasks,
 } from "./queries.ts";
 import {
@@ -432,6 +433,12 @@ export const createApp = ({
       }),
     ),
   );
+  app.get("/v1/threads", async (c) => {
+    if (c.req.query("participant") !== "me") {
+      throw new HttpError("INVALID_INPUT", "participant=me is required");
+    }
+    return c.json(await listThreads(c.env.DB, workspaceParam(c), user(c).userId));
+  });
   app.get("/v1/sidebar", async (c) =>
     c.json(await getSidebar(c.env.DB, workspaceParam(c), user(c).userId)),
   );

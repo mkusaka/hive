@@ -567,7 +567,7 @@ export const getRunContext = async (
       item_id: string | null;
       conversation_id: string | null;
       channel_id: string | null;
-      conversation_kind: "channel" | "bot_pair" | "dm" | null;
+      conversation_kind: "channel" | "bot_pair" | "dm" | "thread" | null;
       message_id: string | null;
       message_kind: string | null;
       from_bot_id: string | null;
@@ -599,7 +599,7 @@ export const getRunContext = async (
         id: string;
         conversation_id: string | null;
         channel_id: string | null;
-        kind: "channel" | "bot_pair" | "dm";
+        kind: "channel" | "bot_pair" | "dm" | "thread";
         body: string;
       }>();
     batch = { id: row.inbox_batch_id, items: results.map(({ id, body }) => ({ id, body })) };
@@ -608,17 +608,49 @@ export const getRunContext = async (
     row.conversation_kind = results[0]?.kind ?? null;
   }
   let conversation: RunContext["conversation"] = null;
+  let parentMessages: RunContext["parentMessages"] = [];
   if (row.conversation_id && row.channel_id) {
-    const { results } = await db
-      .prepare(
-        `SELECT actorKind, actorId, body, createdAt FROM (
-           SELECT a.kind AS actorKind, a.id AS actorId, m.body, m.created_at AS createdAt, m.seq
-             FROM messages m JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-            WHERE m.workspace_id = ? AND m.conversation_id = ? ORDER BY m.seq DESC LIMIT 20
-         ) ORDER BY seq`,
-      )
-      .bind(workspaceId, row.conversation_id)
-      .all<NonNullable<RunContext["conversation"]>["recent"][number]>();
+    // The last 20 messages of `conversation`, oldest first, optionally only those before message `before`.
+    const lastMessages = async (conversationId: string, before: string | null) =>
+      (
+        await db
+          .prepare(
+            `SELECT actorKind, actorId, body, createdAt FROM (
+               SELECT a.kind AS actorKind, a.id AS actorId, m.body, m.created_at AS createdAt, m.seq
+                 FROM messages m JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+                WHERE m.workspace_id = ?1 AND m.conversation_id = ?2
+                  AND (?3 IS NULL OR m.seq < (SELECT seq FROM messages WHERE id = ?3))
+                ORDER BY m.seq DESC LIMIT 20
+             ) ORDER BY seq`,
+          )
+          .bind(workspaceId, conversationId, before)
+          .all<RunContext["parentMessages"][number]>()
+      ).results;
+    const results = await lastMessages(row.conversation_id, null);
+    // A thread: its root message first, and the parent's messages before the root as read-only context.
+    const thread =
+      row.conversation_kind === "thread"
+        ? await db
+            .prepare(
+              `SELECT c.parent_conversation_id, c.root_message_id, a.kind AS actorKind, a.id AS actorId, m.body, m.created_at AS createdAt
+                 FROM conversations c
+                 JOIN messages m ON m.workspace_id = c.workspace_id AND m.id = c.root_message_id
+                 JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+                WHERE c.workspace_id = ? AND c.id = ?`,
+            )
+            .bind(workspaceId, row.conversation_id)
+            .first<
+              RunContext["parentMessages"][number] & {
+                parent_conversation_id: string;
+                root_message_id: string;
+              }
+            >()
+        : null;
+    if (thread) {
+      const { parent_conversation_id: parentId, root_message_id: rootId, ...root } = thread;
+      results.unshift(root);
+      parentMessages = await lastMessages(parentId, rootId);
+    }
     // A DM's counterpart: its user's actor.
     const counterpart =
       row.conversation_kind === "dm"
@@ -726,6 +758,7 @@ export const getRunContext = async (
   if (conversation) {
     conversation.recent = conversation.recent.map((m) => ({ ...m, body: named(m.body) }));
   }
+  parentMessages = parentMessages.map((m) => ({ ...m, body: named(m.body) }));
   if (batch) batch.items = batch.items.map((i) => ({ ...i, body: named(i.body) }));
   return {
     previousProviderSessionId: previous?.provider_session_id ?? null,
@@ -746,6 +779,7 @@ export const getRunContext = async (
             description: row.description ?? "",
           },
     conversation,
+    parentMessages,
     inboxItem: row.item_id
       ? {
           id: row.item_id,

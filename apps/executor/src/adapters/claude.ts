@@ -35,13 +35,19 @@ export const systemPrompt = ({ bot }: LaunchContext["context"]) =>
     .filter(Boolean)
     .join("\n\n");
 
+/** One conversation line of the prompt. */
+const promptLine = (m: { actorKind: string; actorId: string; body: string }) =>
+  `[${m.actorKind} ${m.actorId}] ${m.body}`;
+
 /**
- * User message: Task, recent conversation (oldest first), Memory, Related search hits, then the trigger item's body
- * (naming the sending Bot), the batch's items or a Delegation's instructions, then replies to this Job's earlier requests.
+ * User message: Task, a thread's parent messages, recent conversation (oldest first), Memory, Related search hits,
+ * then the trigger item's body (naming the sending Bot), the batch's items or a Delegation's instructions, then replies
+ * to this Job's earlier requests.
  */
 export const userPrompt = ({
   task,
   conversation,
+  parentMessages,
   inboxItem,
   batch,
   replies,
@@ -54,9 +60,16 @@ export const userPrompt = ({
   if (conversation?.counterpart) {
     parts.push(`Direct message with user ${conversation.counterpart.name}.`);
   }
+  if (parentMessages.length) {
+    parts.push(
+      `Earlier in the channel, before this thread (read-only context):\n${parentMessages.map(promptLine).join("\n")}`,
+    );
+  }
   if (conversation?.recent.length) {
-    const lines = conversation.recent.map((m) => `[${m.actorKind} ${m.actorId}] ${m.body}`);
-    parts.push(`Recent conversation:\n${lines.join("\n")}`);
+    const lines = conversation.recent.map(promptLine);
+    parts.push(
+      `${conversation.kind === "thread" ? "Thread (root message first)" : "Recent conversation"}:\n${lines.join("\n")}`,
+    );
   }
   if (memories.length) {
     parts.push(`Memory:\n${memories.map((m) => `- (${m.scopeKind}) ${m.content}`).join("\n")}`);

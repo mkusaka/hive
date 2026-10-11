@@ -239,12 +239,15 @@ export const renderMentions = (text: string, names: ReadonlyMap<string, string>)
  * A user's Channel message (docs/architecture.md §7.2). Every Bot mentioned with a token gets the Inbox item + Job that
  * `agent.send` with `request` / `wake` gives (and joins the Channel); no mention = only posted. `mentions`, when given,
  * must equal the tokens. With `conversationId` (a DM) instead of `channelId`, the DM's Bot is always the recipient.
+ * `threadOf` (a message of that Channel / DM) posts the reply in the message's thread, created on the first reply;
+ * in a Channel thread every Bot that already took part in it is woken too, mentioned or not.
  */
 export const MessagePost = v.pipe(
   v.strictObject({
     type: v.literal("message.post"),
     channelId: v.optional(ChannelId),
     conversationId: v.optional(v.pipe(v.string(), v.minLength(1))),
+    threadOf: v.optional(v.pipe(v.string(), v.minLength(1))),
     text: MessageText,
     mentions: v.optional(v.array(BotId)),
   }),
@@ -618,7 +621,9 @@ export type MessagePostAccepted = {
   operationId: string;
   status: "accepted";
   messageId: string;
-  /** One per mentioned Bot, in mention order; empty when nobody was mentioned. */
+  /** Where the message landed: the Channel's / DM's conversation, or the thread's. */
+  conversationId: string;
+  /** One per woken Bot (mentioned ones in mention order); empty when nobody was woken. */
   inboxItemIds: string[];
   receivedAt: string;
 };
@@ -931,6 +936,8 @@ export type QueuedJob = {
   createdAt: string;
 };
 
+type ContextMessage = { actorKind: string; actorId: string; body: string; createdAt: string };
+
 /** `GET /v1/executor/runs/:id`: the device's own Run, for reconcile after a restart. */
 /** `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=`: what the adapter builds its prompt from. */
 export type RunContext = {
@@ -941,12 +948,14 @@ export type RunContext = {
   conversation: {
     id: string;
     channelId: string;
-    kind: "channel" | "bot_pair" | "dm";
+    kind: "channel" | "bot_pair" | "dm" | "thread";
     /** A DM's user, the Bot's counterpart; null otherwise. */
     counterpart: { actorId: string; name: string } | null;
-    /** The last 20 messages, oldest first. */
-    recent: { actorKind: string; actorId: string; body: string; createdAt: string }[];
+    /** The last 20 messages, oldest first; a thread's start with its root message. */
+    recent: ContextMessage[];
   } | null;
+  /** A thread's parent Channel / DM: up to 20 messages before the root, oldest first (read-only context). */
+  parentMessages: ContextMessage[];
   /** `fromBot` is set when another Bot sent the message (kind `request` / `notification`). */
   inboxItem: {
     id: string;

@@ -45,6 +45,8 @@ export const Avatar = (props: { id: string; name: string; size?: number; plain?:
 const icons = {
   sidebar: "M6 4h12a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3z M9 4v16",
   inbox: "M3 13h5l1 3h6l1-3h5 M5.5 5h13L21 13v6H3v-6z",
+  thread: "M21 11.5a8.5 8.5 0 0 1-12.6 7.4L3 20l1.1-5.4A8.5 8.5 0 1 1 21 11.5z",
+  threads: "M21 11.5a8.5 8.5 0 0 1-12.6 7.4L3 20l1.1-5.4A8.5 8.5 0 1 1 21 11.5z M8 10h8 M8 13.5h5",
   activity: "M3 12h4l3-8 4 16 3-8h4",
   approvals: "M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z M9 12l2 2 4-4",
   search: "M18 11a7 7 0 1 1-14 0a7 7 0 1 1 14 0 M16 16l5 5",

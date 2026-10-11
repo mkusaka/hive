@@ -141,7 +141,7 @@ export const listChannels = async (db: D1Database, workspaceId: string, userId: 
          FROM channels ch
          JOIN channel_members m ON m.workspace_id = ch.workspace_id AND m.channel_id = ch.id
          JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-         LEFT JOIN conversations c ON c.workspace_id = ch.workspace_id AND c.channel_id = ch.id
+         LEFT JOIN conversations c ON c.workspace_id = ch.workspace_id AND c.channel_id = ch.id AND c.kind = 'channel'
         WHERE ch.workspace_id = ? AND a.user_id = ?
         ORDER BY ch.name LIMIT 500`,
     )
@@ -316,9 +316,37 @@ export const listJobs = async (
   return { jobs: results };
 };
 
+/** SQL: user `?uid` may read conversation `c`: a member of its Channel, or the user of its DM (a thread: its parent's). */
+const mayRead = (uid: string) => `EXISTS (
+  SELECT 1 FROM conversations p WHERE p.workspace_id = c.workspace_id AND p.id = COALESCE(c.parent_conversation_id, c.id)
+     AND ((p.kind = 'dm' AND p.dm_user_id = ${uid})
+          OR (p.kind = 'channel' AND EXISTS (SELECT 1 FROM channel_members cm
+                JOIN actors ca ON ca.workspace_id = cm.workspace_id AND ca.id = cm.actor_id
+               WHERE cm.workspace_id = p.workspace_id AND cm.channel_id = p.channel_id AND ca.user_id = ${uid}))))`;
+
+/** Per thread of the conversation `?parent`: its id, reply count, last reply and up to 5 participants (actor ids). */
+const threadSummaries = (parent: string) => `SELECT t.root_message_id, t.id AS conversationId,
+    COUNT(r.id) AS replyCount, MAX(r.created_at) AS lastReplyAt,
+    (SELECT json_group_array(actor_id) FROM (SELECT DISTINCT actor_id FROM messages
+       WHERE workspace_id = t.workspace_id AND conversation_id = t.id LIMIT 5)) AS participants
+  FROM conversations t JOIN messages r ON r.workspace_id = t.workspace_id AND r.conversation_id = t.id
+ WHERE t.workspace_id = ?1 AND t.parent_conversation_id = ${parent} AND t.kind = 'thread'
+ GROUP BY t.id`;
+
+const messageColumns = `m.id, m.conversation_id AS conversationId, m.seq, m.actor_id AS actorId, a.user_id AS userId,
+  m.body, m.created_at AS createdAt`;
+
+type Thread = {
+  conversationId: string;
+  replyCount: number;
+  lastReplyAt: string;
+  participants: string[];
+};
+
 /**
- * Newest first, from a channel's main conversation (`channelId`, members only) or a DM (`conversationId`, its user
- * only); 404 otherwise.
+ * Newest first, from a channel's main conversation (`channelId`, members only), a DM (`conversationId`, its user only)
+ * or a thread (`conversationId`, whoever may read its parent); 404 otherwise. Each message carries its `thread`
+ * summary (null without replies); a thread's response also has its `root` message.
  */
 export const listMessages = async (
   db: D1Database,
@@ -331,31 +359,75 @@ export const listMessages = async (
     "channelId" in input
       ? db
           .prepare(
-            `SELECT c.id FROM conversations c
+            `SELECT c.id, c.root_message_id FROM conversations c
              JOIN channel_members m ON m.workspace_id = c.workspace_id AND m.channel_id = c.channel_id
              JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-            WHERE c.workspace_id = ? AND c.channel_id = ? AND a.user_id = ?`,
+            WHERE c.workspace_id = ? AND c.channel_id = ? AND c.kind = 'channel' AND a.user_id = ?`,
           )
           .bind(input.workspaceId, input.channelId, input.userId)
       : db
           .prepare(
-            "SELECT id FROM conversations WHERE workspace_id = ? AND id = ? AND kind = 'dm' AND dm_user_id = ?",
+            `SELECT c.id, c.root_message_id FROM conversations c
+              WHERE c.workspace_id = ?1 AND c.id = ?2 AND c.kind IN ('dm', 'thread') AND ${mayRead("?3")}`,
           )
           .bind(input.workspaceId, input.conversationId, input.userId)
-  ).first<{ id: string }>();
+  ).first<{ id: string; root_message_id: string | null }>();
   if (!conversation) throw notFound("channelId" in input ? "channel" : "conversation");
   const { results } = await db
     .prepare(
-      `SELECT m.id, m.conversation_id AS conversationId, m.seq, m.actor_id AS actorId, a.user_id AS userId, m.body,
-              m.created_at AS createdAt
+      `SELECT ${messageColumns},
+              CASE WHEN th.conversationId IS NULL THEN NULL ELSE json_object('conversationId', th.conversationId,
+                'replyCount', th.replyCount, 'lastReplyAt', th.lastReplyAt, 'participants', json(th.participants))
+              END AS thread
          FROM messages m
          LEFT JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-        WHERE m.workspace_id = ? AND m.conversation_id = ?
-        ORDER BY m.seq DESC LIMIT ?`,
+         LEFT JOIN (${threadSummaries("?2")}) th ON th.root_message_id = m.id
+        WHERE m.workspace_id = ?1 AND m.conversation_id = ?2
+        ORDER BY m.seq DESC LIMIT ?3`,
     )
     .bind(input.workspaceId, conversation.id, input.limit)
-    .all();
-  return { messages: results };
+    .all<{ thread: string | Thread | null }>();
+  for (const m of results) m.thread = m.thread && (JSON.parse(m.thread as string) as Thread);
+  if (!conversation.root_message_id) return { messages: results };
+  const root = await db
+    .prepare(
+      `SELECT ${messageColumns} FROM messages m
+         LEFT JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+        WHERE m.workspace_id = ? AND m.id = ?`,
+    )
+    .bind(input.workspaceId, conversation.root_message_id)
+    .first();
+  return { messages: results, root };
+};
+
+/**
+ * `GET /v1/threads?participant=me`: threads the user replied in or started (authored the root) and may still read,
+ * newest reply first (max 50), each with its root message, parent and reply summary.
+ */
+export const listThreads = async (db: D1Database, workspaceId: string, userId: string) => {
+  const { results } = await db
+    .prepare(
+      `SELECT c.id AS conversationId, c.channel_id AS channelId, c.parent_conversation_id AS parentConversationId,
+              p.kind AS parentKind, ch.name AS channelName,
+              json_object('id', rm.id, 'actorId', rm.actor_id, 'body', rm.body, 'createdAt', rm.created_at) AS root,
+              (SELECT COUNT(*) FROM messages r WHERE r.workspace_id = c.workspace_id AND r.conversation_id = c.id)
+                AS replyCount,
+              (SELECT MAX(created_at) FROM messages r WHERE r.workspace_id = c.workspace_id AND r.conversation_id = c.id)
+                AS lastReplyAt
+         FROM conversations c
+         JOIN conversations p ON p.workspace_id = c.workspace_id AND p.id = c.parent_conversation_id
+         JOIN channels ch ON ch.workspace_id = c.workspace_id AND ch.id = c.channel_id
+         JOIN messages rm ON rm.workspace_id = c.workspace_id AND rm.id = c.root_message_id
+         JOIN actors me ON me.workspace_id = c.workspace_id AND me.user_id = ?2
+        WHERE c.workspace_id = ?1 AND c.kind = 'thread' AND ${mayRead("?2")}
+          AND (rm.actor_id = me.id OR EXISTS (SELECT 1 FROM messages r WHERE r.workspace_id = c.workspace_id
+                                                AND r.conversation_id = c.id AND r.actor_id = me.id))
+        ORDER BY lastReplyAt DESC, c.id LIMIT 50`,
+    )
+    .bind(workspaceId, userId)
+    .all<{ root: string | Record<string, unknown> }>();
+  for (const t of results) t.root = JSON.parse(t.root as string) as Record<string, unknown>;
+  return { threads: results };
 };
 
 // ------------------------------------------------- Projects and Tasks (§4)

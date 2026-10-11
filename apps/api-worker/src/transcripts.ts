@@ -391,7 +391,7 @@ const transcriptAccess = async (
                         JOIN conversations cv ON cv.workspace_id = i.workspace_id AND cv.id = i.conversation_id
                         JOIN channel_members m ON m.workspace_id = cv.workspace_id AND m.channel_id = cv.channel_id
                         JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-                       WHERE j.workspace_id = r.workspace_id AND j.id = r.job_id AND cv.kind = 'channel'
+                       WHERE j.workspace_id = r.workspace_id AND j.id = r.job_id AND cv.kind IN ('channel', 'thread')
                          AND a.user_id = ?1) AS member
          FROM runs r LEFT JOIN transcript_streams s ON s.run_id = r.id AND s.kind = 'run'
         WHERE r.id = ?2 AND r.workspace_id IN (SELECT value FROM json_each(?3))`,

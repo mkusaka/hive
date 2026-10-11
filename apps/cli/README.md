@@ -39,7 +39,8 @@ hive memory write --scope <workspace|channel:<id>|project:<id>|bot:<id>|task:<id
 hive memory list --scope <...>                         # live memories of the scope, newest first
 hive memory delete <memory-id> [--revision <n>]        # tombstone; a live memory is at revision 1
 hive agent send <bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]
-hive message post (--channel <channel-id> | --conversation <dm-id>) --text <text> [--resolve-names]  # <@bot:ID> wakes that Bot (a DM always wakes its Bot); --resolve-names maps @name
+hive message post (--channel <channel-id> | --conversation <dm-id>) [--thread-of <message-id>] --text <text> [--resolve-names]  # <@bot:ID> wakes that Bot (a DM always wakes its Bot); --thread-of replies in that message's thread (Bots already in it wake too); --resolve-names maps @name
+hive thread list                                      # threads you started or replied in, newest reply first
 hive event emit <type> [--data-file <path|->] [--subject <kind:id>]
 hive op get <operation-id>
 hive run get <run-id>                                  # state, persistence (pending|complete), transcript parts, git

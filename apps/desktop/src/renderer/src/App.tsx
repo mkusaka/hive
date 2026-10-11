@@ -4,7 +4,7 @@
 import type { SidebarPrefs } from "@hive/contracts";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HiveConfig } from "../../shared/api.ts";
-import { ChannelView } from "./chat.tsx";
+import { ChannelView, ThreadPanel } from "./chat.tsx";
 import { BotPanel, ChannelPanel, type ChannelTab } from "./panel.tsx";
 import { Sidebar, togglePin, type View } from "./sidebar.tsx";
 import { createSync, type ListKey, type SyncStatus } from "./sync.ts";
@@ -24,6 +24,9 @@ export const App = () => {
   const [channels, setChannels] = useState<Row[]>([]);
   const [dms, setDms] = useState<Row[]>([]);
   const [messages, setMessages] = useState<Row[]>([]);
+  const [threads, setThreads] = useState<Row[]>([]);
+  // The open Thread panel's replies, oldest first.
+  const [replies, setReplies] = useState<Row[]>([]);
   const [bots, setBots] = useState<Row[]>([]);
   const [inbox, setInbox] = useState<Row[]>([]);
   const [jobs, setJobs] = useState<Row[]>([]);
@@ -45,10 +48,14 @@ export const App = () => {
   // The revision the next sidebar.update expects: ahead of `side` while saves are in flight.
   const sideRevision = useRef(0);
   const saving = useRef(Promise.resolve());
-  // One right panel at a time: a Bot's, or the current Channel's.
+  // One right panel at a time: a Bot's, the current Channel's, or a thread (null `conversationId` until its first reply).
   const [panel, setPanel] = useState<
-    { kind: "bot"; id: string } | { kind: "channel"; tab: ChannelTab } | null
+    | { kind: "bot"; id: string }
+    | { kind: "channel"; tab: ChannelTab }
+    | ({ kind: "thread"; conversationId: string | null } & ThreadOpen)
+    | null
   >(null);
+  const thread = panel?.kind === "thread" ? panel : null;
   const panelBot = panel?.kind === "bot" ? panel.id : null;
   const openBot = useCallback((id: string | null) => setPanel(id ? { kind: "bot", id } : null), []);
   const [collapsed, setCollapsed] = useState(() => {
@@ -94,11 +101,18 @@ export const App = () => {
   };
 
   // Refetches run from sync callbacks, so they read the current selection through refs.
-  const selection = useRef({ channelId, dmId, botId, runId });
-  selection.current = { channelId, dmId, botId, runId };
+  const threadId = thread?.conversationId ?? null;
+  const selection = useRef({ channelId, dmId, botId, runId, threadId });
+  selection.current = { channelId, dmId, botId, runId, threadId };
 
   const refetch = useCallback(async (keys: Set<ListKey>, ws: string) => {
-    const { channelId: ch, dmId: dm, botId: bot, runId: inspected } = selection.current;
+    const {
+      channelId: ch,
+      dmId: dm,
+      botId: bot,
+      runId: inspected,
+      threadId: th,
+    } = selection.current;
     const tasks: Promise<void>[] = [];
     if (keys.has("run") && inspected) tasks.push(inspect(inspected).then(setRun));
     const load = (key: ListKey, path: string | null, field: string, set: (rows: Row[]) => void) => {
@@ -125,6 +139,17 @@ export const App = () => {
       "messages",
       (rows) => setMessages(rows.toReversed()),
     );
+    load("threads", inWorkspace("threads", ws, { participant: "me" }), "threads", setThreads);
+    if (keys.has("thread") && th)
+      tasks.push(
+        get(inWorkspace(`conversations/${encodeURIComponent(th)}/messages`, ws)).then((body) => {
+          setReplies((body.messages as Row[]).toReversed());
+          // The served root names its author's user ("You"); a Threads row's root does not.
+          setPanel((p) =>
+            p?.kind === "thread" && p.conversationId === th ? { ...p, root: body.root as Row } : p,
+          );
+        }),
+      );
     load("inbox", bot && `/v1/inbox?${new URLSearchParams({ botId: bot })}`, "items", setInbox);
     if (keys.has("sidebar"))
       tasks.push(
@@ -250,6 +275,11 @@ export const App = () => {
       void refetch(new Set(["inbox"]), config.workspaceId);
   }, [config, botId, refetch]);
   useEffect(() => {
+    setReplies([]);
+    if (config && !config.problem && !config.loginRequired && threadId)
+      void refetch(new Set(["thread"]), config.workspaceId);
+  }, [config, threadId, refetch]);
+  useEffect(() => {
     setRun(null);
     if (config && !config.problem && !config.loginRequired && runId)
       void refetch(new Set(["run"]), config.workspaceId);
@@ -294,9 +324,24 @@ export const App = () => {
   const current = dmId
     ? { kind: "dm" as const, id: dmId }
     : { kind: "channel" as const, id: channelId };
+  /** Opens a message's thread (the Bot / Channel panel closes); a Threads row also switches to its Channel / DM. */
+  const openThread = (root: Row, conversationId: string | null, at: ThreadOpen["at"]) => {
+    const bot = at.kind === "dm" ? dms.find((d) => d.id === at.id) : undefined;
+    setChannelId(at.kind === "channel" ? at.id : channelId);
+    setDmId(at.kind === "dm" ? at.id : null);
+    setView("channel");
+    setPanel({
+      kind: "thread",
+      conversationId,
+      root,
+      at,
+      title:
+        at.kind === "dm" ? text(bot?.name) : `#${text(channels.find((c) => c.id === at.id)?.name)}`,
+    });
+  };
 
   return (
-    <div className={`app ${panelBotRow || channelPanel ? "with-panel" : ""}`}>
+    <div className={`app ${panelBotRow || channelPanel || thread ? "with-panel" : ""}`}>
       <Sidebar
         workspaceName={side.workspaceName}
         prefs={side.prefs}
@@ -329,6 +374,13 @@ export const App = () => {
             bots={bots}
             me={me}
             openBot={openBot}
+            openThread={(m) =>
+              openThread(
+                m,
+                (m.thread as { conversationId?: string } | null)?.conversationId ?? null,
+                current,
+              )
+            }
             toggleChannelPanel={() =>
               setPanel(channelPanel ? null : { kind: "channel", tab: "about" })
             }
@@ -336,6 +388,38 @@ export const App = () => {
             starred={side.prefs.pinned.some((i) => i.kind === current.kind && i.id === current.id)}
             toggleStar={() => updateSidebar(togglePin(side.prefs, current))}
           />
+        )}
+        {view === "threads" && (
+          <section className="view">
+            <h2>Threads</h2>
+            {threads.length === 0 && <p className="muted">No threads yet.</p>}
+            <ul className="list threads">
+              {threads.map((t) => {
+                const root = t.root as Row;
+                return (
+                  <li key={String(t.conversationId)}>
+                    <button
+                      onClick={() =>
+                        openThread(root, String(t.conversationId), {
+                          kind: t.parentKind === "dm" ? "dm" : "channel",
+                          id: String(t.parentKind === "dm" ? t.parentConversationId : t.channelId),
+                        })
+                      }
+                    >
+                      <span className="muted">
+                        {t.parentKind === "dm" ? "DM" : `#${text(t.channelName)}`}
+                      </span>{" "}
+                      <span className="ellipsis">{text(root.body)}</span>{" "}
+                      <span className="muted">
+                        {text(t.replyCount)} {t.replyCount === 1 ? "reply" : "replies"} · last reply{" "}
+                        {new Date(String(t.lastReplyAt)).toLocaleString("en-US")}
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </section>
         )}
         {view === "inbox" && (
           <section className="view">
@@ -481,6 +565,30 @@ export const App = () => {
           close={() => setPanel(null)}
         />
       )}
+      {thread && (
+        <ThreadPanel
+          ws={ws}
+          title={thread.title}
+          root={thread.root}
+          replies={replies}
+          target={
+            thread.at.kind === "dm" ? { conversationId: thread.at.id } : { channelId: thread.at.id }
+          }
+          dmBot={
+            thread.at.kind === "dm"
+              ? String(dms.find((d) => d.id === thread.at.id)?.botId ?? "")
+              : null
+          }
+          bots={bots}
+          me={me}
+          openBot={openBot}
+          onPosted={(id) => {
+            if (id === thread.conversationId) return void refetch(new Set(["thread"]), ws);
+            setPanel({ ...thread, conversationId: id });
+          }}
+          close={() => setPanel(null)}
+        />
+      )}
       {channelPanel && (
         <ChannelPanel
           ws={ws}
@@ -498,6 +606,9 @@ export const App = () => {
     </div>
   );
 };
+
+/** What the Thread panel shows: the root message, where it lives and the header title. */
+type ThreadOpen = { root: Row; at: { kind: "channel" | "dm"; id: string }; title: string };
 
 type Inspected = {
   detail: Record<string, unknown>;

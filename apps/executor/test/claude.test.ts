@@ -11,7 +11,7 @@ import type {
   SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
 import { describe, expect, it } from "vitest";
-import { claudeAdapter, type QueryFn } from "../src/adapters/claude.ts";
+import { claudeAdapter, type QueryFn, userPrompt } from "../src/adapters/claude.ts";
 import { type JournalEntry, type LaunchContext, reconcile, runOnce } from "../src/runner.ts";
 import { context, fakeCloud, memoryJournal } from "./helpers.ts";
 
@@ -93,6 +93,13 @@ const fakeStore = (entries: SessionStoreEntry[] | null) => {
   return { store, loads };
 };
 
+const msg = (actorId: string, body: string) => ({
+  actorKind: "user",
+  actorId,
+  body,
+  createdAt: "",
+});
+
 describe("claudeAdapter", () => {
   it("runs a Claude turn: observation, transcript, summary and Bot reply", async () => {
     const dir = await stateDir();
@@ -139,6 +146,22 @@ describe("claudeAdapter", () => {
       cwd: join(dir, "runs", "run-1"),
     });
     expect(options.resume).toBeUndefined();
+  });
+
+  it("prompts a thread Run with the parent's messages before the root, then the thread", () => {
+    const prompt = userPrompt({
+      ...context,
+      conversation: {
+        ...context.conversation!,
+        kind: "thread",
+        recent: [msg("a1", "root"), msg("a2", "reply")],
+      },
+      parentMessages: [msg("a3", "before")],
+    });
+    expect(prompt).toContain(
+      "Earlier in the channel, before this thread (read-only context):\n[user a3] before\n\n" +
+        "Thread (root message first):\n[user a1] root\n[user a2] reply",
+    );
   });
 
   it("journals each message before processing it", async () => {

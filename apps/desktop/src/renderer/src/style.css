@@ -513,7 +513,7 @@ button.pill:hover {
 .hover-actions {
   position: absolute;
   right: 0;
-  top: 50%;
+  top: 24px;
   display: none;
 }
 .message:hover .hover-actions {
@@ -528,6 +528,51 @@ button.pill:hover {
   border-radius: 50%;
   background: none;
   color: var(--text-2);
+}
+/* A message's thread: participant blobs, reply count and last reply time. */
+.thread-footer {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 4px 0 0 8px;
+  padding: 2px 8px 2px 2px;
+  border-radius: 999px;
+  background: none;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.thread-footer:hover {
+  background: var(--bg-quaternary);
+}
+.thread-footer .replies {
+  margin-left: 4px;
+  color: var(--accent);
+  font-weight: 500;
+}
+.thread-footer .last-reply {
+  color: var(--text-3);
+}
+.muted {
+  color: var(--text-3);
+}
+.thread-panel {
+  overflow: hidden;
+}
+.thread-panel .panel-top {
+  justify-content: space-between;
+  align-items: center;
+}
+.thread-panel h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 500;
+}
+.reply-count {
+  margin: 8px 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--bg-tertiary);
+  color: var(--text-3);
+  font-size: 12px;
 }
 .composer {
   position: relative;

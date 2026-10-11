@@ -468,20 +468,34 @@ const specs: Record<string, Spec> = {
   },
   "message post": {
     usage:
-      "(--channel <channel-id> | --conversation <dm-conversation-id>) --text <text with <@bot:ID> tokens> [--resolve-names]",
-    options: { channel: str, conversation: str, text: str, "resolve-names": flag },
+      "(--channel <channel-id> | --conversation <dm-conversation-id>) [--thread-of <message-id>] --text <text with <@bot:ID> tokens> [--resolve-names]",
+    options: {
+      channel: str,
+      conversation: str,
+      "thread-of": str,
+      text: str,
+      "resolve-names": flag,
+    },
     run: async (c) => {
       const { channel, conversation } = c.values as { channel?: string; conversation?: string };
       if ((channel === undefined) === (conversation === undefined))
         throw invalid("exactly one of --channel / --conversation is required");
+      const threadOf = c.values["thread-of"] as string | undefined;
       c.print(
         await cmd.messagePost(c.client(), c.envelope(), {
-          target: channel ? { channelId: channel } : { conversationId: conversation! },
+          target: {
+            ...(channel ? { channelId: channel } : { conversationId: conversation! }),
+            ...(threadOf ? { threadOf } : {}),
+          },
           text: need(c.values, "text"),
           resolveNames: c.values["resolve-names"] === true,
         }),
       );
     },
+  },
+  "thread list": {
+    usage: "",
+    run: async (c) => c.print(await cmd.listThreads(c.client(), c.workspace())),
   },
   "dm open": {
     usage: "<bot-id>",

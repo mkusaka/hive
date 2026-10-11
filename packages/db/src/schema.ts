@@ -242,11 +242,15 @@ export const conversations = sqliteTable(
     id: text("id").primaryKey(),
     workspaceId: workspaceId(),
     channelId: text("channel_id").notNull(),
-    // `channel` | `bot_pair` | `dm`. No CHECK: added by ALTER TABLE.
+    // `channel` | `bot_pair` | `dm` | `thread`. No CHECK: added by ALTER TABLE.
     kind: text("kind").notNull().default("channel"),
     // A DM's user (users.id) and Bot (bots.id). No FK: added by ALTER TABLE.
     dmUserId: text("dm_user_id"),
     dmBotId: text("dm_bot_id"),
+    // A thread's root message and the Channel / DM conversation it lives under (its `channel_id` is the parent's).
+    // No FK: added by ALTER TABLE.
+    rootMessageId: text("root_message_id"),
+    parentConversationId: text("parent_conversation_id"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -255,6 +259,10 @@ export const conversations = sqliteTable(
     uniqueIndex("conversations_dm")
       .on(t.workspaceId, t.dmUserId, t.dmBotId)
       .where(sql`${t.kind} = 'dm'`),
+    uniqueIndex("conversations_thread")
+      .on(t.workspaceId, t.rootMessageId)
+      .where(sql`${t.kind} = 'thread'`),
+    index("conversations_parent").on(t.workspaceId, t.parentConversationId),
     foreignKey({
       columns: [t.workspaceId, t.channelId],
       foreignColumns: [channels.workspaceId, channels.id],

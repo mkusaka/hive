@@ -152,7 +152,7 @@ export const messagePost = async (
   c: Client,
   e: Envelope,
   input: {
-    target: { channelId: string } | { conversationId: string };
+    target: ({ channelId: string } | { conversationId: string }) & { threadOf?: string };
     text: string;
     resolveNames: boolean;
   },
@@ -199,6 +199,9 @@ export const listChannels = (c: Client, workspaceId: string) =>
   c.get(inWorkspace("channels", workspaceId));
 export const listBots = (c: Client, workspaceId: string) => c.get(inWorkspace("bots", workspaceId));
 export const listDms = (c: Client, workspaceId: string) => c.get(inWorkspace("dms", workspaceId));
+/** Threads the user replied in or started, newest reply first. */
+export const listThreads = (c: Client, workspaceId: string) =>
+  c.get(inWorkspace("threads", workspaceId, { participant: "me" }));
 /** Newest first (`limit` default 50). */
 export const listMessages = (c: Client, workspaceId: string, channelId: string) =>
   c.get(inWorkspace(`channels/${encodeURIComponent(channelId)}/messages`, workspaceId));

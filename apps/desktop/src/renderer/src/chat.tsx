@@ -98,30 +98,27 @@ export const mentionItems = (bots: Row[], query: string, dmBot: string | null) =
 
 type Suggestion = SuggestionProps<Row, { id: string; label: string }>;
 
-export const ChannelView = (props: {
+/**
+ * The message.post composer: a Tiptap editor with mention pills, the `@` popup and the operation line. `target` is the
+ * command's address (`channelId` / `conversationId`, plus `threadOf` in a thread); `dmBot` limits `@` to a DM's Bot.
+ */
+export const Composer = (props: {
   ws: string;
-  /** The Channel, or with `dm` the DM row (`id` = conversation id, `botId`, `name`). */
-  channel: Row | undefined;
-  dm: boolean;
-  messages: Row[];
+  target: Record<string, string> | null;
   bots: Row[];
-  me: string | null;
-  openBot: (id: string) => void;
-  toggleChannelPanel: () => void;
-  /** The header's member count (Members) and "…" (About). */
-  openChannelPanel: (tab: "about" | "members") => void;
-  starred: boolean;
-  toggleStar: () => void;
+  dmBot: string | null;
+  placeholder: string;
+  label: string;
+  /** After an accepted post, with the conversation it landed in. */
+  onPosted?: (conversationId: string) => void;
 }) => {
   const [suggestion, setSuggestion] = useState<Suggestion | null>(null);
   const [active, setActive] = useState(0);
   const [empty, setEmpty] = useState(true);
   const [op, setOp] = useState<Operation | null>(null);
-  const end = useRef<HTMLDivElement>(null);
   /** What the editor's extensions (created once) read at call time. */
   const live = useRef({
     props,
-    placeholder: "",
     send: async () => {},
     keyDown: (_: KeyboardEvent): boolean => false,
     menuOpen: false,
@@ -136,13 +133,13 @@ export const ChannelView = (props: {
         underline: false,
         link: false,
       }),
-      Placeholder.configure({ placeholder: () => live.current.placeholder }),
+      Placeholder.configure({ placeholder: () => live.current.props.placeholder }),
       Mention.configure({
         HTMLAttributes: { class: "mention" },
         suggestion: {
           items: ({ query }) => {
             const p = live.current.props;
-            return mentionItems(p.bots, query, p.dm ? String(p.channel?.botId) : null);
+            return mentionItems(p.bots, query, p.dmBot);
           },
           render: () => ({
             onStart: (s) => {
@@ -180,48 +177,32 @@ export const ChannelView = (props: {
       }),
     ],
     editorProps: {
-      attributes: { role: "textbox", "aria-label": "Message", "aria-multiline": "true" },
+      attributes: { role: "textbox", "aria-label": props.label, "aria-multiline": "true" },
     },
     onUpdate: ({ editor: e }) => setEmpty(toMarkdown(e.getJSON()) === ""),
   });
-  // Braces: Chromium's scrollIntoView returns a Promise, which React would call as the cleanup.
-  useEffect(() => {
-    void end.current?.scrollIntoView({ block: "end" });
-  }, [props.messages]);
 
-  const botByActor = new Map(props.bots.map((b) => [String(b.actorId), b]));
-  const names: Names = new Map(props.bots.map((b) => [b.id, String(b.name)]));
   const matches = suggestion?.items ?? [];
   const highlighted = Math.min(active, matches.length - 1);
   const pick = (b: Row) => suggestion?.command({ id: b.id, label: String(b.name) });
-  const posted = [
-    ...new Map(
-      props.messages.flatMap((m) => {
-        const b = botByActor.get(String(m.actorId));
-        return b ? [[b.id, b] as const] : [];
-      }),
-    ).values(),
-  ];
 
   const send = async () => {
     const draft = editor ? toMarkdown(editor.getJSON()) : "";
-    if (!draft || !props.channel) return;
+    if (!draft || !props.target) return;
     const operationId = crypto.randomUUID();
     const result = await window.hive.api.command({
       operationId,
       idempotencyKey: crypto.randomUUID(),
       workspaceId: props.ws,
-      command: {
-        type: "message.post",
-        ...(props.dm ? { conversationId: props.channel.id } : { channelId: props.channel.id }),
-        text: draft,
-      },
+      command: { type: "message.post", ...props.target, text: draft },
     });
     if (!result.ok) return setOp({ operationId, jobIds: null, error: result.error.message });
     editor?.chain().clearContent(true).focus().run();
-    const mentioned = (result.value.inboxItemIds as unknown[] | undefined)?.length ?? 0;
-    setOp({ operationId, jobIds: mentioned === 0 ? [] : null });
-    if (mentioned === 0) return;
+    if (typeof result.value.conversationId === "string")
+      props.onPosted?.(result.value.conversationId);
+    const woken = (result.value.inboxItemIds as unknown[] | undefined)?.length ?? 0;
+    setOp({ operationId, jobIds: woken === 0 ? [] : null });
+    if (woken === 0) return;
     // Accepted is not started: Job ids appear once routing created them (§22.4). ponytail: polls 2 s for 10 min.
     for (let i = 0; i < 300; i++) {
       await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -232,11 +213,8 @@ export const ChannelView = (props: {
     }
   };
 
-  const name = text(props.channel?.name);
-  const title = props.dm ? name : `#${name}`;
   live.current = {
     props,
-    placeholder: `Message ${title}`,
     send,
     menuOpen: matches.length > 0,
     keyDown: (event) => {
@@ -251,8 +229,181 @@ export const ChannelView = (props: {
   // The placeholder is read when decorations are drawn: redraw them when the conversation changes.
   useEffect(() => {
     if (editor && !editor.isDestroyed) editor.view.dispatch(editor.state.tr);
-  }, [editor, title]);
+  }, [editor, props.placeholder]);
 
+  return (
+    <>
+      <form
+        className="composer"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void send();
+        }}
+      >
+        {matches.length > 0 && (
+          <ul className="mentions" role="listbox" aria-label="Mention a Bot">
+            {matches.map((b, i) => (
+              <li
+                key={b.id}
+                role="option"
+                aria-selected={i === highlighted}
+                // mousedown, not click: the editor keeps focus and its caret.
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  pick(b);
+                }}
+              >
+                <Avatar id={b.id} name={String(b.name)} size={20} /> {text(b.name)}
+              </li>
+            ))}
+          </ul>
+        )}
+        <EditorContent editor={editor} className="composer-input" />
+        <button className="send" aria-label="Send" disabled={empty}>
+          <Icon name="send" />
+        </button>
+      </form>
+      <p className="op">
+        {op && (
+          <>
+            operation <span className="mono">{op.operationId}</span>:{" "}
+            {op.error ??
+              (op.jobIds === null
+                ? "accepted, routing pending"
+                : op.jobIds.length === 0
+                  ? "posted, no Bot mentioned"
+                  : op.jobIds.map((id, i) => (
+                      <Fragment key={id}>
+                        {i === 0 ? (op.jobIds!.length > 1 ? "jobs " : "job ") : ", "}
+                        <span className="mono">{id}</span>
+                      </Fragment>
+                    )))}
+          </>
+        )}
+      </p>
+    </>
+  );
+};
+
+const time = (at: unknown) =>
+  new Date(String(at)).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+
+/** A message's thread summary (`GET …/messages`). */
+type ThreadSummary = {
+  conversationId: string;
+  replyCount: number;
+  lastReplyAt: string;
+  participants: string[];
+};
+
+/** One message: author, time, bubble, hover actions and, with replies, the thread footer. */
+const Message = (props: {
+  m: Row;
+  bots: Row[];
+  me: string | null;
+  openBot: (id: string) => void;
+  /** Reply in thread / the footer; absent inside a thread. */
+  openThread?: (m: Row) => void;
+}) => {
+  const { m } = props;
+  const botByActor = new Map(props.bots.map((b) => [String(b.actorId), b]));
+  const names: Names = new Map(props.bots.map((b) => [b.id, String(b.name)]));
+  const author = botByActor.get(String(m.actorId));
+  const thread = m.thread as ThreadSummary | null | undefined;
+  return (
+    <article className="message">
+      <div className="author">
+        {author ? (
+          <button className="inline-bot" onClick={() => props.openBot(author.id)}>
+            <Avatar id={author.id} name={String(author.name)} size={20} /> {text(author.name)}
+          </button>
+        ) : (
+          <span>{props.me && m.userId === props.me ? "You" : String(m.actorId).slice(0, 8)}</span>
+        )}
+        <time>{time(m.createdAt)}</time>
+      </div>
+      <div className="bubble">
+        <Markdown source={String(m.body ?? "")} names={names} />
+      </div>
+      {thread && props.openThread && (
+        <button className="thread-footer" onClick={() => props.openThread?.(m)}>
+          {thread.participants.map((actorId) => {
+            const b = botByActor.get(actorId);
+            return b ? (
+              <Avatar key={actorId} id={b.id} name={String(b.name)} size={18} />
+            ) : (
+              <Avatar key={actorId} id={actorId} name="?" size={18} plain />
+            );
+          })}
+          <span className="replies">
+            {thread.replyCount} {thread.replyCount === 1 ? "reply" : "replies"}
+          </span>
+          <span className="last-reply">last reply {time(thread.lastReplyAt)}</span>
+        </button>
+      )}
+      <div className="hover-actions">
+        {props.openThread && (
+          <button
+            title="Reply in thread"
+            aria-label="Reply in thread"
+            onClick={() => props.openThread?.(m)}
+          >
+            <Icon name="thread" />
+          </button>
+        )}
+        <button
+          title="Copy"
+          aria-label="Copy"
+          onClick={() =>
+            void navigator.clipboard.writeText(
+              String(m.body ?? "").replaceAll(
+                /<@bot:([^>\s]+)>/g,
+                (_, id: string) => `@${names.get(id) ?? "unknown"}`,
+              ),
+            )
+          }
+        >
+          <Icon name="copy" />
+        </button>
+      </div>
+    </article>
+  );
+};
+
+export const ChannelView = (props: {
+  ws: string;
+  /** The Channel, or with `dm` the DM row (`id` = conversation id, `botId`, `name`). */
+  channel: Row | undefined;
+  dm: boolean;
+  messages: Row[];
+  bots: Row[];
+  me: string | null;
+  openBot: (id: string) => void;
+  openThread: (m: Row) => void;
+  toggleChannelPanel: () => void;
+  /** The header's member count (Members) and "…" (About). */
+  openChannelPanel: (tab: "about" | "members") => void;
+  starred: boolean;
+  toggleStar: () => void;
+}) => {
+  const end = useRef<HTMLDivElement>(null);
+  // Braces: Chromium's scrollIntoView returns a Promise, which React would call as the cleanup.
+  useEffect(() => {
+    void end.current?.scrollIntoView({ block: "end" });
+  }, [props.messages]);
+
+  const botByActor = new Map(props.bots.map((b) => [String(b.actorId), b]));
+  const posted = [
+    ...new Map(
+      props.messages.flatMap((m) => {
+        const b = botByActor.get(String(m.actorId));
+        return b ? [[b.id, b] as const] : [];
+      }),
+    ).values(),
+  ];
+
+  const name = text(props.channel?.name);
+  const title = props.dm ? name : `#${name}`;
   if (!props.channel) return <div className="empty">No channel yet.</div>;
   const memberCount = Number(props.channel.memberCount ?? 0);
   const dmBot = String(props.channel.botId);
@@ -313,100 +464,75 @@ export const ChannelView = (props: {
         {byDay(props.messages).map((d) => (
           <section key={d.day} className="day">
             <span className="day-pill">{dayLabel(d.at)}</span>
-            {d.messages.map((m) => {
-              const at = new Date(String(m.createdAt));
-              const author = botByActor.get(String(m.actorId));
-              return (
-                <article key={m.id} className="message">
-                  <div className="author">
-                    {author ? (
-                      <button className="inline-bot" onClick={() => props.openBot(author.id)}>
-                        <Avatar id={author.id} name={String(author.name)} size={20} />{" "}
-                        {text(author.name)}
-                      </button>
-                    ) : (
-                      <span>
-                        {props.me && m.userId === props.me ? "You" : String(m.actorId).slice(0, 8)}
-                      </span>
-                    )}
-                    <time>
-                      {at.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
-                    </time>
-                  </div>
-                  <div className="bubble">
-                    <Markdown source={String(m.body ?? "")} names={names} />
-                  </div>
-                  <div className="hover-actions">
-                    <button
-                      title="Copy"
-                      aria-label="Copy"
-                      onClick={() =>
-                        void navigator.clipboard.writeText(
-                          String(m.body ?? "").replaceAll(
-                            /<@bot:([^>\s]+)>/g,
-                            (_, id: string) => `@${names.get(id) ?? "unknown"}`,
-                          ),
-                        )
-                      }
-                    >
-                      <Icon name="copy" />
-                    </button>
-                  </div>
-                </article>
-              );
-            })}
+            {d.messages.map((m) => (
+              <Message
+                key={m.id}
+                m={m}
+                bots={props.bots}
+                me={props.me}
+                openBot={props.openBot}
+                openThread={props.openThread}
+              />
+            ))}
           </section>
         ))}
         <div ref={end} />
       </div>
-      <form
-        className="composer"
-        onSubmit={(e) => {
-          e.preventDefault();
-          void send();
-        }}
-      >
-        {matches.length > 0 && (
-          <ul className="mentions" role="listbox" aria-label="Mention a Bot">
-            {matches.map((b, i) => (
-              <li
-                key={b.id}
-                role="option"
-                aria-selected={i === highlighted}
-                // mousedown, not click: the editor keeps focus and its caret.
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  pick(b);
-                }}
-              >
-                <Avatar id={b.id} name={String(b.name)} size={20} /> {text(b.name)}
-              </li>
-            ))}
-          </ul>
-        )}
-        <EditorContent editor={editor} className="composer-input" />
-        <button className="send" aria-label="Send" disabled={empty}>
-          <Icon name="send" />
-        </button>
-      </form>
-      <p className="op">
-        {op && (
-          <>
-            operation <span className="mono">{op.operationId}</span>:{" "}
-            {op.error ??
-              (op.jobIds === null
-                ? "accepted, routing pending"
-                : op.jobIds.length === 0
-                  ? "posted, no Bot mentioned"
-                  : op.jobIds.map((id, i) => (
-                      <Fragment key={id}>
-                        {i === 0 ? (op.jobIds!.length > 1 ? "jobs " : "job ") : ", "}
-                        <span className="mono">{id}</span>
-                      </Fragment>
-                    )))}
-          </>
-        )}
-      </p>
+      <Composer
+        ws={props.ws}
+        target={props.dm ? { conversationId: props.channel.id } : { channelId: props.channel.id }}
+        bots={props.bots}
+        dmBot={props.dm ? dmBot : null}
+        placeholder={`Message ${title}`}
+        label="Message"
+      />
     </div>
   );
 };
+
+/**
+ * The Thread panel: the root message, its replies (oldest first) and a "Reply…" composer posting with `threadOf`.
+ * `target` addresses the root's Channel / DM.
+ */
+export const ThreadPanel = (props: {
+  ws: string;
+  title: string;
+  root: Row;
+  replies: Row[];
+  target: Record<string, string>;
+  dmBot: string | null;
+  bots: Row[];
+  me: string | null;
+  openBot: (id: string) => void;
+  onPosted: (conversationId: string) => void;
+  close: () => void;
+}) => (
+  <aside className="panel thread-panel" aria-label="Thread">
+    <div className="panel-top">
+      <h2>
+        Thread <span className="muted">{props.title}</span>
+      </h2>
+      <button className="round" aria-label="Close" onClick={props.close}>
+        <Icon name="close" />
+      </button>
+    </div>
+    <div className="scroll">
+      <Message m={props.root} bots={props.bots} me={props.me} openBot={props.openBot} />
+      <p className="reply-count">
+        {props.replies.length} {props.replies.length === 1 ? "reply" : "replies"}
+      </p>
+      {props.replies.map((m) => (
+        <Message key={m.id} m={m} bots={props.bots} me={props.me} openBot={props.openBot} />
+      ))}
+    </div>
+    <Composer
+      ws={props.ws}
+      target={{ ...props.target, threadOf: props.root.id }}
+      bots={props.bots}
+      dmBot={props.dmBot}
+      placeholder="Reply…"
+      label="Reply"
+      onPosted={props.onPosted}
+    />
+  </aside>
+);

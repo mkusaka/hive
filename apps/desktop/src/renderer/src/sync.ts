@@ -2,11 +2,13 @@
 /* oxlint-disable no-await-in-loop */
 import type { ApiResult } from "../../shared/api.ts";
 
-/** `run`: the Run open in the Run Inspector (state, persistence, transcript). */
+/** `run`: the Run open in the Run Inspector (state, persistence, transcript); `thread`: the open Thread panel. */
 export type ListKey =
   | "channels"
   | "dms"
   | "messages"
+  | "thread"
+  | "threads"
   | "inbox"
   | "jobs"
   | "bots"
@@ -18,6 +20,8 @@ export const allLists: ListKey[] = [
   "channels",
   "dms",
   "messages",
+  "thread",
+  "threads",
   "inbox",
   "jobs",
   "bots",
@@ -30,14 +34,15 @@ export const allLists: ListKey[] = [
 type Change = { scope: string; entityKind: string };
 
 /**
- * `channel:*` (a DM's too) → messages / inbox and the channel and DM lists (their `lastMessage` previews);
+ * `channel:*` (a DM's too; thread replies carry their parent's) → messages / the open thread / threads / inbox and the
+ * channel and DM lists (their `lastMessage` previews);
  * `workspace:*` → jobs / bots / devices / approvals / sidebar / DMs (and the inspected Run for a `run` or `effect` row).
  */
 export const refetchFor = (changes: Change[]) => {
   const keys = new Set<ListKey>();
   for (const { scope, entityKind } of changes) {
     if (scope.startsWith("channel:")) {
-      keys.add("messages").add("inbox").add("channels").add("dms");
+      keys.add("messages").add("thread").add("threads").add("inbox").add("channels").add("dms");
     } else if (scope.startsWith("workspace:")) {
       keys.add("jobs").add("bots").add("devices").add("approvals").add("sidebar").add("dms");
       if (entityKind === "run" || entityKind === "effect") keys.add("run");

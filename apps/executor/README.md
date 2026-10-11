@@ -63,6 +63,8 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK), `codex` 
   (no further model turn is spent) and exits with `waitingFor`; the runner submits `state: "waiting"` and the Job
   waits in the cloud without holding the executor. The successor Run's prompt holds the original request and
   "Replies to your requests". A Bot's final text is posted into a Channel or a `dm` conversation (DM-01) the same way, never into a bot pair.
+  A thread Run (THREAD-01) posts into its thread; its prompt has "Earlier in the channel, before this thread
+  (read-only context)" (`parentMessages`) and then "Thread (root message first)" instead of "Recent conversation".
 - **Transcript journal.** Every SDK message is appended to `<state-dir>/transcripts/<runId>.jsonl` and fsynced
   before it is processed (§13.3: a durable local journal outside the SDK config dir). The SDK also keeps its own
   session files under `CLAUDE_CONFIG_DIR`.

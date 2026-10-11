@@ -7,11 +7,20 @@ import { Inlines, type Names } from "./chat.tsx";
 import { parseInline } from "./format.ts";
 import { Avatar, Icon, Menu, type Row, text } from "./ui.tsx";
 
-export type View = "channel" | "inbox" | "activity" | "approvals" | "search" | "memory" | "status";
+export type View =
+  | "channel"
+  | "threads"
+  | "inbox"
+  | "activity"
+  | "approvals"
+  | "search"
+  | "memory"
+  | "status";
 type Item = SidebarPrefs["pinned"][number];
 type Target = { section: "pinned" } | { section: "group"; name: string };
 
 const views = [
+  ["threads", "Threads"],
   ["inbox", "Inbox"],
   ["activity", "Activity"],
   ["approvals", "Approvals"],

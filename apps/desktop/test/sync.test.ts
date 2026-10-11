@@ -51,6 +51,8 @@ describe("sync controller", () => {
       "jobs",
       "messages",
       "sidebar",
+      "thread",
+      "threads",
     ]);
     expect(h.statuses.at(-1)).toEqual({ cursor: "C2", unsynced: 0, error: null });
   });
@@ -64,7 +66,9 @@ describe("sync controller", () => {
     await h.sync.pull();
     await h.sync.hint();
     await h.sync.pull();
-    expect(h.refetched.slice(1)).toEqual([["channels", "dms", "inbox", "messages"]]);
+    expect(h.refetched.slice(1)).toEqual([
+      ["channels", "dms", "inbox", "messages", "thread", "threads"],
+    ]);
   });
 
   it("refetches the inspected Run for a run change row", async () => {

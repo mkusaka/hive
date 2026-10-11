@@ -114,6 +114,18 @@ describe("argv → request", () => {
     ]);
   });
 
+  it("message post --thread-of replies in a thread; thread list reads the user's threads", async () => {
+    const h = harness(() => Response.json({ ok: true }));
+    expect(
+      await h.hive("message", "post", "--channel", "ch-1", "--thread-of", "m-1", "--text", "hi"),
+    ).toBe(0);
+    expect(await h.hive("thread", "list")).toBe(0);
+    expect(h.calls[0]!.body).toMatchObject({
+      command: { type: "message.post", channelId: "ch-1", threadOf: "m-1", text: "hi" },
+    });
+    expect(h.calls[1]!.path).toBe("/v1/threads?workspaceId=ws-1&participant=me");
+  });
+
   it("agent send builds the command envelope with the Access assertion", async () => {
     const h = harness();
     const code = await h.hive(

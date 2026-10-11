@@ -40,20 +40,28 @@ const memoryScope = (workspaceId: string, kind: string, id: string) =>
 
 const loadSource = async (db: D1Database, kind: SearchKind, id: string): Promise<Doc | null> => {
   if (kind === "message") {
-    // Messages are immutable; `seq` stands in for a revision.
+    // Messages are immutable; `seq` stands in for a revision. A thread reply's title is its root message's start.
     const row = await db
       .prepare(
-        `SELECT m.workspace_id, m.seq, m.body, c.channel_id FROM messages m
+        `SELECT m.workspace_id, m.seq, m.body, c.channel_id, COALESCE(substr(rm.body, 1, 80), '') AS title
+           FROM messages m
            JOIN conversations c ON c.workspace_id = m.workspace_id AND c.id = m.conversation_id
+           LEFT JOIN messages rm ON rm.workspace_id = c.workspace_id AND rm.id = c.root_message_id
           WHERE m.id = ?`,
       )
       .bind(id)
-      .first<{ workspace_id: string; seq: number; body: string; channel_id: string }>();
+      .first<{
+        workspace_id: string;
+        seq: number;
+        body: string;
+        channel_id: string;
+        title: string;
+      }>();
     return row
       ? {
           workspaceId: row.workspace_id,
           revision: row.seq,
-          title: "",
+          title: row.title,
           body: row.body,
           scope: `channel:${row.channel_id}`,
           deleted: false,

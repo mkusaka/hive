@@ -633,7 +633,7 @@ const channelMember = async (
          FROM conversations c
          JOIN channel_members m ON m.workspace_id = c.workspace_id AND m.channel_id = c.channel_id
          JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-        WHERE c.workspace_id = ? AND c.channel_id = ? AND a.user_id = ?`,
+        WHERE c.workspace_id = ? AND c.channel_id = ? AND c.kind = 'channel' AND a.user_id = ?`,
     )
     .bind(workspaceId, channelId, userId)
     .first<{ conversation_id: string; actor_id: string }>();
@@ -773,14 +773,20 @@ const dmParticipant = async (
   return dm;
 };
 
+/** A thread and its conversation share this id; deterministic, so concurrent first replies agree. */
+const threadId = (rootMessageId: string) => `thread-${rootMessageId}`;
+
 /**
  * One message. In a Channel, each Bot mentioned by a `<@bot:ID>` token gets the delivery of a waking `agent.send`
  * request and joins the Channel when it is not a member. In a DM the DM's Bot is the one recipient; a mention of
  * another Bot is 422. A token naming no Bot of the Workspace, or `mentions` differing from the tokens, is 422.
+ * With `threadOf` the message goes to the root message's thread (created here on the first reply, same batch); in a
+ * Channel thread the Bots that took part in it (posted there, the root included, or were delivered a message there)
+ * are woken as well.
  */
 const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user, env) => {
   const { workspaceId, command } = env;
-  const where = command.conversationId
+  const parent = command.conversationId
     ? await dmParticipant(db, workspaceId, command.conversationId, user.userId)
     : {
         ...(await channelMember(db, workspaceId, command.channelId!, user.userId)),
@@ -795,49 +801,94 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
   ) {
     throw new HttpError("INVALID_INPUT", "mentions must equal the <@bot:ID> tokens in text");
   }
+  // The root must be a message of the addressed conversation itself (a reply lives in its thread, so no nesting).
+  const root = command.threadOf
+    ? await db
+        .prepare(
+          "SELECT id FROM messages WHERE workspace_id = ? AND id = ? AND conversation_id = ?",
+        )
+        .bind(workspaceId, command.threadOf, parent.conversation_id)
+        .first<{ id: string }>()
+    : null;
+  if (command.threadOf && !root) throw new HttpError("NOT_FOUND", "thread root message not found");
+  const conversationId = root ? threadId(root.id) : parent.conversation_id;
   let joining: string[] = [];
-  if (where.dm_bot_id) {
-    if (botIds.some((id) => id !== where.dm_bot_id)) {
+  let recipients = botIds;
+  if (parent.dm_bot_id) {
+    if (botIds.some((id) => id !== parent.dm_bot_id)) {
       throw new HttpError("INVALID_INPUT", "a DM can only mention its own bot");
     }
-  } else if (botIds.length > 0) {
-    const { results } = await db
-      .prepare(
-        `SELECT b.id, b.actor_id, EXISTS (SELECT 1 FROM channel_members m WHERE m.workspace_id = b.workspace_id
-                  AND m.channel_id = ? AND m.actor_id = b.actor_id) AS member
-           FROM bots b WHERE b.workspace_id = ? AND b.id IN (${botIds.map(() => "?").join(", ")})`,
-      )
-      .bind(where.channel_id, workspaceId, ...botIds)
-      .all<{ id: string; actor_id: string; member: number }>();
-    const unknown = botIds.filter((id) => !results.some((r) => r.id === id));
-    if (unknown.length > 0) {
-      throw new HttpError("INVALID_INPUT", `unknown bot in mention: ${unknown.join(", ")}`);
+    recipients = [parent.dm_bot_id];
+  } else {
+    if (botIds.length > 0) {
+      const { results } = await db
+        .prepare(
+          `SELECT b.id, b.actor_id, EXISTS (SELECT 1 FROM channel_members m WHERE m.workspace_id = b.workspace_id
+                    AND m.channel_id = ? AND m.actor_id = b.actor_id) AS member
+             FROM bots b WHERE b.workspace_id = ? AND b.id IN (${botIds.map(() => "?").join(", ")})`,
+        )
+        .bind(parent.channel_id, workspaceId, ...botIds)
+        .all<{ id: string; actor_id: string; member: number }>();
+      const unknown = botIds.filter((id) => !results.some((r) => r.id === id));
+      if (unknown.length > 0) {
+        throw new HttpError("INVALID_INPUT", `unknown bot in mention: ${unknown.join(", ")}`);
+      }
+      joining = results.filter((r) => !r.member).map((r) => r.actor_id);
     }
-    joining = results.filter((r) => !r.member).map((r) => r.actor_id);
+    if (root) {
+      const { results } = await db
+        .prepare(
+          `SELECT b.id FROM bots b
+            WHERE b.workspace_id = ?1
+              AND (b.actor_id IN (SELECT actor_id FROM messages
+                                   WHERE workspace_id = ?1 AND (conversation_id = ?2 OR id = ?3))
+                   OR b.id IN (SELECT bot_id FROM inbox_items WHERE workspace_id = ?1 AND conversation_id = ?2))
+            ORDER BY b.name`,
+        )
+        .bind(workspaceId, conversationId, root.id)
+        .all<{ id: string }>();
+      recipients = [...new Set([...botIds, ...results.map((r) => r.id)])];
+    }
   }
 
   const receivedAt = new Date().toISOString();
   const messageId = crypto.randomUUID();
-  const recipients = where.dm_bot_id ? [where.dm_bot_id] : botIds;
   const deliveries = recipients.map((botId) => ({ botId, inboxItemId: crypto.randomUUID() }));
   const response: MessagePostAccepted = {
     operationId: env.operationId,
     status: "accepted",
     messageId,
+    conversationId,
     inboxItemIds: deliveries.map((d) => d.inboxItemId),
     receivedAt,
   };
-  const scope = `channel:${where.channel_id}`;
+  const scope = `channel:${parent.channel_id}`;
   return receipt(
     db,
     user.userId,
     env,
     [
+      ...(root
+        ? [
+            db
+              .prepare(
+                `INSERT INTO conversations (id, workspace_id, channel_id, kind, root_message_id, parent_conversation_id)
+                 VALUES (?, ?, ?, 'thread', ?, ?) ON CONFLICT DO NOTHING`,
+              )
+              .bind(
+                conversationId,
+                workspaceId,
+                parent.channel_id,
+                root.id,
+                parent.conversation_id,
+              ),
+          ]
+        : []),
       insertMessage(db, {
         id: messageId,
         workspaceId,
-        conversationId: where.conversation_id,
-        actorId: where.actor_id,
+        conversationId,
+        actorId: parent.actor_id,
         clientMessageId: env.idempotencyKey,
         body: command.text,
       }),
@@ -846,8 +897,8 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
           userId: user.userId,
           messageId,
           botId: d.botId,
-          channelId: where.channel_id,
-          conversationId: where.conversation_id,
+          channelId: parent.channel_id,
+          conversationId,
           kind: "request",
           delivery: "wake",
           inboxItemId: d.inboxItemId,
@@ -861,7 +912,7 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
                 `INSERT INTO channel_members (workspace_id, channel_id, actor_id, role)
                  SELECT ?, ?, value, 'member' FROM json_each(?) WHERE true ON CONFLICT DO NOTHING`,
               )
-              .bind(workspaceId, where.channel_id, JSON.stringify(joining)),
+              .bind(workspaceId, parent.channel_id, JSON.stringify(joining)),
           ]
         : []),
       indexLater(db, workspaceId, "message", messageId),
@@ -870,7 +921,9 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
     [
       { entityKind: "message", entityId: messageId, scope },
       ...deliveries.map((d) => ({ entityKind: "inbox_item", entityId: d.inboxItemId, scope })),
-      ...(joining.length > 0 ? [{ entityKind: "channel", entityId: where.channel_id, scope }] : []),
+      ...(joining.length > 0
+        ? [{ entityKind: "channel", entityId: parent.channel_id, scope }]
+        : []),
     ],
   );
 };
