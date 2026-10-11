@@ -62,7 +62,7 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK), `codex` 
 - **Waiting.** When the tool result of `hive_wait_for_reply` appears in the stream, the adapter aborts the query
   (no further model turn is spent) and exits with `waitingFor`; the runner submits `state: "waiting"` and the Job
   waits in the cloud without holding the executor. The successor Run's prompt holds the original request and
-  "Replies to your requests". A Bot's final text is posted only into a Channel conversation, not a bot pair.
+  "Replies to your requests". A Bot's final text is posted into a Channel or a `dm` conversation (DM-01) the same way, never into a bot pair.
 - **Transcript journal.** Every SDK message is appended to `<state-dir>/transcripts/<runId>.jsonl` and fsynced
   before it is processed (§13.3: a durable local journal outside the SDK config dir). The SDK also keeps its own
   session files under `CLAUDE_CONFIG_DIR`.
