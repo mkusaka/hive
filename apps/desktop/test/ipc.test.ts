@@ -154,6 +154,22 @@ describe("IPC handlers", () => {
     expect(requests).toHaveLength(1);
   });
 
+  it("posts sidebar.update and rejects an unknown item kind", async () => {
+    const { h, requests } = setup();
+    const update = (kind: string) =>
+      h.command({
+        ...envelope,
+        command: {
+          type: "sidebar.update",
+          prefs: { pinned: [{ kind, id: "ch-1" }], hidden: [], groups: [] },
+          expectedRevision: 0,
+        },
+      });
+    expect((await update("channel")).ok).toBe(true);
+    expect(await update("task")).toMatchObject({ ok: false, error: { code: "INVALID_ARGS" } });
+    expect(requests).toHaveLength(1);
+  });
+
   it("posts message.post and rejects an unknown field", async () => {
     const { h, requests } = setup();
     const post = (command: Record<string, unknown>) =>

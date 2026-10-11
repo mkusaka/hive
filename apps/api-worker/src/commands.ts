@@ -41,6 +41,7 @@ import {
   RunAgentSend,
   type RunAgentSendAccepted,
   RunCommand,
+  SidebarUpdate,
   SubscriptionCreate,
   SubscriptionDelete,
   SubscriptionPause,
@@ -121,6 +122,7 @@ export const CommandEnvelope = commandEnvelope(
     MemoryWrite,
     MemoryDelete,
     EffectResolve,
+    SidebarUpdate,
   ]),
 );
 type Envelope = v.InferOutput<typeof CommandEnvelope>;
@@ -2519,6 +2521,60 @@ const effectResolve: Handler<v.InferOutput<typeof EffectResolve>> = async (db, u
   return explainFailure(resolved, async () => conflict());
 };
 
+/**
+ * Replaces the caller's sidebar document (UI-04). Revision CAS: 0 inserts (a row already there fails on the primary
+ * key), otherwise a 0-row conditional UPDATE trips the guard; either way a stale revision is 409.
+ */
+const sidebarUpdate: Handler<v.InferOutput<typeof SidebarUpdate>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const prefs = JSON.stringify(command.prefs);
+  const now = new Date().toISOString();
+  const [setGuard, clearGuard] = guard(db);
+  const statements =
+    command.expectedRevision === 0
+      ? [
+          db
+            .prepare(
+              "INSERT INTO sidebar_prefs (workspace_id, user_id, prefs, revision, updated_at) VALUES (?, ?, ?, 1, ?)",
+            )
+            .bind(workspaceId, user.userId, prefs, now),
+        ]
+      : [
+          db
+            .prepare(
+              `UPDATE sidebar_prefs SET prefs = ?, revision = revision + 1, updated_at = ?
+                WHERE workspace_id = ? AND user_id = ? AND revision = ?`,
+            )
+            .bind(prefs, now, workspaceId, user.userId, command.expectedRevision),
+          setGuard,
+          clearGuard,
+        ];
+  const revision = command.expectedRevision + 1;
+  const run = receipt(
+    db,
+    user.userId,
+    env,
+    statements,
+    { operationId: env.operationId, status: "accepted", revision },
+    [{ entityKind: "sidebar", entityId: user.userId, scope: `workspace:${workspaceId}` }],
+  );
+  return explainFailure(run, async () => {
+    const row = await db
+      .prepare("SELECT revision FROM sidebar_prefs WHERE workspace_id = ? AND user_id = ?")
+      .bind(workspaceId, user.userId)
+      .first<{ revision: number }>();
+    const current = row?.revision ?? 0;
+    return current === command.expectedRevision
+      ? null
+      : new HttpError(
+          "REVISION_CONFLICT",
+          `sidebar revision is ${current}; refetch and retry`,
+          false,
+          "stale_revision",
+        );
+  });
+};
+
 const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>> } = {
   "workspace.create": workspaceCreate,
   "device.register": deviceRegister,
@@ -2558,6 +2614,7 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "memory.write": userMemoryWrite,
   "memory.delete": memoryDelete,
   "effect.resolve": effectResolve,
+  "sidebar.update": sidebarUpdate,
 };
 
 export const runCommand = (db: D1Database, principal: Principal, envelope: Envelope) => {

@@ -73,6 +73,24 @@ export const workspaceMembers = sqliteTable(
   (t) => [primaryKey({ columns: [t.workspaceId, t.userId] })],
 );
 
+/** current state. One sidebar document (`SidebarPrefs` JSON) per user per Workspace (UI-04). */
+export const sidebarPrefs = sqliteTable(
+  "sidebar_prefs",
+  {
+    workspaceId: workspaceId(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    prefs: text("prefs").notNull(),
+    revision: integer("revision").notNull(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.workspaceId, t.userId] }),
+    check("sidebar_prefs_size", sql`length(CAST(${t.prefs} AS BLOB)) <= 65536`),
+  ],
+);
+
 const actorKinds = ["user", "bot", "service"] as const;
 
 /** current state */

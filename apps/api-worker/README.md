@@ -16,7 +16,8 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/runs/:id/transcript?cursor=`                           | Access assertion (user)           | Normalized, redacted transcript, one confirmed part per page; channel member or owner (404 otherwise); see Transcripts                                                                               |
 | `GET /v1/transcripts/:runId/raw`                                | Access assertion (user, owner)    | The confirmed raw JSONL parts concatenated (`application/x-ndjson`); never indexed                                                                                                                   |
 | `GET /v1/inbox?botId=`                                          | Access assertion (user)           | The Bot's inbox items (first 100, no cursor yet)                                                                                                                                                     |
-| `GET /v1/channels?workspaceId=`                                 | Access assertion (user)           | Channels the user is a member of, with the main `conversationId` and `topic` (max 500)                                                                                                               |
+| `GET /v1/channels?workspaceId=`                                 | Access assertion (user)           | Channels the user is a member of, with the main `conversationId`, `topic` and `memberCount` (max 500)                                                                                                |
+| `GET /v1/sidebar?workspaceId=`                                  | Access assertion (user)           | The caller's own sidebar document `{workspaceName, prefs: {pinned, hidden, groups}, revision}`; the empty default at revision 0 when none                                                            |
 | `GET /v1/channels/:id/members`                                  | Access assertion (user)           | The channel's members (`role` owner / member) and the actors that posted in it without membership (`role` null), with `kind`, `name` (a Bot's current name), `userId`, `botId` (404 if not a member) |
 | `GET /v1/channels/:id/messages`                                 | Access assertion (user)           | Newest-first messages of a member channel (limit 1..200, default 50; 404 if not a member)                                                                                                            |
 | `GET /v1/bots?workspaceId=`                                     | Access assertion (user)           | Bots of the Workspace (max 500)                                                                                                                                                                      |
@@ -72,12 +73,17 @@ token). The Worker falls back to `Authorization: Bearer <token>` for local dev a
 - **Command types:** `workspace.create`, `device.register`, `device.revoke`, `channel.create`, `channel.update`, `bot.create`,
   `agent.send`, `event.emit`, the Work commands, the Subscription / integration commands, the Routine commands,
   `job.cancel` / `job.resolve` below, `bot.update`, `device.environment.register`, `approval.resolve` (Tools and
-  approvals), `memory.write` / `memory.delete` (Search and memory) and `effect.resolve` (External effects).
+  approvals), `memory.write` / `memory.delete` (Search and memory), `effect.resolve` (External effects) and `sidebar.update`.
 - **Actors.** A user's `actors` row is created by `workspace.create` together with the membership (the only path
   that creates a membership today), unique per `(workspace_id, user_id)`. Messages and channel membership use it.
 - **`channel.create`** creates the channel, its main conversation and an `owner` channel membership for the caller.
   **`channel.update {channelId, topic}`** sets the topic (≤ 250 chars; empty or blank clears it); members only (403),
   404 for an unknown channel.
+  **`sidebar.update {prefs, expectedRevision}`** replaces the caller's own sidebar document (`SidebarPrefs`: pinned /
+  hidden `{kind: channel|bot, id}` lists and named groups, ≤ 64 KiB of JSON, also a SQL CHECK). Revision CAS:
+  `expectedRevision` 0 creates it (a row already there fails on the primary key), otherwise a guarded conditional
+  UPDATE; a stale revision is 409 `REVISION_CONFLICT`. Ids are not checked against Channels / Bots (clients skip
+  unknown ones).
   **`bot.create`** creates the Bot and its actor; it joins no channel. A duplicate name is 422. Optional
   `instructions` (≤ 64 KiB, default `""`) is the Bot's system prompt for its runs.
 - **`agent.send`** requires channel membership (403) and a Bot in the Workspace (404). One batch commits the
@@ -327,6 +333,7 @@ member).
   | `channel.create`                           | channel, conversation (channel)                                          |
   | `channel.update`                           | channel (channel)                                                        |
   | `bot.create`                               | bot (workspace)                                                          |
+  | `sidebar.update`                           | sidebar, entity id = the user (workspace)                                |
   | `agent.send`                               | message, inbox item (channel)                                            |
   | `message.post`                             | message, one inbox item per mention (channel)                            |
   | event route                                | inbox item (channel), Job (workspace) for `wake`                         |

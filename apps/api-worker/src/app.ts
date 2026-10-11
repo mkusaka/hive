@@ -33,6 +33,7 @@ import {
   getJob,
   getOperation,
   getRunApproval,
+  getSidebar,
   getTask,
   listBotConversations,
   listBots,
@@ -416,6 +417,9 @@ export const createApp = ({
         limit: limitParam(c, 50, 200),
       }),
     ),
+  );
+  app.get("/v1/sidebar", async (c) =>
+    c.json(await getSidebar(c.env.DB, workspaceParam(c), user(c).userId)),
   );
   app.get("/v1/bots", async (c) => c.json(await listBots(c.env.DB, workspaceParam(c))));
   app.get("/v1/bot-conversations", async (c) =>

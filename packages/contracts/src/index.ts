@@ -801,6 +801,36 @@ export const MemoryDelete = v.strictObject({
   expectedRevision: Revision,
 });
 
+// ------------------------------------------------- Sidebar (UI-04)
+
+const SidebarItem = v.strictObject({
+  kind: v.picklist(["channel", "bot"]),
+  id: v.pipe(v.string(), v.minLength(1), v.maxLength(200)),
+});
+/**
+ * A user's own sidebar in one Workspace: pinned items (in order), hidden items and named groups (each in order).
+ * Ids of deleted Channels / Bots may linger; clients skip them.
+ */
+export const SidebarPrefs = v.pipe(
+  v.strictObject({
+    pinned: v.array(SidebarItem),
+    hidden: v.array(SidebarItem),
+    groups: v.array(
+      v.strictObject({ name: v.pipe(Name, v.maxLength(80)), items: v.array(SidebarItem) }),
+    ),
+  }),
+  v.check((p) => jsonBytes(p) <= 64 * 1024, "prefs must be at most 64 KiB of JSON"),
+);
+export type SidebarPrefs = v.InferOutput<typeof SidebarPrefs>;
+export const defaultSidebarPrefs: SidebarPrefs = { pinned: [], hidden: [], groups: [] };
+
+/** Replaces the caller's document; `expectedRevision` 0 creates it. A stale revision is 409 REVISION_CONFLICT. */
+export const SidebarUpdate = v.strictObject({
+  type: v.literal("sidebar.update"),
+  prefs: SidebarPrefs,
+  expectedRevision: v.pipe(v.number(), v.integer(), v.minValue(0)),
+});
+
 export type Memory = {
   id: string;
   scopeKind: (typeof memoryScopeKinds)[number];

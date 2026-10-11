@@ -141,6 +141,13 @@
       "when": 1791735354298,
       "tag": "0019_channel_topic",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1791737465173,
+      "tag": "0020_sidebar_prefs",
+      "breakpoints": true
     }
   ]
 }

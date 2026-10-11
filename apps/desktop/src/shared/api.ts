@@ -13,6 +13,7 @@ import type {
   RoutineResume,
   RoutineRun,
   RoutineUpdate,
+  SidebarUpdate,
 } from "@hive/contracts";
 import type * as v from "valibot";
 
@@ -21,7 +22,7 @@ export type ApiResult =
   | { ok: true; value: Record<string, unknown> }
   | { ok: false; error: { code: string; message: string; body?: unknown } };
 
-/** The commands the UI sends today: message.post, agent.send, job.cancel, approval.resolve, memory.write, channel.update and the routine commands. */
+/** The commands the UI sends today: message.post, agent.send, job.cancel, approval.resolve, memory.write, channel.update, the routine commands and sidebar.update. */
 export type UiCommand = v.InferInput<
   ReturnType<
     typeof commandEnvelope<
@@ -40,6 +41,7 @@ export type UiCommand = v.InferInput<
           typeof RoutinePause,
           typeof RoutineResume,
           typeof RoutineRun,
+          typeof SidebarUpdate,
         ],
         undefined
       >

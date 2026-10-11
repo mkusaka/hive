@@ -49,6 +49,7 @@ describe("sync controller", () => {
       "inbox",
       "jobs",
       "messages",
+      "sidebar",
     ]);
     expect(h.statuses.at(-1)).toEqual({ cursor: "C2", unsynced: 0, error: null });
   });
@@ -72,7 +73,7 @@ describe("sync controller", () => {
     ]);
     await h.sync.pull();
     await h.sync.hint();
-    expect(h.refetched[1]).toEqual(["approvals", "bots", "devices", "jobs", "run"]);
+    expect(h.refetched[1]).toEqual(["approvals", "bots", "devices", "jobs", "run", "sidebar"]);
   });
 
   it("re-bootstraps on 410 CURSOR_EXPIRED", async () => {

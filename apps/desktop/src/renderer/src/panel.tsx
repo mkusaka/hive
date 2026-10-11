@@ -3,7 +3,7 @@
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import type { ExecutorProvider, UiCommand } from "../../shared/api.ts";
 import { type Schedule, scheduleLine } from "./format.ts";
-import { Avatar, failure, Icon, inWorkspace, MemoryList, type Row, text } from "./ui.tsx";
+import { Avatar, failure, Icon, inWorkspace, MemoryList, Menu, type Row, text } from "./ui.tsx";
 
 type Tab = "details" | "library" | "computer";
 
@@ -161,6 +161,9 @@ export const BotPanel = (props: {
  * Channel details, like Slack's: About (name, topic edited inline, created date), Members (`GET
  * /v1/channels/:id/members`: members and actors that posted) and Routines (each with its assigned Bot).
  */
+export type ChannelTab = "about" | "members" | "routines";
+
+/** `tab` is App state: the header's member count opens Members, its "…" About. */
 export const ChannelPanel = (props: {
   ws: string;
   channel: Row;
@@ -170,8 +173,10 @@ export const ChannelPanel = (props: {
   openBot: (id: string) => void;
   refreshChannels: () => void;
   close: () => void;
+  tab: ChannelTab;
+  setTab: (tab: ChannelTab) => void;
 }) => {
-  const [tab, setTab] = useState<"about" | "members" | "routines">("about");
+  const { tab, setTab } = props;
   const [members, setMembers] = useState<Row[]>([]);
   const [error, setError] = useState<string | null>(null);
   const { ws, channel } = props;
@@ -333,12 +338,7 @@ const Routines = (props: {
     setRoutines(res.value.routines as Row[]);
   }, [ws, query]);
   useEffect(() => void load(), [load]);
-  useEffect(() => {
-    if (!menu) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenu(null);
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [menu]);
+  const closeMenu = useCallback(() => setMenu(null), []);
 
   const act = async (cmd: UiCommand["command"]) => {
     setMenu(null);
@@ -346,13 +346,7 @@ const Routines = (props: {
     setError(res.ok ? null : failure(res));
     void load();
   };
-  const openMenu = (routine: Row, x: number, y: number) =>
-    // Kept inside the window (the menu is about 200 x 190 px).
-    setMenu({
-      routine,
-      x: Math.min(x, window.innerWidth - 216),
-      y: Math.min(y, window.innerHeight - 206),
-    });
+  const openMenu = (routine: Row, x: number, y: number) => setMenu({ routine, x, y });
 
   if (editing)
     return (
@@ -421,46 +415,43 @@ const Routines = (props: {
         </button>
       )}
       {menu && (
-        <>
-          <div className="backdrop" onClick={() => setMenu(null)} />
-          <div className="menu" role="menu" style={{ left: menu.x, top: menu.y }}>
-            <button
-              role="menuitem"
-              onClick={() =>
-                void act({
-                  type: menu.routine.enabled ? "routine.pause" : "routine.resume",
-                  routineId: menu.routine.id,
-                })
-              }
-            >
-              <Icon name={menu.routine.enabled ? "pause" : "play"} />
-              {menu.routine.enabled ? "Pause" : "Resume"}
-            </button>
-            <button
-              role="menuitem"
-              onClick={() => {
-                setEditing({ routine: menu.routine });
-                setMenu(null);
-              }}
-            >
-              <Icon name="edit" /> Edit
-            </button>
-            <button
-              role="menuitem"
-              onClick={() => void act({ type: "routine.run", routineId: menu.routine.id })}
-            >
-              <Icon name="send" /> Run now
-            </button>
-            <hr />
-            <button
-              role="menuitem"
-              className="danger"
-              onClick={() => void act({ type: "routine.delete", routineId: menu.routine.id })}
-            >
-              <Icon name="trash" /> Delete
-            </button>
-          </div>
-        </>
+        <Menu x={menu.x} y={menu.y} close={closeMenu}>
+          <button
+            role="menuitem"
+            onClick={() =>
+              void act({
+                type: menu.routine.enabled ? "routine.pause" : "routine.resume",
+                routineId: menu.routine.id,
+              })
+            }
+          >
+            <Icon name={menu.routine.enabled ? "pause" : "play"} />
+            {menu.routine.enabled ? "Pause" : "Resume"}
+          </button>
+          <button
+            role="menuitem"
+            onClick={() => {
+              setEditing({ routine: menu.routine });
+              setMenu(null);
+            }}
+          >
+            <Icon name="edit" /> Edit
+          </button>
+          <button
+            role="menuitem"
+            onClick={() => void act({ type: "routine.run", routineId: menu.routine.id })}
+          >
+            <Icon name="send" /> Run now
+          </button>
+          <hr />
+          <button
+            role="menuitem"
+            className="danger"
+            onClick={() => void act({ type: "routine.delete", routineId: menu.routine.id })}
+          >
+            <Icon name="trash" /> Delete
+          </button>
+        </Menu>
       )}
     </>
   );

@@ -16,6 +16,7 @@ import {
   RoutineResume,
   RoutineRun,
   RoutineUpdate,
+  SidebarUpdate,
 } from "@hive/contracts";
 import * as v from "valibot";
 import type { ApiResult } from "../shared/api.ts";
@@ -46,6 +47,7 @@ export const UiCommandSchema = commandEnvelope(
     RoutinePause,
     RoutineResume,
     RoutineRun,
+    SidebarUpdate,
   ]),
 );
 

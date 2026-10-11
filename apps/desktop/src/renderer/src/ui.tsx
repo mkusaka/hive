@@ -1,4 +1,5 @@
-// Shared renderer helpers: API access, small presentational pieces (badge, avatar blob, stroke icons).
+// Shared renderer helpers: API access, small presentational pieces (badge, avatar blob, stroke icons, menu).
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { avatarColor } from "./format.ts";
 
 export type Row = Record<string, unknown> & { id: string };
@@ -57,6 +58,15 @@ const icons = {
   play: "M7 5l12 7-12 7z",
   edit: "M4 20h4L19 9l-4-4L4 16z M13.5 6.5l4 4",
   trash: "M4 7h16 M10 11v6 M14 11v6 M6 7l1 13h10l1-13 M9 7V4h6v3",
+  star: "M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z",
+  pin: "M9 4h6 M10 4v6l-3 4h10l-3-4V4 M12 14v6",
+  unpin: "M9 4h6 M10 4v6l-3 4h10l-3-4V4 M12 14v6 M4 4l16 16",
+  hide: "M3 3l18 18 M10.6 6.1A9.8 9.8 0 0 1 12 6c5 0 9 6 9 6a17 17 0 0 1-3 3.4 M6.6 6.6C4.3 8.1 3 12 3 12s4 6 9 6a9 9 0 0 0 4.4-1.2 M9.9 9.9a3 3 0 0 0 4.2 4.2",
+  show: "M3 12s4-6 9-6 9 6 9 6-4 6-9 6-9-6-9-6z M15 12a3 3 0 1 1-6 0a3 3 0 1 1 6 0",
+  folder: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",
+  chevron: "M6 9l6 6 6-6",
+  users:
+    "M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1 M13 7a4 4 0 1 1-8 0a4 4 0 1 1 8 0 M22 19v-1a4 4 0 0 0-3-3.9 M16 3.1a4 4 0 0 1 0 7.8",
 };
 
 export const Icon = ({ name }: { name: keyof typeof icons }) => (
@@ -85,3 +95,40 @@ export const MemoryList = ({ memories }: { memories: Row[] }) => (
     ))}
   </ul>
 );
+
+/**
+ * A context menu at (x, y), kept inside the window, over a backdrop: a click outside, a right-click outside or Escape
+ * closes it. Children are `role="menuitem"` buttons and `<hr />` separators.
+ */
+export const Menu = (props: { x: number; y: number; close: () => void; children: ReactNode }) => {
+  const { x, y, close } = props;
+  const box = useRef<HTMLDivElement>(null);
+  const [at, setAt] = useState({ left: x, top: y });
+  // Measured on every render: the content can grow (an expanded submenu).
+  useLayoutEffect(() => {
+    const el = box.current!;
+    const left = Math.max(4, Math.min(x, window.innerWidth - el.offsetWidth - 8));
+    const top = Math.max(4, Math.min(y, window.innerHeight - el.offsetHeight - 8));
+    if (left !== at.left || top !== at.top) setAt({ left, top });
+  });
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && close();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [close]);
+  return (
+    <>
+      <div
+        className="backdrop"
+        onClick={close}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          close();
+        }}
+      />
+      <div ref={box} className="menu" role="menu" style={at}>
+        {props.children}
+      </div>
+    </>
+  );
+};

@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
-import { act, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { act, screen, within } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { dayLabel } from "../../src/renderer/src/chat.tsx";
 import { renderApp } from "./fakeHive.ts";
 import { channels, messages } from "./fixtures.ts";
 
@@ -162,5 +163,50 @@ describe("chat", () => {
     expect(await screen.findByText("a new reply")).toBeTruthy();
     expect(count("/v1/channels?")).toBe(before.channels + 1);
     expect(count("/v1/channels/ch-1/")).toBe(before.messages + 1);
+  });
+
+  it("groups messages by day under a date pill", async () => {
+    const { container } = renderApp();
+    await screen.findByText("please fix the build");
+    const days = [...container.querySelectorAll(".day")];
+    expect(days).toHaveLength(1);
+    expect(days[0]!.querySelector(".day-pill")!.textContent).toBe(
+      dayLabel(new Date(messages[0]!.createdAt)),
+    );
+    expect(days[0]!.querySelectorAll(".message")).toHaveLength(2);
+    const now = new Date(2026, 9, 12, 9);
+    expect(dayLabel(new Date(2026, 9, 12, 1), now)).toBe("Today");
+    expect(dayLabel(new Date(2026, 9, 11, 23), now)).toBe("Yesterday");
+    expect(dayLabel(new Date(2026, 9, 6), now)).toBe("Tuesday, October 6");
+    expect(dayLabel(new Date(2025, 11, 31), now)).toBe("Wednesday, December 31, 2025");
+  });
+
+  it("stars the channel from the header star (sidebar.update), shown in Starred", async () => {
+    const { hive, user, container } = renderApp();
+    await user.click(await screen.findByRole("button", { name: "Star #general" }));
+    await vi.waitFor(() =>
+      expect(hive.sent("sidebar.update").map((s) => s.command)).toEqual([
+        {
+          type: "sidebar.update",
+          prefs: { pinned: [{ kind: "channel", id: "ch-1" }], hidden: [], groups: [] },
+          expectedRevision: 0,
+        },
+      ]),
+    );
+    expect(screen.getByRole("button", { name: "Unstar #general" })).toBeTruthy();
+    const starred = within(container.querySelector(".side-section")!);
+    expect(starred.getByText("# general")).toBeTruthy();
+  });
+
+  it("opens the channel panel on Members from the member count and on About from …", async () => {
+    const { user, container } = renderApp();
+    await user.click(await screen.findByRole("button", { name: "2 members" }));
+    const panel = () => within(container.querySelector<HTMLElement>(".panel")!);
+    expect(panel().getByRole("tab", { name: "Members" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    expect(await panel().findByText("Mina (you)")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Channel details" }));
+    expect(panel().getByRole("tab", { name: "About" }).getAttribute("aria-selected")).toBe("true");
   });
 });

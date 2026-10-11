@@ -1,33 +1,16 @@
 // The desktop shell (docs/architecture.md §21): a sidebar of Bots and Channels, the Channel conversation, the Bot
 // panel, and the Inbox / Activity (with the Run Inspector) / Approvals / Search / Memory / Status views.
 /* oxlint-disable no-await-in-loop */
+import type { SidebarPrefs } from "@hive/contracts";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HiveConfig } from "../../shared/api.ts";
-import { ChannelView, Inlines } from "./chat.tsx";
-import { BotPanel, ChannelPanel } from "./panel.tsx";
-import { parseInline } from "./format.ts";
+import { ChannelView } from "./chat.tsx";
+import { BotPanel, ChannelPanel, type ChannelTab } from "./panel.tsx";
+import { Sidebar, togglePin, type View } from "./sidebar.tsx";
 import { createSync, type ListKey, type SyncStatus } from "./sync.ts";
-import {
-  Avatar,
-  Badge,
-  failure,
-  get,
-  Icon,
-  inWorkspace,
-  MemoryList,
-  type Row,
-  text,
-} from "./ui.tsx";
+import { Badge, failure, get, inWorkspace, MemoryList, type Row, text } from "./ui.tsx";
 
-type View = "channel" | "inbox" | "activity" | "approvals" | "search" | "memory" | "status";
-const otherViews = [
-  ["inbox", "Inbox"],
-  ["activity", "Activity"],
-  ["approvals", "Approvals"],
-  ["search", "Search"],
-  ["memory", "Memory"],
-  ["status", "Status"],
-] as const;
+type SidebarDoc = { workspaceName: string; prefs: SidebarPrefs; revision: number };
 const collapsedKey = "hive.sidebarCollapsed";
 
 export const App = () => {
@@ -51,10 +34,18 @@ export const App = () => {
   const [runId, setRunId] = useState("");
   const [run, setRun] = useState<Inspected | null>(null);
   const [me, setMe] = useState<string | null>(null);
+  const [side, setSide] = useState<SidebarDoc>({
+    workspaceName: "",
+    prefs: { pinned: [], hidden: [], groups: [] },
+    revision: 0,
+  });
+  // The revision the next sidebar.update expects: ahead of `side` while saves are in flight.
+  const sideRevision = useRef(0);
+  const saving = useRef(Promise.resolve());
   // One right panel at a time: a Bot's, or the current Channel's.
-  const [panel, setPanel] = useState<{ kind: "bot"; id: string } | { kind: "channel" } | null>(
-    null,
-  );
+  const [panel, setPanel] = useState<
+    { kind: "bot"; id: string } | { kind: "channel"; tab: ChannelTab } | null
+  >(null);
   const panelBot = panel?.kind === "bot" ? panel.id : null;
   const openBot = useCallback((id: string | null) => setPanel(id ? { kind: "bot", id } : null), []);
   const [collapsed, setCollapsed] = useState(() => {
@@ -128,6 +119,13 @@ export const App = () => {
       (rows) => setMessages(rows.toReversed()),
     );
     load("inbox", bot && `/v1/inbox?${new URLSearchParams({ botId: bot })}`, "items", setInbox);
+    if (keys.has("sidebar"))
+      tasks.push(
+        get(inWorkspace("sidebar", ws)).then((doc) => {
+          sideRevision.current = Number(doc.revision);
+          setSide(doc as SidebarDoc);
+        }),
+      );
     const failed = (await Promise.allSettled(tasks)).find((r) => r.status === "rejected");
     setError(failed ? String(failed.reason) : null);
   }, []);
@@ -186,6 +184,35 @@ export const App = () => {
         () => setMe(null),
       );
   }, [config]);
+  /**
+   * Optimistic: shown at once, saved in order (each save expects the revision the previous one produced). A 409 means
+   * another device changed it: the server's document is re-read and shown.
+   */
+  const updateSidebar = (next: SidebarPrefs) => {
+    if (!config) return;
+    const ws = config.workspaceId;
+    // A group exists while it has items.
+    const prefs = { ...next, groups: next.groups.filter((g) => g.items.length > 0) };
+    setSide((s) => ({ ...s, prefs }));
+    saving.current = saving.current.then(async () => {
+      const res = await window.hive.api.command({
+        operationId: crypto.randomUUID(),
+        idempotencyKey: crypto.randomUUID(),
+        workspaceId: ws,
+        command: { type: "sidebar.update", prefs, expectedRevision: sideRevision.current },
+      });
+      if (res.ok) {
+        sideRevision.current = Number(res.value.revision);
+        return setSide((s) => ({ ...s, revision: sideRevision.current }));
+      }
+      await refetch(new Set(["sidebar"]), ws);
+      setError(
+        res.error.code === "REVISION_CONFLICT"
+          ? "The sidebar changed on another device; reloaded it."
+          : failure(res),
+      );
+    });
+  };
   const refreshDevices = useCallback(() => {
     if (config) void refetch(new Set(["devices"]), config.workspaceId);
   }, [config, refetch]);
@@ -242,89 +269,26 @@ export const App = () => {
 
   return (
     <div className={`app ${panelBotRow || channelPanel ? "with-panel" : ""}`}>
-      <aside className={`sidebar ${collapsed ? "collapsed" : ""}`}>
-        <div className="side-top">
-          <button
-            className="icon tip-below"
-            data-tip={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-            aria-label="Toggle sidebar"
-            onClick={() => setCollapsed(!collapsed)}
-          >
-            <Icon name="sidebar" />
-          </button>
-        </div>
-        <div className="bots">
-          {bots.map((b) => (
-            <button
-              key={b.id}
-              className={`bot ${b.id === panelBot ? "active" : ""}`}
-              {...(collapsed ? { "data-tip": text(b.name) } : {})}
-              aria-label={text(b.name)}
-              onClick={() => openBot(b.id === panelBot ? null : b.id)}
-            >
-              <Avatar id={b.id} name={String(b.name)} size={collapsed ? 40 : 56} />
-              {!collapsed && <span className="ellipsis">{text(b.name)}</span>}
-            </button>
-          ))}
-        </div>
-        <ul className="convs">
-          {channels.map((c) => {
-            const last = c.lastMessage as { body: string } | null;
-            return (
-              <li key={c.id}>
-                <button
-                  className={view === "channel" && c.id === channelId ? "active" : ""}
-                  title={`# ${text(c.name)}`}
-                  onClick={() => {
-                    setChannelId(c.id);
-                    setView("channel");
-                  }}
-                >
-                  <Avatar id={c.id} name={String(c.name)} size={40} />
-                  {!collapsed && (
-                    <span className="conv-text">
-                      <span className="ellipsis"># {text(c.name)}</span>
-                      <span className="preview ellipsis">
-                        {last ? (
-                          <Inlines
-                            inlines={parseInline(
-                              last.body
-                                .split("\n")[0]!
-                                .replace(/^\s*([-*]|\d+[.)])\s+/, "")
-                                .replaceAll(/\*\*|`/g, ""),
-                            )}
-                            names={botNames}
-                          />
-                        ) : (
-                          "No messages yet"
-                        )}
-                      </span>
-                    </span>
-                  )}
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-        <nav className="side-nav">
-          {otherViews.map(([v, label]) => (
-            <button
-              key={v}
-              className={`icon ${v === view ? "active" : ""}`}
-              data-tip={label}
-              aria-label={label}
-              onClick={() => setView(v)}
-            >
-              <Icon name={v} />
-              {v === "approvals" && approvals.length > 0 && (
-                <span className="count" aria-label={`${approvals.length} pending`}>
-                  {approvals.length}
-                </span>
-              )}
-            </button>
-          ))}
-        </nav>
-      </aside>
+      <Sidebar
+        workspaceName={side.workspaceName}
+        prefs={side.prefs}
+        update={updateSidebar}
+        collapsed={collapsed}
+        toggleCollapsed={() => setCollapsed(!collapsed)}
+        channels={channels}
+        bots={bots}
+        names={botNames}
+        view={view}
+        setView={setView}
+        channelId={channelId}
+        openChannel={(id) => {
+          setChannelId(id);
+          setView("channel");
+        }}
+        panelBot={panelBot}
+        openBot={openBot}
+        approvals={approvals.length}
+      />
       <main>
         {error && <p className="error banner">{error}</p>}
         {view === "channel" && (
@@ -335,7 +299,14 @@ export const App = () => {
             bots={bots}
             me={me}
             openBot={openBot}
-            toggleChannelPanel={() => setPanel(channelPanel ? null : { kind: "channel" })}
+            toggleChannelPanel={() =>
+              setPanel(channelPanel ? null : { kind: "channel", tab: "about" })
+            }
+            openChannelPanel={(tab) => setPanel({ kind: "channel", tab })}
+            starred={side.prefs.pinned.some((i) => i.kind === "channel" && i.id === channelId)}
+            toggleStar={() =>
+              updateSidebar(togglePin(side.prefs, { kind: "channel", id: channelId }))
+            }
           />
         )}
         {view === "inbox" && (
@@ -491,6 +462,8 @@ export const App = () => {
           openBot={openBot}
           refreshChannels={() => void refetch(new Set(["channels"]), ws)}
           close={() => setPanel(null)}
+          tab={panel?.kind === "channel" ? panel.tab : "about"}
+          setTab={(tab) => setPanel({ kind: "channel", tab })}
         />
       )}
     </div>

@@ -1,4 +1,4 @@
-// The Channel conversation: header pill, date-divided Markdown bubbles and the composer (message.post with @mentions).
+// The Channel conversation: header (star, name pill, topic, member count, "…"), day sections with sticky date pills, Markdown bubbles and the composer (message.post with @mentions).
 /* oxlint-disable no-await-in-loop */
 import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { type Inline, parseMarkdown } from "./format.ts";
@@ -49,14 +49,31 @@ export const Markdown = ({ source, names }: { source: string; names: Names }) =>
     );
   });
 
-const dayLabel = (at: Date) => {
+/** The day pill: Today, Yesterday, or the weekday and date (with the year when it is not this year). */
+export const dayLabel = (at: Date, now = new Date()) => {
   const days = Math.round(
-    (new Date().setHours(0, 0, 0, 0) - new Date(at).setHours(0, 0, 0, 0)) / 86_400_000,
+    (new Date(now).setHours(0, 0, 0, 0) - new Date(at).setHours(0, 0, 0, 0)) / 86_400_000,
   );
-  const time = at.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
-  if (days === 0) return `Today ${time}`;
-  if (days === 1) return `Yesterday ${time}`;
-  return `${at.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })} ${time}`;
+  if (days === 0) return "Today";
+  if (days === 1) return "Yesterday";
+  return at.toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    ...(at.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }),
+  });
+};
+
+/** Messages (oldest first) split into days: each day is a section whose pill sticks while it scrolls. */
+const byDay = (messages: Row[]) => {
+  const days: { day: string; at: Date; messages: Row[] }[] = [];
+  for (const m of messages) {
+    const at = new Date(String(m.createdAt));
+    const day = at.toDateString();
+    if (days.at(-1)?.day !== day) days.push({ day, at, messages: [] });
+    days.at(-1)!.messages.push(m);
+  }
+  return days;
 };
 
 /** `jobIds`: null while routing is pending, then one per mentioned Bot (empty: nobody was mentioned). */
@@ -82,6 +99,10 @@ export const ChannelView = (props: {
   me: string | null;
   openBot: (id: string) => void;
   toggleChannelPanel: () => void;
+  /** The header's member count (Members) and "…" (About). */
+  openChannelPanel: (tab: "about" | "members") => void;
+  starred: boolean;
+  toggleStar: () => void;
 }) => {
   const [draft, setDraft] = useState("");
   const [caret, setCaret] = useState(0);
@@ -163,16 +184,41 @@ export const ChannelView = (props: {
   };
 
   if (!props.channel) return <div className="empty">No channel yet.</div>;
-  let lastDay = "";
+  const name = text(props.channel.name);
+  const memberCount = Number(props.channel.memberCount ?? 0);
   return (
     <div className="chat">
       <header className="chat-head">
-        <button className="pill" onClick={props.toggleChannelPanel}>
-          <span className="hash">#</span> {text(props.channel.name)}
+        <button
+          className={`icon star ${props.starred ? "starred" : ""}`}
+          aria-label={props.starred ? `Unstar #${name}` : `Star #${name}`}
+          aria-pressed={props.starred}
+          onClick={props.toggleStar}
+        >
+          <Icon name="star" />
         </button>
-        {props.channel.topic ? (
-          <span className="topic-line ellipsis">{text(props.channel.topic)}</span>
-        ) : null}
+        <div className="head-name">
+          <button className="pill" onClick={props.toggleChannelPanel}>
+            <span className="hash">#</span> {name}
+          </button>
+          {props.channel.topic ? (
+            <span className="topic-line ellipsis">{text(props.channel.topic)}</span>
+          ) : null}
+        </div>
+        <button
+          className="members-button"
+          aria-label={`${memberCount} ${memberCount === 1 ? "member" : "members"}`}
+          onClick={() => props.openChannelPanel("members")}
+        >
+          <Icon name="users" /> {memberCount}
+        </button>
+        <button
+          className="icon"
+          aria-label="Channel details"
+          onClick={() => props.openChannelPanel("about")}
+        >
+          <Icon name="more" />
+        </button>
       </header>
       <div className="scroll">
         <p className="subtitle">
@@ -184,54 +230,53 @@ export const ChannelView = (props: {
             </button>
           ))}
         </p>
-        {props.messages.map((m) => {
-          const at = new Date(String(m.createdAt));
-          const day = at.toDateString();
-          const divider = day !== lastDay;
-          lastDay = day;
-          const author = botByActor.get(String(m.actorId));
-          return (
-            <Fragment key={m.id}>
-              {divider && <p className="divider">{dayLabel(at)}</p>}
-              <article className="message">
-                <div className="author">
-                  {author ? (
-                    <button className="inline-bot" onClick={() => props.openBot(author.id)}>
-                      <Avatar id={author.id} name={String(author.name)} size={20} />{" "}
-                      {text(author.name)}
+        {byDay(props.messages).map((d) => (
+          <section key={d.day} className="day">
+            <span className="day-pill">{dayLabel(d.at)}</span>
+            {d.messages.map((m) => {
+              const at = new Date(String(m.createdAt));
+              const author = botByActor.get(String(m.actorId));
+              return (
+                <article key={m.id} className="message">
+                  <div className="author">
+                    {author ? (
+                      <button className="inline-bot" onClick={() => props.openBot(author.id)}>
+                        <Avatar id={author.id} name={String(author.name)} size={20} />{" "}
+                        {text(author.name)}
+                      </button>
+                    ) : (
+                      <span>
+                        {props.me && m.userId === props.me ? "You" : String(m.actorId).slice(0, 8)}
+                      </span>
+                    )}
+                    <time>
+                      {at.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
+                    </time>
+                  </div>
+                  <div className="bubble">
+                    <Markdown source={String(m.body ?? "")} names={names} />
+                  </div>
+                  <div className="hover-actions">
+                    <button
+                      title="Copy"
+                      aria-label="Copy"
+                      onClick={() =>
+                        void navigator.clipboard.writeText(
+                          String(m.body ?? "").replaceAll(
+                            /<@bot:([^>\s]+)>/g,
+                            (_, id: string) => `@${names.get(id) ?? "unknown"}`,
+                          ),
+                        )
+                      }
+                    >
+                      <Icon name="copy" />
                     </button>
-                  ) : (
-                    <span>
-                      {props.me && m.userId === props.me ? "You" : String(m.actorId).slice(0, 8)}
-                    </span>
-                  )}
-                  <time>
-                    {at.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
-                  </time>
-                </div>
-                <div className="bubble">
-                  <Markdown source={String(m.body ?? "")} names={names} />
-                </div>
-                <div className="hover-actions">
-                  <button
-                    title="Copy"
-                    aria-label="Copy"
-                    onClick={() =>
-                      void navigator.clipboard.writeText(
-                        String(m.body ?? "").replaceAll(
-                          /<@bot:([^>\s]+)>/g,
-                          (_, id: string) => `@${names.get(id) ?? "unknown"}`,
-                        ),
-                      )
-                    }
-                  >
-                    <Icon name="copy" />
-                  </button>
-                </div>
-              </article>
-            </Fragment>
-          );
-        })}
+                  </div>
+                </article>
+              );
+            })}
+          </section>
+        ))}
         <div ref={end} />
       </div>
       <form

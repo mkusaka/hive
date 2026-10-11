@@ -12,6 +12,7 @@ export const channels = [
     topic: null,
     conversationId: "conv-1",
     role: "owner",
+    memberCount: 2,
     createdAt: "2026-10-01T09:00:00.000Z",
     lastMessage: {
       body: "- **Fixed** the `build`\nand more",
@@ -25,6 +26,7 @@ export const channels = [
     topic: "Ship it",
     conversationId: "conv-2",
     role: "member",
+    memberCount: 1,
     createdAt: "2026-10-02T09:00:00.000Z",
     lastMessage: null,
   },
@@ -105,6 +107,11 @@ export const routes = (): Routes => ({
   "/v1/me": { userId: me },
   "/v1/channels": { channels },
   "/v1/bots": { bots },
+  "/v1/sidebar": {
+    workspaceName: "acme",
+    prefs: { pinned: [], hidden: [], groups: [] },
+    revision: 0,
+  },
   "/v1/devices": {
     devices: [
       {

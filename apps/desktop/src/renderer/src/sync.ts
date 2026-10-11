@@ -11,6 +11,7 @@ export type ListKey =
   | "bots"
   | "devices"
   | "approvals"
+  | "sidebar"
   | "run";
 export const allLists: ListKey[] = [
   "channels",
@@ -20,6 +21,7 @@ export const allLists: ListKey[] = [
   "bots",
   "devices",
   "approvals",
+  "sidebar",
   "run",
 ];
 
@@ -27,7 +29,7 @@ type Change = { scope: string; entityKind: string };
 
 /**
  * `channel:*` → messages / inbox and the channel list (its `lastMessage` previews); `workspace:*` → jobs / bots /
- * devices / approvals (and the inspected Run for a `run` or `effect` row).
+ * devices / approvals / sidebar (and the inspected Run for a `run` or `effect` row).
  */
 export const refetchFor = (changes: Change[]) => {
   const keys = new Set<ListKey>();
@@ -35,7 +37,7 @@ export const refetchFor = (changes: Change[]) => {
     if (scope.startsWith("channel:")) {
       keys.add("messages").add("inbox").add("channels");
     } else if (scope.startsWith("workspace:")) {
-      keys.add("jobs").add("bots").add("devices").add("approvals");
+      keys.add("jobs").add("bots").add("devices").add("approvals").add("sidebar");
       if (entityKind === "run" || entityKind === "effect") keys.add("run");
     }
   }

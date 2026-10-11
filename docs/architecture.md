@@ -695,6 +695,11 @@ Notifications are refetch hints; losing one never affects state correctness. Cli
 reconnect, app foreground and periodic reconcile. Executors poll for eligible Jobs even if wake notifications
 are lost.
 
+Implemented as (UI-04): per-user preferences that every device of the user shares (the sidebar's pinned / hidden
+items and groups) are one server-side JSON document per user and Workspace (`sidebar_prefs`, revision CAS through
+`sidebar.update`). Its change row is scoped `workspace:<ws>` with entity kind `sidebar`, so clients refetch it with
+the workspace lists; the row carries no content, and `GET /v1/sidebar` returns only the caller's own document.
+
 ### 12.3 Cursor and bootstrap (§15.3)
 
 - A cursor is an opaque value combining workspace, authorization epoch and scan sequence. Gaps in the global
@@ -1162,6 +1167,10 @@ path, usage / failure / artifact rollups and token attribution are not built.
 | Routine         | Schedule, timezone, misfire, run history, pause                                        |
 | Approval        | Target operation, location, diff, request hash, expiry, approve / deny                 |
 
+- Implemented as (UI-04): the desktop sidebar follows Slack's layout: workspace name, a name filter, the view rows,
+  then Starred (pinned), the user's groups, Channels, Bots and Hidden, with an item menu (Pin, Move to group, Copy ID,
+  Hide) and drag to reorder. The layout is the server-side document of §12.2, so it follows the user to other devices.
+  The Channel view groups messages by day under sticky date pills.
 - Desktop shows accepted, delivered, started and completed separately; "sent" never means "the agent has read it".
   PC1 and PC2 show the same source of truth, and output that exists only in the local journal is marked unsynced.
 - Electron enables context isolation / sandbox, gives the renderer no Node or shell API, validates IPC sender and

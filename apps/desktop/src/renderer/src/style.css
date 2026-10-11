@@ -148,12 +148,24 @@ main {
 }
 .side-top {
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   min-height: 36px;
+  /* Room for the traffic lights. */
+  padding-left: 68px;
+}
+.workspace {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 17px;
+  font-weight: 700;
 }
 /* The traffic lights (about 70 px wide) cover the top of the 72 px rail: the toggle goes below them. */
 .collapsed .side-top {
-  padding-top: 32px;
+  padding: 32px 0 0;
+  justify-content: center;
 }
 button.icon {
   position: relative;
@@ -171,36 +183,115 @@ button.icon.active {
   background: var(--hover);
   color: var(--text);
 }
-.bots {
+.find {
   display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 4px 12px;
-  padding: 8px 0 12px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--bg-tertiary);
+  border-radius: var(--r-lg);
+  color: var(--text-3);
 }
-.collapsed .bots {
-  flex-direction: column;
-  border-bottom: 1px solid var(--bg-tertiary);
+.find input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 0;
+  border: 0;
+  background: none;
+  outline: none;
 }
-.bot {
+.side-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.collapsed .side-scroll {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
-  width: 84px;
-  padding: 6px 4px;
+}
+.side-nav {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--bg-tertiary);
+}
+.side-nav button {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: var(--r-lg);
   background: none;
-  border-radius: var(--r-row);
+  color: var(--text-2);
+  text-align: left;
+}
+.side-nav button:hover,
+.side-nav button.active {
+  background: var(--hover);
+  color: var(--text);
+}
+.collapsed .side-nav button {
+  padding: 9px;
+}
+.count {
+  margin-left: auto;
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+}
+.collapsed .count {
+  position: absolute;
+  top: 0;
+  right: 0;
+}
+.side-section {
+  padding-top: 10px;
+}
+.collapsed .side-section {
+  padding-top: 0;
+}
+.side-section hr {
+  width: 32px;
+  margin: 6px auto;
+  border: 0;
+  border-top: 1px solid var(--bg-tertiary);
+}
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 4px 6px;
+  background: none;
+  color: var(--text-3);
   font-size: 13px;
+  text-align: left;
 }
-.collapsed .bot {
-  width: auto;
+.section-head:hover {
+  color: var(--text-2);
 }
-.bot span {
-  max-width: 100%;
+.caret {
+  display: inline-grid;
+  transition: transform 0.12s;
 }
-.bot.active {
-  background: var(--active);
+.caret svg {
+  width: 14px;
+  height: 14px;
+}
+.caret.closed {
+  transform: rotate(-90deg);
+}
+.hint {
+  margin: 4px 12px 8px;
+  color: var(--text-3);
+  font-size: 13px;
 }
 .avatar {
   display: inline-grid;
@@ -215,26 +306,44 @@ button.icon.active {
   list-style: none;
   margin: 0;
   padding: 0;
-  flex: 1;
-  overflow: auto;
 }
-.convs button {
+.item {
+  position: relative;
+}
+.convs button:not(.icon) {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   width: 100%;
-  padding: 10px 12px;
+  padding: 6px 36px 6px 10px;
   margin-bottom: 2px;
   text-align: left;
   background: none;
   border-radius: var(--r-row);
 }
-.collapsed .convs button {
-  padding: 8px;
+.convs button:not(.icon):hover {
+  background: var(--hover);
+}
+.collapsed .convs button:not(.icon) {
+  padding: 6px;
   justify-content: center;
 }
 .convs button.active {
   background: var(--active);
+}
+/* Out of the flow, shown on hover (`.item` raises it over `button.icon`). */
+.item .item-more {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  width: 28px;
+  height: 28px;
+  opacity: 0;
+}
+.item:hover .item-more,
+.item .item-more:focus-visible {
+  opacity: 1;
 }
 .conv-text {
   display: flex;
@@ -243,29 +352,7 @@ button.icon.active {
 }
 .preview {
   color: var(--text-2);
-  font-size: 14px;
-}
-.side-nav {
-  display: flex;
-  justify-content: space-between;
-  padding-top: 8px;
-  border-top: 1px solid var(--bg-tertiary);
-}
-.collapsed .side-nav {
-  flex-direction: column;
-  gap: 4px;
-}
-.count {
-  position: absolute;
-  top: 0;
-  right: 0;
-  min-width: 16px;
-  padding: 0 4px;
-  border-radius: 8px;
-  background: var(--danger);
-  color: #fff;
-  font-size: 11px;
-  line-height: 16px;
+  font-size: 13px;
 }
 
 /* Channel conversation */
@@ -278,11 +365,37 @@ button.icon.active {
 }
 .chat-head {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 4px;
-  padding: 14px 0 10px;
+  gap: 6px;
+  padding: 12px 0 10px;
   border-bottom: 1px solid var(--bg-quaternary);
+}
+.head-name {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+.star.starred {
+  color: var(--warning);
+}
+.star.starred svg {
+  fill: currentColor;
+}
+.members-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: var(--r-lg);
+  background: none;
+  color: var(--text-2);
+}
+.members-button:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 button.pill:hover {
   background: var(--hover);
@@ -306,12 +419,31 @@ button.pill:hover {
   overflow: auto;
   padding: 8px 0 16px;
 }
-.subtitle,
-.divider {
+.subtitle {
   text-align: center;
   color: var(--text-2);
   font-size: 14px;
   margin: 20px 0 12px;
+}
+/* A day: a divider line with a centered date pill that sticks to the top while the day scrolls by. */
+.day {
+  margin-top: 28px;
+  border-top: 1px solid var(--bg-tertiary);
+}
+.day-pill {
+  position: sticky;
+  top: 6px;
+  z-index: 2;
+  display: block;
+  width: fit-content;
+  margin: -14px auto 10px;
+  padding: 4px 14px;
+  border: 1px solid var(--bg-tertiary);
+  border-radius: 999px;
+  background: var(--chrome);
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 500;
 }
 .inline-bot {
   display: inline-flex;
@@ -811,6 +943,18 @@ button.small {
   border: 0;
   border-top: 1px solid var(--bg-tertiary);
 }
+.menu input {
+  margin: 4px 6px;
+}
+.submenu {
+  display: flex;
+  flex-direction: column;
+  padding-left: 28px;
+}
+.submenu-caret {
+  margin-left: auto;
+  color: var(--text-3);
+}
 .menu .danger {
   color: var(--danger);
 }
@@ -867,7 +1011,8 @@ button.topic {
   color: var(--text);
 }
 .topic-line {
-  max-width: 70%;
+  max-width: 100%;
+  padding-left: 16px;
   color: var(--text-3);
   font-size: 12px;
 }

@@ -1,5 +1,10 @@
 // Read routes for a user principal, scoped to the user's Workspaces (docs/architecture.md §22.2).
-import type { ApprovalStatus, PlacementPolicy } from "@hive/contracts";
+import {
+  type ApprovalStatus,
+  defaultSidebarPrefs,
+  type PlacementPolicy,
+  type SidebarPrefs,
+} from "@hive/contracts";
 import { displayState } from "@hive/db";
 import { HttpError } from "./errors.ts";
 import { placementDevices } from "./executor.ts";
@@ -128,6 +133,8 @@ export const listChannels = async (db: D1Database, workspaceId: string, userId: 
   const { results } = await db
     .prepare(
       `SELECT ch.id, ch.name, ch.topic, c.id AS conversationId, m.role, ch.created_at AS createdAt,
+              (SELECT COUNT(*) FROM channel_members cm
+                WHERE cm.workspace_id = ch.workspace_id AND cm.channel_id = ch.id) AS memberCount,
               (SELECT json_object('body', lm.body, 'createdAt', lm.created_at, 'actorId', lm.actor_id)
                  FROM messages lm WHERE lm.workspace_id = c.workspace_id AND lm.conversation_id = c.id
                 ORDER BY lm.seq DESC LIMIT 1) AS lastMessage
@@ -142,6 +149,24 @@ export const listChannels = async (db: D1Database, workspaceId: string, userId: 
     .all<{ lastMessage: string | null }>();
   for (const ch of results) ch.lastMessage = ch.lastMessage && JSON.parse(ch.lastMessage);
   return { channels: results };
+};
+
+/** The caller's sidebar document (UI-04), the default at revision 0 when none, and the Workspace's name. */
+export const getSidebar = async (db: D1Database, workspaceId: string, userId: string) => {
+  const row = await db
+    .prepare(
+      `SELECT w.name AS workspaceName, s.prefs, s.revision FROM workspaces w
+         LEFT JOIN sidebar_prefs s ON s.workspace_id = w.id AND s.user_id = ?
+        WHERE w.id = ?`,
+    )
+    .bind(userId, workspaceId)
+    .first<{ workspaceName: string; prefs: string | null; revision: number | null }>();
+  if (!row) throw notFound("workspace");
+  return {
+    workspaceName: row.workspaceName,
+    prefs: row.prefs ? (JSON.parse(row.prefs) as SidebarPrefs) : defaultSidebarPrefs,
+    revision: row.revision ?? 0,
+  };
 };
 
 /**
