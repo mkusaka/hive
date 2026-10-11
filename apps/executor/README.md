@@ -11,13 +11,15 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK), `codex` 
   `reason`. `fetch` is injectable.
 - `src/runner.ts`: `reconcile` (startup), `runOnce` (heartbeat → list queued → claim → journal the claim → fetch the
   run context → journal the launch intent → start the adapter → renew the lease every quarter of its remaining
-  time → submit the result, with `reply` when the adapter returns `replyText` and the Job has a Conversation) and
-  `runLoop`. The adapter gets the context and an `observe(kind, payload)` callback for fenced observations. A
-  `STALE_GENERATION` on renew stops the agent, submits nothing and, once the agent exited, sends
-  `runtime.run.stopped {confirmed: true}` (journal result `stopped`, or `stale_generation` if the cloud could not be
-  told). `cancelRequested` on a renewal (`job.cancel`) stops the agent with reason `cancelled` and submits `failed`
-  with error `cancelled`; the cloud finishes the Job `cancelled`. Web-standard APIs only, so it also runs inside
-  workerd tests.
+  time → submit the result, with `reply` when a normal adapter Run returns `replyText` and the Job has a
+  Conversation) and `runLoop`. A successful `summarize` Run first writes its validated `summary.write`; a
+  successful `consolidate` Run first applies its fully validated `memory.write` / revision-guarded
+  `memory.delete` plan. Maintenance Runs never post a reply. The adapter gets the context and an
+  `observe(kind, payload)` callback for fenced observations. A `STALE_GENERATION` on renew stops the agent,
+  submits nothing and, once the agent exited, sends `runtime.run.stopped {confirmed: true}` (journal result
+  `stopped`, or `stale_generation` if the cloud could not be told). `cancelRequested` on a renewal (`job.cancel`)
+  stops the agent with reason `cancelled` and submits `failed` with error `cancelled`; the cloud finishes the Job
+  `cancelled`. Web-standard APIs only, so it also runs inside workerd tests.
 - `src/journal.ts`: the Local Journal file, `<state-dir>/journal.jsonl`, one fsynced JSON line per entry
   (`claim`, `intent`, `result`, `uploaded`). The intent is written before the adapter starts (§20.2).
   `transcriptReader(stateDir)` reads `<state-dir>/transcripts/<runId>.jsonl` (null when absent).
@@ -26,6 +28,8 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK), `codex` 
 - `src/adapters/fake.ts`: exits after `FAKE_DELAY_MS` (default 50) with code 0 and summary
   `fake: handled inbox item <id>`; `FAKE_FAIL=1` exits 1. It is idempotent, so reconcile may simply start it again.
 - `src/adapters/claude.ts`: one SDK `query()` per Run (see below).
+- `src/maintenance.ts`: strict structured-output parsing and provenance / revision validation for summary and
+  consolidation plans before the runner sends any maintenance command.
 - `src/adapters/codex.ts`: one `codex app-server` process and thread per Run (see Codex provider);
   `src/adapters/codexProtocol.ts` holds the hand-written protocol types it uses.
 - `src/toolPolicy.ts`: the Bot tool policy as SDK options, the PreToolUse hook and the `canUseTool` approval gate
@@ -42,10 +46,16 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK), `codex` 
 
 ## Claude provider
 
-- **Prompt.** `systemPrompt` = "You are <bot name>, a bot in a hive workspace." plus the Bot's `instructions`. The
-  user message = the Task (if any), the Conversation's recent messages (oldest first), a "Memory" section (the
-  context's memories with their scope) and a "Related" section (search hits with source kind and snippet), then the
-  trigger item's body. Plain text.
+- **Prompt.** Normal Runs use `systemPrompt` = "You are <bot name>, a bot in a hive workspace." plus the Bot's
+  `instructions`. The user message places the Task (if any) first, then read-only parent context and the latest
+  summary and pinned facts before recent messages, followed by Memory, Related search hits and the trigger item.
+  A `summarize` Run instead uses a fixed
+  no-tool prompt and returns only JSON `{text, pinnedFacts}` for its selected range. A `consolidate` Run returns
+  only a complete JSON `{writes, deletes}` plan over the supplied memory revisions and summary provenance; merged
+  memories retain every source conversation, and only Bot plans may propose Workspace promotion. Both maintenance
+  shapes use SDK `outputFormat` draft-7 JSON schemas generated from the local validators; only `structured_output` is
+  consumed, never assistant prose or fenced JSON. Byte limits and provenance are fully validated before the runner
+  writes anything; invalid or missing output fails the Run with no writes.
 - **Tools.** The Bot's tool policy (below) decides the native tools; `settingSources: []` (no user / project
   settings, hooks or CLAUDE.md), `strictMcpConfig`, `maxTurns: 4`. With a Run capability, `mcpServers: {hive}` is an
   in-process SDK MCP server (`src/tools.ts`) whose tools are in `allowedTools`; without one (a Run resumed after a
@@ -134,6 +144,10 @@ failed: ...`.
   `enforceToolApproval: false`: under `untrusted` Codex may run a command it classifies as safe without an
   approval request, even when Bash is `deny`. That classification is Codex's, not hive's (in G-08 even `ls`, run
   as `zsh -lc ls`, asked).
+
+- **Maintenance jobs.** Codex maintenance jobs fail explicitly before spawning `app-server`: its current protocol
+  configuration cannot enforce the Claude adapter's no-native-tool summary mode or deferred-write consolidation
+  plan. Normal Runs are unchanged.
 
 ## Transcript upload
 
@@ -241,13 +255,14 @@ aborts the wait. The provider response never reaches the model. Codex gets the s
 
 ## Tests
 
-`bun run test` from the repo root. `test/runner.test.ts` runs in Node against an in-memory cloud;
-`test/uploader.test.ts` covers the splitter and the uploader's ACK / retry rules; `test/claude.test.ts` drives the Claude adapter with a fake `queryFn` (SDK message shapes, no subprocess);
-`test/codex.test.ts` drives the Codex adapter against `test/fakeCodex.mjs`, a scripted app-server spawned with
-`process.execPath` (happy path, journaling order, approvals, deny, outside paths, stop, kill, crash, hive tools);
-`test/tools.test.ts` covers the hive tools and the `waiting` exit; `test/retention.test.ts` the retention rules on a
-fake state dir; `test/toolPolicy.test.ts` the SDK options, the
-path hook, the approval gate and the environment cwd; the end-to-end
+`bun run test` from the repo root. `test/runner.test.ts` runs in Node against an in-memory cloud, including
+maintenance writes with no reply; `test/uploader.test.ts` covers the splitter and the uploader's ACK / retry rules;
+`test/claude.test.ts` drives the Claude adapter with a fake `queryFn` (SDK message shapes, no subprocess), including
+maintenance prompt/output validation; `test/codex.test.ts` drives the Codex adapter against
+`test/fakeCodex.mjs`, a scripted app-server spawned with `process.execPath` (happy path, journaling order,
+approvals, deny, outside paths, stop, kill, crash, hive tools, maintenance rejection); `test/tools.test.ts` covers
+the hive tools and the `waiting` exit; `test/retention.test.ts` the retention rules on a fake state dir;
+`test/toolPolicy.test.ts` the SDK options, the path hook, the approval gate and the environment cwd; the end-to-end
 loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (workerd).
 
 ## Known gaps
@@ -267,6 +282,7 @@ loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (
   start identity) before confirming. A long-running loop confirms a stale Run only when its own renewal hits
   `STALE_GENERATION`; a Run journaled by an earlier process is confirmed at the next start.
 - No scheduler / offers or WebSocket: the executor polls. Capacity is one Run at a time.
-- Codex: no same-device `thread/resume` and no cross-PC resume (§13.4: a new thread with the current context);
-  the user's `AGENTS.md`, skills and model defaults from `CODEX_HOME` still apply; commands Codex classifies as safe
-  may bypass approvals; `dynamicTools` is an experimental protocol field; token usage is only in the transcript.
+- Codex: no same-device `thread/resume` and no cross-PC resume (§13.4); maintenance jobs are explicitly unsupported
+  because Codex cannot currently enforce their tool boundary. The user's `AGENTS.md`, skills and model defaults from
+  `CODEX_HOME` still apply to normal Runs; commands Codex classifies as safe may bypass approvals; `dynamicTools` is
+  an experimental protocol field; token usage is only in the transcript.

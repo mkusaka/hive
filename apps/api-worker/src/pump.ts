@@ -22,7 +22,7 @@ import {
   settleDelegations,
 } from "@hive/db";
 import { performEffect, type Performers, reconcileEffect } from "./effects.ts";
-import { parkWaitingJobs } from "./executor.ts";
+import { enqueueSummary, parkWaitingJobs } from "./executor.ts";
 import type { Notification } from "./realtime.ts";
 import { fireDueRoutines } from "./routines.ts";
 import { indexSource } from "./search.ts";
@@ -187,6 +187,31 @@ export const routeEvent = async (db: D1Database, eventId: string): Promise<Notif
     : { workspaceId, scopes: [scope] };
 };
 
+const summaryThreshold = 10;
+const queueSummaries = async (db: D1Database) => {
+  const { results } = await db
+    .prepare(
+      `SELECT c.workspace_id, c.id AS conversation_id, b.id AS bot_id,
+      COUNT(m.id) AS span
+      FROM conversations c JOIN conversations p ON p.workspace_id = c.workspace_id AND p.id = COALESCE(c.parent_conversation_id, c.id)
+      JOIN bots b ON b.workspace_id = c.workspace_id AND (
+        (p.kind = 'dm' AND p.dm_bot_id = b.id)
+        OR (p.kind = 'bot_pair' AND (p.id LIKE 'botpair:' || b.id || ':%' OR p.id LIKE 'botpair:%:' || b.id))
+        OR (p.kind = 'channel' AND EXISTS (SELECT 1 FROM channel_members cm
+          WHERE cm.workspace_id = p.workspace_id AND cm.channel_id = p.channel_id AND cm.actor_id = b.actor_id)))
+      JOIN messages m ON m.workspace_id = c.workspace_id AND m.conversation_id = c.id
+        AND m.seq > COALESCE((SELECT MAX(s.covers_to_seq) FROM conversation_summaries s
+          WHERE s.workspace_id = c.workspace_id AND s.conversation_id = c.id AND (s.bot_id = b.id OR s.bot_id IS NULL)), 0)
+      GROUP BY c.workspace_id, c.id, b.id HAVING span > ? LIMIT 100`,
+    )
+    .bind(summaryThreshold)
+    .all<{ workspace_id: string; conversation_id: string; bot_id: string }>();
+  await Promise.all(
+    results.map((row) => enqueueSummary(db, row.workspace_id, row.conversation_id, row.bot_id)),
+  );
+  return results;
+};
+
 /**
  * Acquires ready outbox rows and handles them. A failed row keeps its lease and is retried after it expires; at
  * `maxAttempts` it goes `dead`. Topics without a consumer yet (e.g. `run.finished`) are marked sent so they do not
@@ -259,6 +284,14 @@ export const pump = async (
     if (jobIds.length > 0) {
       input.notify?.({ workspaceId, scopes: [`workspace:${workspaceId}`], jobAvailable: true });
     }
+  }
+  const summaries = await queueSummaries(db);
+  for (const { workspace_id } of summaries) {
+    input.notify?.({
+      workspaceId: workspace_id,
+      scopes: [`workspace:${workspace_id}`],
+      jobAvailable: true,
+    });
   }
   // Recovery (§10.4): expired leases → unknown / recovery_required; Jobs no online device can run wait.
   const expired = await expireLeases(db);

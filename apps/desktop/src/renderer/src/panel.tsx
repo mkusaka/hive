@@ -65,20 +65,37 @@ export const BotPanel = (props: {
 }) => {
   const [tab, setTab] = useState<Tab>("details");
   const [memories, setMemories] = useState<Row[]>([]);
+  const [source, setSource] = useState<"all" | "explicit" | "consolidation">("all");
   const [error, setError] = useState<string | null>(null);
   const { ws, bot, refreshDevices } = props;
-
+  const loadMemories = useCallback(async () => {
+    const res = await window.hive.api.get(
+      inWorkspace("memories", ws, {
+        scopeKind: "bot",
+        scopeId: bot.id,
+        ...(source === "all" ? {} : { source }),
+      }),
+    );
+    if (res.ok) setMemories(res.value.memories as Row[]);
+    else setError(failure(res));
+  }, [ws, bot.id, source]);
   useEffect(() => {
     setError(null);
-    if (tab === "library")
-      void window.hive.api
-        .get(inWorkspace("memories", ws, { scopeKind: "bot", scopeId: bot.id }))
-        .then((res) =>
-          res.ok ? setMemories(res.value.memories as Row[]) : setError(failure(res)),
-        );
+    if (tab === "library") void loadMemories();
     // Heartbeats write no change rows, so online state is refetched when the tab opens.
     if (tab === "computer") refreshDevices();
-  }, [tab, ws, bot.id, refreshDevices]);
+  }, [tab, loadMemories, refreshDevices]);
+  const changeProposal = async (memory: Row, type: "memory.promote" | "memory.delete") => {
+    const res = await command(
+      ws,
+      type === "memory.promote"
+        ? { type, memoryId: memory.id }
+        : { type, memoryId: memory.id, expectedRevision: Number(memory.revision) },
+    );
+    if (!res.ok) return setError(failure(res));
+    setError(null);
+    void loadMemories();
+  };
 
   const channelOf = (r: Row) => props.channels.find((c) => c.conversationId === r.conversationId);
   return (
@@ -102,11 +119,14 @@ export const BotPanel = (props: {
           <div className="card">
             <pre className="mono">{JSON.stringify(bot.toolPolicy, null, 2)}</pre>
           </div>
+          <h3>Nightly memory consolidation</h3>
+          <NightlyConsolidation ws={ws} botId={bot.id} />
           <h3>Routines</h3>
           {/* All channels; routines are created from a Channel panel. */}
           <Routines
             ws={ws}
             query={{ botId: bot.id }}
+            excludeSystem
             bots={props.bots}
             side={(r) => {
               const channel = channelOf(r);
@@ -118,10 +138,42 @@ export const BotPanel = (props: {
       {tab === "library" && (
         <>
           <h3>Memories</h3>
+          <label>
+            Source{" "}
+            <select
+              aria-label="Memory source"
+              value={source}
+              onChange={(e) => setSource(e.target.value as typeof source)}
+            >
+              <option value="all">All</option>
+              <option value="explicit">Explicit</option>
+              <option value="consolidation">Consolidated</option>
+            </select>
+          </label>
           <div className="card">
             {memories.length === 0 && <p className="meta">No memories for this Bot.</p>}
-            <MemoryList memories={memories} />
+            <MemoryList memories={memories.filter((m) => m.proposedScope !== "workspace")} />
           </div>
+          {memories.some((m) => m.proposedScope === "workspace") && (
+            <>
+              <h3>Proposed for workspace</h3>
+              <div className="card">
+                {memories
+                  .filter((m) => m.proposedScope === "workspace")
+                  .map((memory) => (
+                    <div key={memory.id}>
+                      <MemoryList memories={[memory]} />
+                      <button onClick={() => void changeProposal(memory, "memory.promote")}>
+                        Promote
+                      </button>{" "}
+                      <button onClick={() => void changeProposal(memory, "memory.delete")}>
+                        Dismiss
+                      </button>
+                    </div>
+                  ))}
+              </div>
+            </>
+          )}
         </>
       )}
       {tab === "computer" && (
@@ -158,6 +210,42 @@ export const BotPanel = (props: {
   );
 };
 
+const NightlyConsolidation = (props: { ws: string; botId: string }) => {
+  const [routine, setRoutine] = useState<Row | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    const res = await window.hive.api.get(
+      inWorkspace("routines", props.ws, { botId: props.botId }),
+    );
+    if (!res.ok) return setError(failure(res));
+    const routines = res.value.routines as Row[];
+    setError(null);
+    setRoutine(routines.find((candidate) => candidate.jobKind === "consolidate") ?? null);
+  }, [props.ws, props.botId]);
+  useEffect(() => void load(), [load]);
+  const toggle = async () => {
+    if (!routine) return;
+    const res = await command(props.ws, {
+      type: routine.enabled ? "routine.pause" : "routine.resume",
+      routineId: routine.id,
+    });
+    if (!res.ok) return setError(failure(res));
+    void load();
+  };
+  if (!routine) return error ? <p className="error">{error}</p> : null;
+  return (
+    <label className="switch">
+      <input
+        type="checkbox"
+        checked={Boolean(routine.enabled)}
+        aria-label="Nightly memory consolidation enabled"
+        onChange={() => void toggle()}
+      />
+      <span /> Enabled
+    </label>
+  );
+};
+
 /**
  * Channel details, like Slack's: About (name, topic edited inline, created date), Members (`GET
  * /v1/channels/:id/members`, "Add bot" → channel.join, a Bot's row menu → channel.leave) and Routines (each with its
@@ -186,6 +274,7 @@ export const ChannelPanel = (props: {
 }) => {
   const { tab, setTab } = props;
   const [members, setMembers] = useState<Row[]>([]);
+  const [summary, setSummary] = useState<Row | null>(null);
   const [error, setError] = useState<string | null>(null);
   // "Add bot" picker, or a Bot member's row menu.
   const [menu, setMenu] = useState<{ x: number; y: number; botId?: string } | null>(null);
@@ -199,10 +288,18 @@ export const ChannelPanel = (props: {
         .then((res) => (res.ok ? setMembers(res.value.members as Row[]) : setError(failure(res)))),
     [ws, channel.id],
   );
+  const loadSummary = useCallback(async () => {
+    const res = await window.hive.api.get(
+      inWorkspace(`conversations/${encodeURIComponent(conversationId)}/summary`, ws),
+    );
+    if (res.ok) setSummary((res.value.summary as Row | null) ?? null);
+    else setError(failure(res));
+  }, [ws, conversationId]);
   useEffect(() => {
     setError(null);
     if (tab === "members") loadMembers();
-  }, [tab, loadMembers]);
+    if (tab === "about") void loadSummary();
+  }, [tab, loadMembers, loadSummary]);
   const membership = async (type: "channel.join" | "channel.leave", botId: string) => {
     setMenu(null);
     const res = await command(ws, { type, channelId: channel.id, botId });
@@ -216,6 +313,12 @@ export const ChannelPanel = (props: {
     if (!res.ok) return setError(failure(res));
     setError(null);
     props.refreshChannels();
+  };
+  const summarize = async () => {
+    const res = await command(ws, { type: "conversation.summarize", conversationId });
+    if (!res.ok) return setError(failure(res));
+    setError(null);
+    void loadSummary();
   };
   return (
     <PanelChrome
@@ -242,6 +345,18 @@ export const ChannelPanel = (props: {
               year: "numeric",
             })}
           </div>
+          <div className="meta">Summary</div>
+          {summary ? (
+            <>
+              <p>{text(summary.text)}</p>
+              <p className="meta">
+                Covers messages {text(summary.coversFromSeq)}–{text(summary.coversToSeq)}
+              </p>
+            </>
+          ) : (
+            <p className="meta">No summary yet.</p>
+          )}
+          <button onClick={() => void summarize()}>Summarize now</button>
         </div>
       )}
       {tab === "members" && (
@@ -380,6 +495,7 @@ const Routines = (props: {
   bots: Row[];
   side: (r: Row) => ReactNode;
   create?: { conversationId: string; botId: string };
+  excludeSystem?: boolean;
 }) => {
   const { ws } = props;
   const [routines, setRoutines] = useState<Row[]>([]);
@@ -393,8 +509,12 @@ const Routines = (props: {
       inWorkspace("routines", ws, JSON.parse(query) as Record<string, string>),
     );
     if (!res.ok) return setError(failure(res));
-    setRoutines(res.value.routines as Row[]);
-  }, [ws, query]);
+    setRoutines(
+      (res.value.routines as Row[]).filter(
+        (routine) => !props.excludeSystem || routine.jobKind !== "consolidate",
+      ),
+    );
+  }, [ws, query, props.excludeSystem]);
   useEffect(() => void load(), [load]);
   const closeMenu = useCallback(() => setMenu(null), []);
 

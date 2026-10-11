@@ -12,8 +12,9 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { describe, expect, it } from "vitest";
 import { claudeAdapter, type QueryFn, userPrompt } from "../src/adapters/claude.ts";
+import { parseConsolidationPlan } from "../src/maintenance.ts";
 import { type JournalEntry, type LaunchContext, reconcile, runOnce } from "../src/runner.ts";
-import { context, fakeCloud, memoryJournal } from "./helpers.ts";
+import { context, fakeCloud, fakeRunApi, memoryJournal } from "./helpers.ts";
 
 // Fake SDK stream: the fields the adapter reads, shaped like the real 0.3.x message types.
 const sessionId = "11111111-1111-4111-8111-111111111111";
@@ -131,11 +132,8 @@ describe("claudeAdapter", () => {
       },
     ]);
     expect(await transcriptOf(dir)).toEqual([init, assistant, result()]);
-    // Instructions go to the system prompt; the request and recent conversation to the user message. No tools.
-    const [{ prompt, options }] = calls as [(typeof calls)[number]];
-    expect(options.systemPrompt).toContain("Reply in one short sentence.");
-    expect(prompt).toContain("Request:\nSay hello.");
-    expect(prompt).toContain("[user actor-1] Say hello.");
+    // The default policy denies native tools and ignores user/project settings.
+    const [{ options }] = calls as [(typeof calls)[number]];
     expect(options).toMatchObject({
       // The default policy: no native tool exists, every one is disallowed too.
       tools: [],
@@ -146,6 +144,307 @@ describe("claudeAdapter", () => {
       cwd: join(dir, "runs", "run-1"),
     });
     expect(options.resume).toBeUndefined();
+  });
+
+  it("uses a fixed no-tool prompt and parses a structured summary", async () => {
+    const dir = await stateDir();
+    const summaryContext: LaunchContext["context"] = {
+      ...context,
+      jobKind: "summarize" as const,
+      summarization: {
+        conversationId: "conv-1",
+        botId: "bot-1",
+        coversFromSeq: 1,
+        coversToSeq: 2,
+        messages: [
+          {
+            id: "msg-1",
+            seq: 1,
+            actorKind: "user",
+            actorId: "actor-1",
+            body: "Deploy Friday.",
+            createdAt: "",
+          },
+        ],
+        previousSummary: {
+          id: "summary-0",
+          conversationId: "conv-1",
+          botId: "bot-1",
+          coversFromSeq: 1,
+          coversToSeq: 1,
+          text: "The deploy is Friday.",
+          pinnedFacts: [{ kind: "decision", text: "Deploy Friday.", sourceMessageIds: ["msg-0"] }],
+          revision: 1,
+          createdByRunId: "run-old",
+          createdAt: "",
+        },
+      },
+    };
+    const { calls, queryFn } = fakeQuery([
+      init,
+      {
+        ...result('```json\n{"text":"Untrusted textual fallback"}\n```'),
+        structured_output: {
+          text: "The deploy is Friday.",
+          pinnedFacts: [{ kind: "decision", text: "Deploy Friday.", sourceMessageIds: ["msg-0"] }],
+        },
+      } as SDKMessage,
+    ]);
+    const exit = await (
+      await claudeAdapter({ stateDir: dir, queryFn }).start(launch({ context: summaryContext }))
+    ).waitForExit();
+
+    expect(exit).toMatchObject({
+      code: 0,
+      summary: "claude: summary ready",
+      summaryOutput: {
+        text: "The deploy is Friday.",
+        pinnedFacts: [{ kind: "decision", text: "Deploy Friday.", sourceMessageIds: ["msg-0"] }],
+      },
+    });
+    expect(exit.replyText).toBeUndefined();
+    expect(calls[0]?.options).toMatchObject({
+      tools: [],
+      allowedTools: [],
+      disallowedTools: ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
+      settingSources: [],
+      mcpServers: {},
+    });
+    expect(calls[0]?.options.hooks).toBeUndefined();
+  });
+
+  it("accepts explicit memories without conversation provenance but rejects unfounded or channel proposals", () => {
+    const memory = {
+      id: "memory-1",
+      scopeKind: "bot" as const,
+      scopeId: "bot-1",
+      content: "Use the standard deploy checklist.",
+      sourceKind: "user" as const,
+      sourceId: "user-1",
+      source: "explicit" as const,
+      mergedFromIds: [],
+      sourceConversationIds: [],
+      proposedScope: null,
+      revision: 1,
+      supersedesId: null,
+      createdAt: "",
+    };
+    const botContext = {
+      ...context,
+      jobKind: "consolidate" as const,
+      consolidation: {
+        scopeKind: "bot" as const,
+        scopeId: "bot-1",
+        memories: [memory],
+        summaries: [],
+      },
+    };
+    const memoryPlan = {
+      writes: [
+        {
+          content: "Keep using the standard deploy checklist.",
+          mergedFrom: [{ id: "memory-1", revision: 1 }],
+          sourceConversationIds: [],
+        },
+      ],
+      deletes: [],
+    };
+    expect(parseConsolidationPlan(memoryPlan, botContext)).toMatchObject({
+      writes: [{ mergedFrom: [{ id: "memory-1", revision: 1 }], sourceConversationIds: [] }],
+    });
+    expect(() =>
+      parseConsolidationPlan(memoryPlan, {
+        ...botContext,
+        consolidation: {
+          ...botContext.consolidation,
+          memories: [{ ...memory, sourceConversationIds: ["conv-1"] }],
+        },
+      }),
+    ).toThrow("was not preserved");
+    expect(() =>
+      parseConsolidationPlan(
+        {
+          writes: [{ content: "Unfounded.", mergedFrom: [], sourceConversationIds: [] }],
+          deletes: [],
+        },
+        botContext,
+      ),
+    ).toThrow("needs a memory or conversation source");
+    expect(() =>
+      parseConsolidationPlan(
+        {
+          writes: [
+            {
+              content: "Keep using the standard deploy checklist.",
+              mergedFrom: [{ id: "memory-1", revision: 1 }],
+              sourceConversationIds: [],
+              proposedScope: "workspace",
+            },
+          ],
+          deletes: [],
+        },
+        {
+          ...botContext,
+          consolidation: {
+            ...botContext.consolidation,
+            scopeKind: "channel" as const,
+            scopeId: "chan-1",
+          },
+        },
+      ),
+    ).toThrow("only Bot consolidation may propose workspace promotion");
+  });
+
+  it("fails a missing structured summary before any run command or reply", async () => {
+    const dir = await stateDir();
+    const { api, calls } = fakeRunApi();
+    const summaryContext = {
+      ...context,
+      jobKind: "summarize" as const,
+      summarization: {
+        conversationId: "conv-1",
+        botId: "bot-1",
+        coversFromSeq: 1,
+        coversToSeq: 1,
+        messages: [],
+        previousSummary: null,
+      },
+    };
+    const { cloud, submitted } = fakeCloud({
+      claim: async () => ({
+        runId: "run-1",
+        executionId: "exec-1",
+        executionGeneration: 1,
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        capability: { token: "cap-1", expiresAt: "" },
+        job: { id: "job-1", botId: "bot-1", inboxItemId: null, placement: {} as never },
+      }),
+      getRunContext: async () => summaryContext,
+      forRun: () => api,
+    });
+
+    await runOnce({
+      cloud,
+      journal: memoryJournal(),
+      adapter: claudeAdapter({
+        stateDir: dir,
+        queryFn: fakeQuery([init, result("{not JSON")]).queryFn,
+      }),
+    });
+
+    expect(calls).toEqual([]);
+    expect(submitted).toEqual([
+      expect.objectContaining({ state: "failed", summary: "claude: invalid maintenance output" }),
+    ]);
+    expect(submitted[0]).not.toHaveProperty("reply");
+  });
+
+  it("fails an invalid consolidation plan before any memory command", async () => {
+    const dir = await stateDir();
+    const { api, calls } = fakeRunApi();
+    const consolidationContext = {
+      ...context,
+      jobKind: "consolidate" as const,
+      consolidation: {
+        scopeKind: "bot" as const,
+        scopeId: "bot-1",
+        memories: [],
+        summaries: [
+          {
+            id: "summary-1",
+            conversationId: "conv-1",
+            botId: "bot-1",
+            coversFromSeq: 1,
+            coversToSeq: 1,
+            text: "Deploy Friday.",
+            pinnedFacts: [],
+            revision: 1,
+            createdByRunId: "run-old",
+            createdAt: "",
+          },
+        ],
+      },
+    };
+    const { cloud, submitted } = fakeCloud({
+      claim: async () => ({
+        runId: "run-1",
+        executionId: "exec-1",
+        executionGeneration: 1,
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        capability: { token: "cap-1", expiresAt: "" },
+        job: { id: "job-1", botId: "bot-1", inboxItemId: null, placement: {} as never },
+      }),
+      getRunContext: async () => consolidationContext,
+      forRun: () => api,
+    });
+    const output = {
+      writes: [
+        {
+          content: "Deploy Friday.",
+          mergedFrom: [{ id: "unread-memory", revision: 1 }],
+          sourceConversationIds: ["conv-1"],
+        },
+      ],
+      deletes: [],
+    };
+
+    const { calls: queryCalls, queryFn } = fakeQuery([
+      init,
+      {
+        ...result(
+          JSON.stringify({
+            writes: [
+              {
+                content: "Valid textual fallback.",
+                mergedFrom: [],
+                sourceConversationIds: ["conv-1"],
+              },
+            ],
+            deletes: [],
+          }),
+        ),
+        structured_output: output,
+      } as SDKMessage,
+    ]);
+    await runOnce({
+      cloud,
+      journal: memoryJournal(),
+      adapter: claudeAdapter({ stateDir: dir, queryFn }),
+    });
+
+    expect(calls).toEqual([]);
+    expect(queryCalls[0]?.options).toMatchObject({
+      tools: [],
+      allowedTools: [],
+      disallowedTools: ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
+      mcpServers: {},
+    });
+    expect(submitted).toEqual([
+      expect.objectContaining({ state: "failed", summary: "claude: invalid maintenance output" }),
+    ]);
+    expect(submitted[0]).not.toHaveProperty("reply");
+  });
+
+  it("puts the latest conversation summary before recent messages in a normal prompt", () => {
+    const prompt = userPrompt({
+      ...context,
+      summary: {
+        id: "summary-1",
+        conversationId: "conv-1",
+        botId: "bot-1",
+        coversFromSeq: 1,
+        coversToSeq: 5,
+        text: "The deploy is Friday.",
+        pinnedFacts: [{ kind: "decision", text: "Friday deploy.", sourceMessageIds: ["msg-1"] }],
+        revision: 1,
+        createdByRunId: "run-old",
+        createdAt: "",
+      },
+    });
+    expect(prompt).toContain("Conversation summary (through sequence 5):\nThe deploy is Friday.");
+    expect(prompt.indexOf("Conversation summary")).toBeLessThan(
+      prompt.indexOf("Recent conversation"),
+    );
   });
 
   it("prompts a thread Run with the parent's messages before the root, then the thread", () => {

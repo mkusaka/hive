@@ -433,7 +433,6 @@ const specs: Record<string, Spec> = {
       ),
   },
   "memory delete": {
-    // A memory's content never changes, so a live one is at revision 1.
     usage: "<memory-id> [--revision <n>]",
     args: 1,
     options: { revision: { type: "string", default: "1" } },
@@ -443,6 +442,36 @@ const specs: Record<string, Spec> = {
         throw invalid("--revision must be a positive integer");
       c.print(await cmd.memoryDelete(c.client(), c.envelope(), c.args[0]!, revision));
     },
+  },
+  "memory consolidate": {
+    usage: "--bot <bot-id> [--channel <channel-id>]",
+    options: { bot: str, channel: str },
+    run: async (c) =>
+      c.print(
+        await cmd.memoryConsolidate(
+          c.client(),
+          c.envelope(),
+          need(c.values, "bot"),
+          c.values.channel as string | undefined,
+        ),
+      ),
+  },
+  "memory promote": {
+    usage: "<memory-id>",
+    args: 1,
+    run: async (c) => c.print(await cmd.memoryPromote(c.client(), c.envelope(), c.args[0]!)),
+  },
+  "conversation summarize": {
+    usage: "<conversation-id>",
+    args: 1,
+    run: async (c) =>
+      c.print(await cmd.conversationSummarize(c.client(), c.envelope(), c.args[0]!)),
+  },
+  "conversation summary": {
+    usage: "<conversation-id>",
+    args: 1,
+    run: async (c) =>
+      c.print(await cmd.getConversationSummary(c.client(), c.workspace(), c.args[0]!)),
   },
   "agent send": {
     usage: "<bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]",

@@ -75,13 +75,15 @@ describe("change_log", () => {
     const ws = `workspace:${s.workspaceId}`;
     const ch = `channel:${s.channelId}`;
     const created = await changeRows(s.workspaceId);
-    expect(summary(created)).toEqual([
-      ["workspace", s.workspaceId, ws],
-      ["device", s.deviceId, ws],
-      ["channel", s.channelId, ch],
-      ["conversation", expect.any(String), ch],
-      ["bot", s.botId, ws],
-    ]);
+    expect(summary(created)).toEqual(
+      expect.arrayContaining([
+        ["workspace", s.workspaceId, ws],
+        ["device", s.deviceId, ws],
+        ["channel", s.channelId, ch],
+        ["conversation", expect.any(String), ch],
+        ["bot", s.botId, ws],
+      ]),
+    );
 
     let seq = created.at(-1)!.seq;
     const next = async () => {

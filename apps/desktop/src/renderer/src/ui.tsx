@@ -93,11 +93,21 @@ export const Icon = ({ name }: { name: keyof typeof icons }) => (
 /** Memories newest first (the Memory view and the Bot panel's Library tab). */
 export const MemoryList = ({ memories }: { memories: Row[] }) => (
   <ul className="list">
-    {memories.map((m) => (
-      <li key={m.id}>
-        <span className="meta">{text(m.createdAt)}</span> {text(m.content)}
-      </li>
-    ))}
+    {memories.map((m) => {
+      const mergedFrom = Array.isArray(m.mergedFromIds) ? m.mergedFromIds.length : 0;
+      return (
+        <li key={m.id}>
+          <span className="meta">{text(m.createdAt)}</span> {text(m.content)}
+          {m.source === "consolidation" && (
+            <>
+              {" "}
+              <Badge state="consolidated" />
+              <span className="meta"> merged from {mergedFrom}</span>
+            </>
+          )}
+        </li>
+      );
+    })}
   </ul>
 );
 

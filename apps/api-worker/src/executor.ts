@@ -14,6 +14,7 @@ import {
   type RunLeaseRenew,
   type RunResultAccepted,
   type RunContext,
+  type ContextSnapshot,
   type RunObservation,
   type RunResultSubmit,
   type ToolPolicy,
@@ -25,6 +26,8 @@ import {
   confirmRunStopped,
   finishRun,
   insertMessage,
+  createJob,
+  guard,
   renewLease,
   setJobsWaitingDevice,
 } from "@hive/db";
@@ -34,7 +37,17 @@ import type { Principal } from "./auth/principal.ts";
 import { capabilityExpiresAt, insertCapability } from "./auth/run.ts";
 import { HttpError } from "./errors.ts";
 import { constraintReasons, type PlacementDevice, refusal, shouldWait } from "./placement.ts";
-import { indexLater, relatedQuery, searchDocuments } from "./search.ts";
+import {
+  botSearchAccess,
+  conversationReadableSql,
+  indexLater,
+  memoryProvenance,
+  memoryReadableSql,
+  relatedQuery,
+  searchDocuments,
+  sourcesReadableSql,
+  type SearchAccess,
+} from "./search.ts";
 
 export const ExecutorEnvelope = commandEnvelope(ExecutorCommand);
 type Envelope = v.InferOutput<typeof ExecutorEnvelope>;
@@ -95,16 +108,19 @@ type JobRow = {
   state: string;
   revision: number;
   trigger_key: string;
+  job_kind: "normal" | "summarize" | "consolidate";
   placement: string;
   task_id: string | null;
   created_at: string;
 };
-const jobColumns = "id, bot_id, state, revision, trigger_key, placement, task_id, created_at";
+const jobColumns =
+  "id, bot_id, state, revision, trigger_key, job_kind, placement, task_id, created_at";
 
 const toQueuedJob = (row: JobRow): QueuedJob => ({
   id: row.id,
   botId: row.bot_id,
   revision: row.revision,
+  jobKind: row.job_kind,
   inboxItemId: row.trigger_key.startsWith("inbox:") ? row.trigger_key.slice(6) : null,
   placement: JSON.parse(row.placement) as PlacementPolicy,
   createdAt: row.created_at,
@@ -129,6 +145,32 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
     .first<JobRow>();
   if (!row) throw new HttpError("NOT_FOUND", "job not found");
   const job = toQueuedJob(row);
+  const { results: jobSources } = await db
+    .prepare(
+      `SELECT DISTINCT c.id, c.channel_id FROM jobs j
+      LEFT JOIN inbox_items i ON i.workspace_id = j.workspace_id AND ('inbox:' || i.id = j.trigger_key OR i.batch_id = j.inbox_batch_id)
+      LEFT JOIN delegations d ON d.workspace_id = j.workspace_id AND d.id = j.delegation_id
+      JOIN conversations c ON c.workspace_id = j.workspace_id AND c.id = COALESCE(j.conversation_id, i.conversation_id, d.conversation_id)
+      WHERE j.workspace_id = ? AND j.id = ?`,
+    )
+    .bind(workspaceId, job.id)
+    .all<{ id: string; channel_id: string }>();
+  const sourceIds = jobSources.map((c) => c.id);
+  const claimAccess: SearchAccess =
+    row.job_kind === "normal"
+      ? {
+          workspaceId,
+          botId: row.bot_id,
+          jobId: job.id,
+          allBotsAndTasks: false,
+          scopes: [
+            `workspace:${workspaceId}`,
+            `bot:${row.bot_id}`,
+            ...jobSources.map((c) => `channel:${c.channel_id}`),
+          ],
+        }
+      : await botSearchAccess(db, workspaceId, row.bot_id);
+  await requireConversationAccess(db, claimAccess, sourceIds);
   // Re-validated here (§9.2 step 3) so a stale list cannot bypass the offer rule. Only a claimable Job: a replay of
   // a claim that went through must reach its receipt even though the device now holds that Run.
   if (row.state === "queued" || row.state === "waiting_device") {
@@ -142,14 +184,19 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
   // The Run capability (§18.2) is committed with the claim. Task writes need a Task Job.
   const secret = newDeviceSecret();
   const tokenHash = await hashSecret(secret);
-  const scopes = [
-    "agent.send",
-    "agent.reply",
-    "task.read",
-    "memory.write",
-    "search.read",
-    ...(row.task_id ? ["task.write"] : []),
-  ];
+  const scopes =
+    row.job_kind === "summarize"
+      ? ["summary.write"]
+      : row.job_kind === "consolidate"
+        ? ["memory.write", "memory.delete"]
+        : [
+            "agent.send",
+            "agent.reply",
+            "task.read",
+            "memory.write",
+            "search.read",
+            ...(row.task_id ? ["task.write"] : []),
+          ];
   // Job state is not checked here: the claim CAS decides, and a replay must reach the stored receipt.
   const result = await claimJob(db, {
     workspaceId,
@@ -160,6 +207,14 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
     resourceKeys: command.resourceKeys ?? [`bot:${job.botId}`],
     operationId: env.idempotencyKey,
     statements: (claim) => [
+      db
+        .prepare(
+          `INSERT INTO atomic_guards (operation_id, ok) VALUES (?, ${sourcesReadableSql(claimAccess, sourceIds)})`,
+        )
+        .bind(`${claim.runId}:source-access`),
+      db
+        .prepare("DELETE FROM atomic_guards WHERE operation_id = ?")
+        .bind(`${claim.runId}:source-access`),
       insertCapability(db, {
         workspaceId,
         runId: claim.runId,
@@ -386,6 +441,15 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
         ]
       : [];
   // The Run's capability decides where the Bot may reply: only in its trigger item's Conversation (§8.1).
+  const job = await db
+    .prepare(
+      "SELECT j.job_kind FROM jobs j JOIN runs r ON r.workspace_id = j.workspace_id AND r.job_id = j.id WHERE r.id = ? AND r.workspace_id = ?",
+    )
+    .bind(command.runId, workspaceId)
+    .first<{ job_kind: string }>();
+  if (command.reply && job?.job_kind !== "normal") {
+    throw new HttpError("FORBIDDEN", "maintenance jobs cannot post replies");
+  }
   const { reply } = command;
   if (reply && (!item?.channel_id || item.conversation_id !== reply.conversationId)) {
     throw new HttpError("FORBIDDEN", "reply must go to the trigger item's conversation");
@@ -516,6 +580,150 @@ const fencedRun = async (
   return run;
 };
 
+export const latestSummary = async (
+  db: D1Database,
+  workspaceId: string,
+  conversationId: string,
+  botId: string,
+) => {
+  const summary = await db
+    .prepare(
+      `SELECT id, conversation_id AS conversationId, bot_id AS botId, covers_from_seq AS coversFromSeq,
+      covers_to_seq AS coversToSeq, text, pinned_facts AS pinnedFacts, revision,
+      created_by_run_id AS createdByRunId, created_at AS createdAt
+      FROM conversation_summaries WHERE workspace_id = ? AND conversation_id = ? AND (bot_id = ? OR bot_id IS NULL)
+      ORDER BY covers_to_seq DESC, created_at DESC, id DESC LIMIT 1`,
+    )
+    .bind(workspaceId, conversationId, botId)
+    .first<NonNullable<RunContext["summary"]>>();
+  if (summary) summary.pinnedFacts = JSON.parse(summary.pinnedFacts as unknown as string);
+  return summary;
+};
+
+export const activeSummaryJob = (db: D1Database, workspaceId: string, conversationId: string) =>
+  db
+    .prepare(
+      `SELECT id FROM jobs WHERE workspace_id = ? AND conversation_id = ? AND job_kind = 'summarize'
+    AND state IN ('queued', 'waiting_device', 'active', 'waiting_input', 'recovery_required')`,
+    )
+    .bind(workspaceId, conversationId)
+    .first<{ id: string }>();
+
+export const summaryRangeEnd = async (
+  db: D1Database,
+  workspaceId: string,
+  conversationId: string,
+  botId: string,
+) => {
+  const previous = await latestSummary(db, workspaceId, conversationId, botId);
+  const range = await db
+    .prepare(
+      `SELECT MAX(seq) AS seq FROM (SELECT seq FROM messages WHERE workspace_id = ? AND conversation_id = ? AND seq > ?
+      ORDER BY seq LIMIT 100)`,
+    )
+    .bind(workspaceId, conversationId, previous?.coversToSeq ?? 0)
+    .first<{ seq: number | null }>();
+  return range?.seq ?? null;
+};
+
+/** One active Job per conversation, shared by automatic and manual triggers; each retry is a new occurrence. */
+export const enqueueSummary = async (
+  db: D1Database,
+  workspaceId: string,
+  conversationId: string,
+  botId: string,
+) => {
+  const existing = await activeSummaryJob(db, workspaceId, conversationId);
+  if (existing) return existing.id;
+  const end = await summaryRangeEnd(db, workspaceId, conversationId, botId);
+  if (end === null) return null;
+  const id = crypto.randomUUID();
+  try {
+    await db.batch([
+      createJob(db, {
+        id,
+        workspaceId,
+        botId,
+        conversationId,
+        jobKind: "summarize",
+        triggerKey: `summary:${conversationId}:${id}:${end}`,
+      }),
+      appendChange(db, {
+        workspaceId,
+        entityKind: "job",
+        entityId: id,
+        revision: 1,
+        scope: `workspace:${workspaceId}`,
+      }),
+    ]);
+    return id;
+  } catch (error) {
+    const raced = await activeSummaryJob(db, workspaceId, conversationId);
+    if (raced) return raced.id;
+    throw error;
+  }
+};
+
+export const contextAccess = async (
+  db: D1Database,
+  workspaceId: string,
+  botId: string,
+  jobKind: string,
+  channelId: string | null,
+  taskId: string | null,
+  consolidationScopeKind: string | null,
+  jobId: string,
+): Promise<SearchAccess> => {
+  if (jobKind === "consolidate" && consolidationScopeKind !== "channel")
+    return botSearchAccess(db, workspaceId, botId);
+  const { results: replies } = await db
+    .prepare(
+      `SELECT DISTINCT c.channel_id FROM messages q JOIN messages reply
+      ON reply.workspace_id = q.workspace_id AND reply.reply_to_message_id = q.id
+      JOIN conversations c ON c.workspace_id = reply.workspace_id AND c.id = reply.conversation_id
+      WHERE q.workspace_id = ? AND q.job_id = ? AND q.kind = 'request'`,
+    )
+    .bind(workspaceId, jobId)
+    .all<{ channel_id: string }>();
+  return {
+    workspaceId,
+    botId,
+    allBotsAndTasks: false,
+    ...(jobKind === "normal" ? { jobId } : {}),
+    scopes: [
+      `workspace:${workspaceId}`,
+      `bot:${botId}`,
+      ...(channelId ? [`channel:${channelId}`] : []),
+      ...(taskId ? [`task:${taskId}`] : []),
+      ...replies.map((r) => `channel:${r.channel_id}`),
+    ],
+  };
+};
+
+const requireConversationAccess = async (db: D1Database, access: SearchAccess, ids: string[]) => {
+  const row = await db
+    .prepare(`SELECT ${sourcesReadableSql(access, ids)} AS allowed`)
+    .first<{ allowed: number }>();
+  if (!row?.allowed) throw new HttpError("FORBIDDEN", "source access is no longer permitted");
+};
+
+export const requireSnapshotAccess = async (
+  db: D1Database,
+  access: SearchAccess,
+  snapshot: ContextSnapshot,
+) => {
+  const row = await db
+    .prepare(
+      `SELECT ${sourcesReadableSql(
+        access,
+        snapshot.sourceConversationIds,
+        snapshot.memoryRevisions.map((m) => m.id),
+      )} AS allowed`,
+    )
+    .first<{ allowed: number }>();
+  if (!row?.allowed) throw new HttpError("FORBIDDEN", "source access is no longer permitted");
+};
+
 /**
  * Run context (SDK-01): Bot instructions, Task, recent Conversation and the trigger item's body (with its sender
  * Bot for a bot-to-bot message), or for a batch Job every member's body (its Conversation is the batch lane's), plus
@@ -531,7 +739,8 @@ export const getRunContext = async (
   const workspaceId = device.workspaceIds[0]!;
   const row = await db
     .prepare(
-      `SELECT b.id AS bot_id, b.name, b.instructions, b.tool_policy, j.placement, t.id AS task_id, t.key, t.title, t.description,
+      `SELECT b.id AS bot_id, b.name, b.instructions, b.tool_policy, j.placement, j.job_kind, j.trigger_key, j.consolidation_scope_kind, j.consolidation_scope_id,
+              b.config_revision, t.scope_revision, t.revision AS task_revision, w.auth_epoch, t.id AS task_id, t.key, t.title, t.description,
               j.inbox_batch_id, i.id AS item_id, c.id AS conversation_id, c.channel_id, c.kind AS conversation_kind,
               m.id AS message_id, m.kind AS message_kind, fb.id AS from_bot_id, fb.name AS from_bot_name,
               COALESCE(m.body, CASE e.source_kind WHEN 'routine' THEN json_extract(e.data, '$.inputText') END,
@@ -540,12 +749,13 @@ export const getRunContext = async (
               db.name AS delegator_name
          FROM jobs j
          JOIN bots b ON b.workspace_id = j.workspace_id AND b.id = j.bot_id
+         JOIN workspaces w ON w.id = j.workspace_id
          LEFT JOIN tasks t ON t.workspace_id = j.workspace_id AND t.id = j.task_id
          LEFT JOIN inbox_items i ON i.workspace_id = j.workspace_id AND 'inbox:' || i.id = j.trigger_key
          LEFT JOIN delegations d ON d.workspace_id = j.workspace_id AND d.id = j.delegation_id
          LEFT JOIN bots db ON db.workspace_id = d.workspace_id AND d.from_kind = 'bot' AND db.id = d.from_id
          LEFT JOIN conversations c ON c.workspace_id = j.workspace_id
-                                  AND c.id = COALESCE(i.conversation_id, d.conversation_id)
+                                  AND c.id = COALESCE(j.conversation_id, i.conversation_id, d.conversation_id)
          LEFT JOIN events e ON e.workspace_id = i.workspace_id AND e.id = i.input_id
          LEFT JOIN messages m ON m.workspace_id = e.workspace_id AND e.subject_kind = 'message'
                              AND m.id = e.subject_id
@@ -559,6 +769,14 @@ export const getRunContext = async (
       instructions: string;
       tool_policy: string;
       placement: string;
+      job_kind: "normal" | "summarize" | "consolidate";
+      trigger_key: string;
+      consolidation_scope_kind: "bot" | "channel" | null;
+      consolidation_scope_id: string | null;
+      config_revision: number;
+      scope_revision: number | null;
+      task_revision: number | null;
+      auth_epoch: number;
       task_id: string | null;
       key: string | null;
       title: string | null;
@@ -582,11 +800,12 @@ export const getRunContext = async (
       delegator_name: string | null;
     }>();
   if (!row) throw new HttpError("NOT_FOUND", "job not found");
+  const batchMessageIds: string[] = [];
   let batch: RunContext["batch"] = null;
   if (row.inbox_batch_id) {
     const { results } = await db
       .prepare(
-        `SELECT i.id, i.conversation_id, c.channel_id, c.kind, COALESCE(m.body, e.data) AS body
+        `SELECT i.id, m.id AS message_id, i.conversation_id, c.channel_id, c.kind, COALESCE(m.body, e.data) AS body
            FROM inbox_items i
            LEFT JOIN conversations c ON c.workspace_id = i.workspace_id AND c.id = i.conversation_id
            LEFT JOIN events e ON e.workspace_id = i.workspace_id AND e.id = i.input_id
@@ -597,16 +816,48 @@ export const getRunContext = async (
       .bind(workspaceId, row.inbox_batch_id)
       .all<{
         id: string;
+        message_id: string | null;
         conversation_id: string | null;
         channel_id: string | null;
         kind: "channel" | "bot_pair" | "dm" | "thread";
         body: string;
       }>();
+    batchMessageIds.push(...results.flatMap((item) => (item.message_id ? [item.message_id] : [])));
     batch = { id: row.inbox_batch_id, items: results.map(({ id, body }) => ({ id, body })) };
     row.conversation_id = results[0]?.conversation_id ?? null;
     row.channel_id = results[0]?.channel_id ?? null;
     row.conversation_kind = results[0]?.kind ?? null;
   }
+  const access = await contextAccess(
+    db,
+    workspaceId,
+    row.bot_id,
+    row.job_kind,
+    row.channel_id,
+    row.task_id,
+    row.consolidation_scope_kind,
+    input.jobId,
+  );
+  if (row.conversation_id) await requireConversationAccess(db, access, [row.conversation_id]);
+  const stored = await db
+    .prepare("SELECT context_snapshot FROM runs WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, input.runId)
+    .first<{ context_snapshot: string | null }>();
+  if (stored?.context_snapshot) {
+    const snapshot = JSON.parse(stored.context_snapshot) as ContextSnapshot;
+    await requireSnapshotAccess(db, access, snapshot);
+    return snapshot.context;
+  }
+  const summary =
+    row.conversation_id && row.job_kind !== "consolidate"
+      ? await latestSummary(db, workspaceId, row.conversation_id, row.bot_id)
+      : null;
+  const messageIds = [
+    ...batchMessageIds,
+    ...(row.message_id ? [row.message_id] : []),
+    ...(summary?.pinnedFacts.flatMap((f) => f.sourceMessageIds) ?? []),
+  ];
+  let truncated = false;
   let conversation: RunContext["conversation"] = null;
   let parentMessages: RunContext["parentMessages"] = [];
   if (row.conversation_id && row.channel_id) {
@@ -615,24 +866,41 @@ export const getRunContext = async (
       (
         await db
           .prepare(
-            `SELECT actorKind, actorId, body, createdAt FROM (
-               SELECT a.kind AS actorKind, a.id AS actorId, m.body, m.created_at AS createdAt, m.seq
+            `SELECT id, seq, actorKind, actorId, body, createdAt FROM (
+               SELECT m.id, a.kind AS actorKind, a.id AS actorId, m.body, m.created_at AS createdAt, m.seq
                  FROM messages m JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
                 WHERE m.workspace_id = ?1 AND m.conversation_id = ?2
                   AND (?3 IS NULL OR m.seq < (SELECT seq FROM messages WHERE id = ?3))
+                  AND (?4 IS NULL OR m.seq > ?4)
                 ORDER BY m.seq DESC LIMIT 20
              ) ORDER BY seq`,
           )
-          .bind(workspaceId, conversationId, before)
-          .all<RunContext["parentMessages"][number]>()
+          .bind(
+            workspaceId,
+            conversationId,
+            before,
+            conversationId === row.conversation_id ? (summary?.coversToSeq ?? 0) : null,
+          )
+          .all<RunContext["parentMessages"][number] & { id: string; seq: number }>()
       ).results;
-    const results = await lastMessages(row.conversation_id, null);
-    // A thread: its root message first, and the parent's messages before the root as read-only context.
-    const thread =
-      row.conversation_kind === "thread"
+    const results = row.job_kind === "normal" ? await lastMessages(row.conversation_id, null) : [];
+    messageIds.push(...results.map((m) => m.id));
+    const count =
+      row.job_kind === "normal"
         ? await db
             .prepare(
-              `SELECT c.parent_conversation_id, c.root_message_id, a.kind AS actorKind, a.id AS actorId, m.body, m.created_at AS createdAt
+              "SELECT COUNT(*) AS n FROM messages WHERE workspace_id = ? AND conversation_id = ? AND seq > ?",
+            )
+            .bind(workspaceId, row.conversation_id, summary?.coversToSeq ?? 0)
+            .first<{ n: number }>()
+        : null;
+    truncated = (count?.n ?? 0) > results.length;
+    // A thread: its root message first, and the parent's messages before the root as read-only context.
+    const thread =
+      row.job_kind === "normal" && row.conversation_kind === "thread"
+        ? await db
+            .prepare(
+              `SELECT c.parent_conversation_id, c.root_message_id, m.id, m.seq, a.kind AS actorKind, a.id AS actorId, m.body, m.created_at AS createdAt
                  FROM conversations c
                  JOIN messages m ON m.workspace_id = c.workspace_id AND m.id = c.root_message_id
                  JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
@@ -643,13 +911,25 @@ export const getRunContext = async (
               RunContext["parentMessages"][number] & {
                 parent_conversation_id: string;
                 root_message_id: string;
+                id: string;
+                seq: number;
               }
             >()
         : null;
     if (thread) {
       const { parent_conversation_id: parentId, root_message_id: rootId, ...root } = thread;
       results.unshift(root);
-      parentMessages = await lastMessages(parentId, rootId);
+      messageIds.push(rootId);
+      await requireConversationAccess(db, access, [parentId]);
+      const parent = await lastMessages(parentId, rootId);
+      const parentCount = await db
+        .prepare(`SELECT COUNT(*) AS n FROM messages WHERE workspace_id = ? AND conversation_id = ?
+        AND seq < (SELECT seq FROM messages WHERE workspace_id = ? AND id = ?)`)
+        .bind(workspaceId, parentId, workspaceId, rootId)
+        .first<{ n: number }>();
+      if (parentCount!.n > parent.length) truncated = true;
+      messageIds.push(...parent.map((m) => m.id));
+      parentMessages = parent.map(({ id: _id, seq: _seq, ...m }) => m);
     }
     // A DM's counterpart: its user's actor.
     const counterpart =
@@ -668,7 +948,7 @@ export const getRunContext = async (
       channelId: row.channel_id,
       kind: row.conversation_kind ?? "channel",
       counterpart,
-      recent: results,
+      recent: results.map(({ id: _id, seq: _seq, ...m }) => m),
     };
   }
   const { results: replies } = await db
@@ -690,54 +970,47 @@ export const getRunContext = async (
       created_at: string;
     }>();
   // Memory (§13.5): the Bot's, the Task's and the Channel's, newest first, within 8 KiB.
-  const { results: memoryRows } = await db
-    .prepare(
-      `SELECT id, scope_kind AS scopeKind, content, created_at AS createdAt FROM memories
+  const { results: memoryRows } =
+    row.job_kind === "normal"
+      ? await db
+          .prepare(
+            `SELECT id, scope_kind AS scopeKind, content, revision, created_at AS createdAt FROM memories m
         WHERE workspace_id = ? AND deleted_at IS NULL
           AND ((scope_kind = 'bot' AND scope_id = ?) OR (scope_kind = 'task' AND scope_id = ?)
                OR (scope_kind = 'channel' AND scope_id = ?))
-        ORDER BY created_at DESC, id DESC LIMIT 20`,
-    )
-    .bind(workspaceId, row.bot_id, row.task_id, row.channel_id)
-    .all<RunContext["memories"][number]>();
+        AND ${memoryReadableSql(access)} ORDER BY created_at DESC, id DESC LIMIT 21`,
+          )
+          .bind(workspaceId, row.bot_id, row.task_id, row.channel_id)
+          .all<RunContext["memories"][number]>()
+      : { results: [] };
   const memories: RunContext["memories"] = [];
   let bytes = 0;
   for (const memory of memoryRows) {
     bytes += new TextEncoder().encode(memory.content).length;
-    if (bytes > memoryContextBytes) break;
+    if (bytes > memoryContextBytes || memories.length === 20) {
+      truncated = true;
+      break;
+    }
     memories.push(memory);
   }
   // Related history: search hits for the trigger body within what this Run may read, never the trigger itself.
-  const match = row.item_id && row.body ? relatedQuery(row.body) : null;
-  const related = match
-    ? (
-        await searchDocuments(
-          db,
-          {
-            workspaceId,
-            scopes: [
-              `workspace:${workspaceId}`,
-              `bot:${row.bot_id}`,
-              ...(row.channel_id ? [`channel:${row.channel_id}`] : []),
-              ...(row.task_id ? [`task:${row.task_id}`] : []),
-            ],
-            allBotsAndTasks: false,
-          },
-          {
-            q: "",
-            match,
-            kinds: ["message", "task", "memory"],
-            limit: 5,
-            excludeMessageId: row.message_id,
-          },
-        )
-      ).map(({ sourceKind, sourceId, title, snippet }) => ({
-        sourceKind,
-        sourceId,
-        title,
-        snippet,
-      }))
+  const match =
+    row.job_kind === "normal" && row.item_id && row.body ? relatedQuery(row.body) : null;
+  const relatedHits = match
+    ? await searchDocuments(db, access, {
+        q: "",
+        match,
+        kinds: ["message", "task", "memory"],
+        limit: 5,
+        excludeMessageId: row.message_id,
+      })
     : [];
+  const related = relatedHits.map(({ sourceKind, sourceId, title, snippet }) => ({
+    sourceKind,
+    sourceId,
+    title,
+    snippet,
+  }));
   // The native session to resume (§13.3): the latest earlier root Run of this Job that reported one.
   const previous = await db
     .prepare(
@@ -760,7 +1033,80 @@ export const getRunContext = async (
   }
   parentMessages = parentMessages.map((m) => ({ ...m, body: named(m.body) }));
   if (batch) batch.items = batch.items.map((i) => ({ ...i, body: named(i.body) }));
-  return {
+  const selectedMessages =
+    row.job_kind === "summarize" && row.conversation_id
+      ? (
+          await db
+            .prepare(
+              `SELECT m.id, m.seq, a.kind AS actorKind, a.id AS actorId, m.body, m.created_at AS createdAt
+          FROM messages m JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+          WHERE m.workspace_id = ? AND m.conversation_id = ? AND m.seq > ? AND m.seq <= ?
+          ORDER BY m.seq LIMIT 100`,
+            )
+            .bind(
+              workspaceId,
+              row.conversation_id,
+              summary?.coversToSeq ?? 0,
+              Number(row.trigger_key.slice(row.trigger_key.lastIndexOf(":") + 1)),
+            )
+            .all<NonNullable<RunContext["summarization"]>["messages"][number]>()
+        ).results
+      : null;
+  if (selectedMessages && selectedMessages.length === 0) {
+    throw new HttpError("INVALID_INPUT", "conversation has no unsummarized messages");
+  }
+  if (selectedMessages) messageIds.push(...selectedMessages.map((m) => m.id));
+  const consolidation =
+    row.job_kind === "consolidate"
+      ? await (async () => {
+          const scopeKind = row.consolidation_scope_kind ?? "bot";
+          const scopeId = row.consolidation_scope_id ?? row.bot_id;
+          const { results: scopeRows } = await db
+            .prepare(
+              `SELECT id, scope_kind AS scopeKind, scope_id AS scopeId, content, source_kind AS sourceKind,
+             source_id AS sourceId, source, merged_from_ids AS mergedFromIds,
+             source_conversation_ids AS sourceConversationIds, proposed_scope AS proposedScope, revision,
+             supersedes_id AS supersedesId, created_at AS createdAt FROM memories m
+             WHERE workspace_id = ? AND scope_kind = ? AND scope_id = ? AND deleted_at IS NULL
+               AND ${memoryReadableSql(access)} ORDER BY created_at DESC, id DESC LIMIT 201`,
+            )
+            .bind(workspaceId, scopeKind, scopeId)
+            .all<NonNullable<RunContext["consolidation"]>["memories"][number]>();
+          const scopeMemories = scopeRows.slice(0, 200);
+          if (scopeRows.length > 200) truncated = true;
+          await Promise.all(
+            scopeMemories.map(async (memory) => {
+              memory.mergedFromIds = JSON.parse(memory.mergedFromIds as unknown as string);
+              memory.sourceConversationIds = await memoryProvenance(db, workspaceId, memory.id);
+            }),
+          );
+          const { results: summaryRows } = await db
+            .prepare(
+              `SELECT s.id, s.conversation_id AS conversationId, s.bot_id AS botId, s.covers_from_seq AS coversFromSeq,
+             s.covers_to_seq AS coversToSeq, s.text, s.pinned_facts AS pinnedFacts, s.revision,
+             created_by_run_id AS createdByRunId, s.created_at AS createdAt FROM conversation_summaries s
+             JOIN conversations c ON c.workspace_id = s.workspace_id AND c.id = s.conversation_id
+             WHERE s.workspace_id = ? AND (s.bot_id = ? OR s.bot_id IS NULL)
+               AND ${conversationReadableSql(access)}
+               AND (? = 'bot' OR c.channel_id = ?)
+               AND NOT EXISTS (SELECT 1 FROM conversation_summaries newer
+                 WHERE newer.workspace_id = s.workspace_id AND newer.conversation_id = s.conversation_id
+                   AND (newer.bot_id = ? OR newer.bot_id IS NULL)
+                   AND (newer.covers_to_seq > s.covers_to_seq OR (newer.covers_to_seq = s.covers_to_seq
+                     AND (newer.created_at > s.created_at OR (newer.created_at = s.created_at AND newer.id > s.id)))))
+             ORDER BY s.created_at DESC, s.id DESC LIMIT 21`,
+            )
+            .bind(workspaceId, row.bot_id, scopeKind, scopeId, row.bot_id)
+            .all<NonNullable<RunContext["consolidation"]>["summaries"][number]>();
+          const summaries = summaryRows.slice(0, 20);
+          if (summaryRows.length > 20) truncated = true;
+          for (const item of summaries)
+            item.pinnedFacts = JSON.parse(item.pinnedFacts as unknown as string);
+          return { scopeKind, scopeId, memories: scopeMemories, summaries };
+        })()
+      : null;
+  const context: RunContext = {
+    jobKind: row.job_kind,
     previousProviderSessionId: previous?.provider_session_id ?? null,
     bot: {
       id: row.bot_id,
@@ -799,6 +1145,18 @@ export const getRunContext = async (
     })),
     memories,
     related,
+    summary,
+    summarization: selectedMessages
+      ? {
+          conversationId: row.conversation_id!,
+          botId: row.bot_id,
+          coversFromSeq: selectedMessages[0]!.seq,
+          coversToSeq: selectedMessages.at(-1)!.seq,
+          messages: selectedMessages,
+          previousSummary: summary,
+        }
+      : null,
+    consolidation,
     delegation: row.delegation_id
       ? {
           id: row.delegation_id,
@@ -811,6 +1169,82 @@ export const getRunContext = async (
         }
       : null,
   };
+  messageIds.push(...replies.map((r) => r.id));
+  const memoryRevisions = [...memories, ...(consolidation?.memories ?? [])].map(
+    ({ id, revision }) => ({ id, revision }),
+  );
+  const sources = new Set<string>([
+    ...(row.conversation_id ? [row.conversation_id] : []),
+    ...(consolidation?.summaries.map((s) => s.conversationId) ?? []),
+  ]);
+  for (const hit of relatedHits) {
+    if (hit.sourceKind === "memory") {
+      memoryRevisions.push({ id: hit.sourceId, revision: hit.sourceRevision });
+    } else if (hit.sourceKind === "message") messageIds.push(hit.sourceId);
+  }
+  const provenances = await Promise.all(
+    memoryRevisions.map((memory) => memoryProvenance(db, workspaceId, memory.id)),
+  );
+  for (const provenance of provenances) {
+    for (const id of provenance) sources.add(id);
+  }
+  if (messageIds.length) {
+    const { results } = await db
+      .prepare(
+        "SELECT DISTINCT conversation_id FROM messages WHERE workspace_id = ? AND id IN (SELECT value FROM json_each(?))",
+      )
+      .bind(workspaceId, JSON.stringify(messageIds))
+      .all<{ conversation_id: string }>();
+    for (const m of results) sources.add(m.conversation_id);
+  }
+  const snapshot: ContextSnapshot = {
+    context,
+    summaryId: summary?.id ?? null,
+    truncated,
+    selectedMessageIds: selectedMessages?.map((m) => m.id) ?? [],
+    messageIds: [...new Set(messageIds)],
+    selectedRange: context.summarization
+      ? {
+          conversationId: context.summarization.conversationId,
+          coversFromSeq: context.summarization.coversFromSeq,
+          coversToSeq: context.summarization.coversToSeq,
+        }
+      : null,
+    memoryRevisions: [
+      ...new Map(memoryRevisions.map((m) => [`${m.id}:${m.revision}`, m])).values(),
+    ],
+    botRevision: row.config_revision,
+    taskScopeRevision: row.scope_revision,
+    taskRevision: row.task_revision,
+    sourceAclEpoch: row.auth_epoch,
+    sourceConversationIds: [...sources],
+    tokenEstimate: Math.ceil(new TextEncoder().encode(JSON.stringify(context)).length / 4),
+  };
+  await requireSnapshotAccess(db, access, snapshot);
+  const [setGuard, clearGuard] = guard(db);
+  await db.batch([
+    db
+      .prepare(`UPDATE runs SET context_snapshot = COALESCE(context_snapshot, ?)
+      WHERE workspace_id = ? AND id = ? AND execution_generation = ? AND state IN ('starting', 'running', 'waiting_approval')
+      AND ${sourcesReadableSql(
+        access,
+        snapshot.sourceConversationIds,
+        snapshot.memoryRevisions.map((m) => m.id),
+      )}`)
+      .bind(JSON.stringify(snapshot), workspaceId, input.runId, input.executionGeneration),
+    setGuard,
+    clearGuard,
+  ]);
+  const frozen = (await db
+    .prepare("SELECT context_snapshot FROM runs WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, input.runId)
+    .first<{ context_snapshot: string }>())!;
+  const saved = JSON.parse(frozen.context_snapshot) as ContextSnapshot;
+  await requireSnapshotAccess(db, access, saved);
+  if (saved.truncated && saved.context.jobKind === "normal" && row.conversation_id) {
+    await enqueueSummary(db, workspaceId, row.conversation_id, row.bot_id);
+  }
+  return saved.context;
 };
 
 /**

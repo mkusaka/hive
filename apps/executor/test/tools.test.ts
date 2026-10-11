@@ -407,7 +407,15 @@ describe("claudeAdapter with hive tools", () => {
       inboxItemId: "inbox-1",
       context: {
         ...context,
-        memories: [{ id: "m-1", scopeKind: "bot", content: "staging is stage-3", createdAt: "" }],
+        memories: [
+          {
+            id: "m-1",
+            scopeKind: "bot",
+            content: "staging is stage-3",
+            revision: 1,
+            createdAt: "",
+          },
+        ],
         related: [
           {
             sourceKind: "message",

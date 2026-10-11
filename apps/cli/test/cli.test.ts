@@ -781,4 +781,45 @@ describe("search and memory", () => {
     expect(await h.hive("memory", "write", "--scope", "workspace")).toBe(2);
     expect(await h.hive("search")).toBe(2);
   });
+
+  it("memory consolidation, promotion, and conversation summaries", async () => {
+    const h = harness((call) => {
+      if (call.method === "GET") {
+        const url = new URL(call.path, "https://hive.test");
+        if (url.searchParams.get("workspaceId") !== "ws-1") return apiError(400, "INVALID_INPUT");
+      }
+      const command = (call.body as { command?: { type?: string } } | undefined)?.command;
+      if (command?.type === "memory.consolidate") return Response.json({ jobId: "j-1" });
+      if (command?.type === "memory.promote") return Response.json({ memoryId: "m-workspace" });
+      if (command?.type === "conversation.summarize") return Response.json({ jobId: "j-2" });
+      return Response.json({ summary: { id: "s-1", text: "Deploy Friday." } });
+    });
+
+    expect(await h.hive("memory", "consolidate", "--bot", "b-1")).toBe(0);
+    expect(commandOf(h.calls[0]!)).toEqual({ type: "memory.consolidate", botId: "b-1" });
+    expect(h.out[0]).toBe("jobId: j-1");
+
+    expect(await h.hive("memory", "consolidate", "--bot", "b-1", "--channel", "c-1")).toBe(0);
+    expect(commandOf(h.calls[1]!)).toEqual({
+      type: "memory.consolidate",
+      botId: "b-1",
+      channelId: "c-1",
+    });
+
+    expect(await h.hive("memory", "promote", "m-1")).toBe(0);
+    expect(commandOf(h.calls[2]!)).toEqual({ type: "memory.promote", memoryId: "m-1" });
+    expect(h.out[2]).toBe("memoryId: m-workspace");
+
+    expect(await h.hive("conversation", "summarize", "cv-1")).toBe(0);
+    expect(commandOf(h.calls[3]!)).toEqual({
+      type: "conversation.summarize",
+      conversationId: "cv-1",
+    });
+    expect(h.out[3]).toBe("jobId: j-2");
+
+    expect(await h.hive("conversation", "summary", "cv-1")).toBe(0);
+    expect(h.calls[4]!.method).toBe("GET");
+    expect(h.calls[4]!.path).toBe("/v1/conversations/cv-1/summary?workspaceId=ws-1");
+    expect(h.out[4]).toBe('summary: {"id":"s-1","text":"Deploy Friday."}');
+  });
 });

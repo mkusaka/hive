@@ -18,7 +18,7 @@ import { createInterface } from "node:readline";
 import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
 import { runCwd } from "../environments.ts";
-import type { AgentAdapter, RunningAgent } from "../runner.ts";
+import type { AgentAdapter, AgentExit } from "../runner.ts";
 import { approvalGate, outsidePath, truncate } from "../toolPolicy.ts";
 import { hiveTools } from "../tools.ts";
 import { systemPrompt, userPrompt } from "./claude.ts";
@@ -44,7 +44,6 @@ import type {
 } from "./codexProtocol.ts";
 
 export type SpawnFn = (command: string, args: string[], options: SpawnOptions) => ChildProcess;
-type Exit = Awaited<ReturnType<RunningAgent["waitForExit"]>>;
 type Line =
   | { dir: "in" | "out"; msg: RpcMessage }
   | { dir: "local"; event: string; [key: string]: unknown };
@@ -69,7 +68,7 @@ const isolation = (mcpServers: string[]) => ({
 type AgentMessage = Extract<ThreadItem, { type: "agentMessage" }>;
 
 /** The turn's final answer (else its last agent message, else the last one seen in the stream) as reply. */
-const turnExit = (turn: Turn, lastMessage?: string): Exit => {
+const turnExit = (turn: Turn, lastMessage?: string): AgentExit => {
   if (turn.status !== "completed") {
     return {
       code: 1,
@@ -95,7 +94,7 @@ const toolReply = (text: string, success: boolean): DynamicToolCallResponse => (
   success,
 });
 
-const waitingExit = (requestMessageId: string): Exit => ({
+const waitingExit = (requestMessageId: string): AgentExit => ({
   code: 0,
   reason: "waiting",
   summary: truncate(`codex: waiting for the reply to ${requestMessageId}`, kib8),
@@ -165,6 +164,14 @@ export const codexAdapter = ({
     enforceToolApproval: false,
   }),
   start: async (ctx) => {
+    if (ctx.context.jobKind !== "normal") {
+      const exit: AgentExit = {
+        code: 1,
+        reason: `unsupported job kind: ${ctx.context.jobKind}`,
+        summary: "codex: maintenance jobs are unsupported",
+      };
+      return { requestStop: async () => {}, waitForExit: async () => exit };
+    }
     const transcript = join(stateDir, "transcripts", `${ctx.runId}.jsonl`);
     await mkdir(join(stateDir, "transcripts"), { recursive: true });
 
@@ -183,7 +190,7 @@ export const codexAdapter = ({
     const environment = ctx.context.environment;
     const cwd = await runCwd(stateDir, ctx.runId, ctx.context);
     if (!cwd) {
-      const exit: Exit = {
+      const exit: AgentExit = {
         code: 1,
         reason: "environment_missing",
         summary: truncate(
@@ -410,7 +417,7 @@ export const codexAdapter = ({
       clearTimeout(killTimer);
     };
 
-    const run = async (): Promise<Exit> => {
+    const run = async (): Promise<AgentExit> => {
       try {
         await record({
           dir: "local",

@@ -4,6 +4,7 @@
 // the cloud caps the device's active root Runs at the capacity the heartbeat reports.
 /* oxlint-disable no-await-in-loop */
 import type { ExecutorHeartbeat, RunContext } from "@hive/contracts";
+import type { ConsolidationPlan, SummaryOutput } from "./maintenance.ts";
 import { CloudError, type CloudClient, type RunApi } from "./cloudClient.ts";
 import type { Uploader } from "./uploader.ts";
 
@@ -44,19 +45,22 @@ export type LaunchContext = ClaimedRun & {
   /** Sends a fenced runtime observation for this Run (§9.2 step 7). */
   observe(kind: string, payload: Record<string, unknown>): Promise<void>;
 };
+export type AgentExit = {
+  code: number | null;
+  reason: string;
+  summary: string;
+  replyText?: string;
+  waitingFor?: { requestMessageId: string };
+  summaryOutput?: SummaryOutput;
+  consolidationPlan?: ConsolidationPlan;
+};
 export type RunningAgent = {
   requestStop(reason: string): Promise<void>;
   /**
    * `replyText` is posted to the trigger Conversation as the Bot's message. `waitingFor`: the agent stopped to wait
    * for the reply to that request (§8.2); the Run is submitted as `waiting`.
    */
-  waitForExit(): Promise<{
-    code: number | null;
-    reason: string;
-    summary: string;
-    replyText?: string;
-    waitingFor?: { requestMessageId: string };
-  }>;
+  waitForExit(): Promise<AgentExit>;
 };
 export type AgentAdapter = { start(input: LaunchContext): Promise<RunningAgent> };
 
@@ -94,6 +98,53 @@ const confirmStopped = (
       return false;
     },
   );
+
+/** Writes a fully validated maintenance result only after its adapter exits successfully. */
+const writeMaintenance = async (ctx: LaunchContext, exit: AgentExit) => {
+  if (ctx.context.jobKind === "normal") return;
+  if (!ctx.run) throw new Error("run capability unavailable for maintenance output");
+  if (ctx.context.jobKind === "summarize") {
+    const output = exit.summaryOutput;
+    const source = ctx.context.summarization;
+    if (!output || !source) throw new Error("missing validated summary output");
+    await ctx.run.command({
+      type: "summary.write",
+      conversationId: source.conversationId,
+      coversFromSeq: source.coversFromSeq,
+      coversToSeq: source.coversToSeq,
+      ...output,
+    });
+    return;
+  }
+  const plan = exit.consolidationPlan;
+  const source = ctx.context.consolidation;
+  if (!plan || !source) throw new Error("missing validated consolidation plan");
+  for (const write of plan.writes) {
+    await ctx.run.command({
+      type: "memory.write",
+      scopeKind: source.scopeKind,
+      scopeId: source.scopeId,
+      content: write.content,
+      source: "consolidation",
+      mergedFrom: write.mergedFrom,
+      sourceConversationIds: write.sourceConversationIds,
+      ...(write.proposedScope ? { proposedScope: write.proposedScope } : {}),
+      ...(write.supersedes
+        ? {
+            supersedesId: write.supersedes.id,
+            expectedSupersedesRevision: write.supersedes.revision,
+          }
+        : {}),
+    });
+  }
+  for (const memory of plan.deletes) {
+    await ctx.run.command({
+      type: "memory.delete",
+      memoryId: memory.id,
+      expectedRevision: memory.revision,
+    });
+  }
+};
 
 /**
  * Runs one claimed (or resumed) Run to its result. Records the launch intent before starting the agent and
@@ -146,12 +197,28 @@ const execute = async (
     return { runId: ctx.runId, jobId: ctx.jobId, state: "left_active" };
   }
 
-  const outcome =
+  let outcome: "failed" | "waiting" | "succeeded" =
     exit.code !== 0 || cancelled ? "failed" : exit.waitingFor ? "waiting" : "succeeded";
+  let error = cancelled ? "cancelled" : exit.reason;
+  if (outcome === "succeeded" && ctx.context.jobKind !== "normal") {
+    try {
+      await writeMaintenance(ctx, exit);
+    } catch (maintenanceError) {
+      outcome = "failed";
+      error =
+        maintenanceError instanceof Error
+          ? `maintenance output: ${maintenanceError.message}`
+          : "maintenance output failed";
+    }
+  }
   const conversation = ctx.context.conversation;
-  // A Bot answers a bot request with its reply tool, so the final text is posted only in a Channel or a DM.
+  // Maintenance Runs only persist their structured result; a Bot reply belongs to a normal conversation Run.
   const reply =
-    outcome === "succeeded" && exit.replyText && conversation && conversation.kind !== "bot_pair"
+    ctx.context.jobKind === "normal" &&
+    outcome === "succeeded" &&
+    exit.replyText &&
+    conversation &&
+    conversation.kind !== "bot_pair"
       ? { reply: { conversationId: conversation.id, text: exit.replyText } }
       : {};
   if (!stale) {
@@ -160,12 +227,12 @@ const execute = async (
         ...fence,
         state: outcome,
         summary: exit.summary,
-        ...(outcome === "failed" ? { error: cancelled ? "cancelled" : exit.reason } : {}),
+        ...(outcome === "failed" ? { error } : {}),
         ...(outcome === "waiting" ? { waitingFor: exit.waitingFor } : {}),
         ...reply,
       });
-    } catch (error) {
-      if (!isStale(error)) throw error;
+    } catch (submitError) {
+      if (!isStale(submitError)) throw submitError;
       stale = true;
     }
   }

@@ -42,6 +42,7 @@ export const workspaces = sqliteTable("workspaces", {
   authEpoch: integer("auth_epoch").notNull().default(1),
   createdAt: createdAt(),
   updatedAt: updatedAt(),
+  timezone: text("timezone").notNull().default("UTC"),
 });
 
 /** current state. Global identity (not workspace-scoped); membership links it to Workspaces. */
@@ -713,6 +714,9 @@ export const routines = sqliteTable(
     conversationId: text("conversation_id"),
     taskId: text("task_id"),
     inputText: text("input_text").notNull(),
+    jobKind: text("job_kind", { enum: ["normal", "summarize", "consolidate"] })
+      .notNull()
+      .default("normal"),
     schedule: text("schedule", { mode: "json" }).notNull(),
     scheduleRevision: integer("schedule_revision").notNull().default(1),
     misfire: text("misfire", { enum: misfirePolicies }).notNull().default("coalesce"),
@@ -788,6 +792,12 @@ export const jobs = sqliteTable(
     state: text("state", { enum: jobStates }).notNull().default("queued"),
     revision: integer("revision").notNull().default(1),
     triggerKey: text("trigger_key").notNull(),
+    jobKind: text("job_kind", { enum: ["normal", "summarize", "consolidate"] })
+      .notNull()
+      .default("normal"),
+    conversationId: text("conversation_id"),
+    consolidationScopeKind: text("consolidation_scope_kind", { enum: ["bot", "channel"] }),
+    consolidationScopeId: text("consolidation_scope_id"),
     placement: text("placement", { mode: "json" }).notNull(),
     inboxBatchId: text("inbox_batch_id"),
     // Explicit Task Jobs (job.start). Added by ALTER TABLE, which can only add a single-column FK: a composite
@@ -808,6 +818,16 @@ export const jobs = sqliteTable(
   (t) => [
     scoped(t),
     unique().on(t.workspaceId, t.triggerKey),
+    uniqueIndex("jobs_active_summary_conversation")
+      .on(t.workspaceId, t.conversationId)
+      .where(
+        sql`${t.jobKind} = 'summarize' AND ${t.state} IN ('queued', 'waiting_device', 'active', 'waiting_input', 'recovery_required')`,
+      ),
+    uniqueIndex("jobs_active_consolidation_scope")
+      .on(t.workspaceId, t.consolidationScopeKind, t.consolidationScopeId)
+      .where(
+        sql`${t.jobKind} = 'consolidate' AND ${t.state} IN ('queued', 'waiting_device', 'active', 'waiting_input', 'recovery_required')`,
+      ),
     index("jobs_correlation").on(t.workspaceId, t.correlationId),
     oneOf("jobs_state", t.state, jobStates),
     foreignKey({ columns: [t.workspaceId, t.botId], foreignColumns: [bots.workspaceId, bots.id] }),
@@ -841,6 +861,7 @@ export const runs = sqliteTable(
     state: text("state", { enum: runStates }).notNull().default("starting"),
     leaseExpiresAt: text("lease_expires_at"),
     continuedFromRunId: text("continued_from_run_id"),
+    contextSnapshot: text("context_snapshot", { mode: "json" }),
     // Submitted by the executor with the terminal state (run.result.submit).
     resultSummary: text("result_summary"),
     resultError: text("result_error"),
@@ -1226,6 +1247,12 @@ const memorySpec = () => ({
   content: text("content").notNull(),
   sourceKind: text("source_kind", { enum: memorySourceKinds }).notNull(),
   sourceId: text("source_id").notNull(),
+  source: text("source", { enum: ["explicit", "consolidation"] })
+    .notNull()
+    .default("explicit"),
+  mergedFromIds: text("merged_from_ids", { mode: "json" }).notNull().default("[]"),
+  sourceConversationIds: text("source_conversation_ids", { mode: "json" }).notNull().default("[]"),
+  proposedScope: text("proposed_scope", { enum: ["workspace"] }),
   createdByActorId: text("created_by_actor_id").notNull(),
   revision: integer("revision").notNull(),
   supersedesId: text("supersedes_id"),
@@ -1269,6 +1296,33 @@ export const memoryRevisions = sqliteTable(
   (t) => [primaryKey({ columns: [t.memoryId, t.revision] })],
 );
 
+/** immutable conversation coverage produced by summarize Runs. */
+export const conversationSummaries = sqliteTable(
+  "conversation_summaries",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    conversationId: text("conversation_id").notNull(),
+    botId: text("bot_id"),
+    coversFromSeq: integer("covers_from_seq").notNull(),
+    coversToSeq: integer("covers_to_seq").notNull(),
+    text: text("text").notNull(),
+    pinnedFacts: text("pinned_facts", { mode: "json" }).notNull(),
+    revision: integer("revision").notNull().default(1),
+    createdByRunId: text("created_by_run_id").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("conversation_summaries_latest").on(
+      t.workspaceId,
+      t.conversationId,
+      t.botId,
+      t.coversToSeq,
+    ),
+    uniqueIndex("conversation_summaries_run").on(t.createdByRunId),
+    check("conversation_summaries_text_size", sql`length(CAST(${t.text} AS BLOB)) <= 8192`),
+  ],
+);
 const searchSourceKinds = ["message", "task", "memory"] as const;
 
 /**

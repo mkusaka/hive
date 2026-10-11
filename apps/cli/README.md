@@ -37,7 +37,11 @@ hive effect resolve <effect-id> (--succeeded <external-id> [--url <url>] | --fai
 hive search <query> [--kinds message,task,memory]   # GET /v1/search; 1-2 characters take the bounded short path
 hive memory write --scope <workspace|channel:<id>|project:<id>|bot:<id>|task:<id>> (--content <text> | --file <path|->)
 hive memory list --scope <...>                         # live memories of the scope, newest first
-hive memory delete <memory-id> [--revision <n>]        # tombstone; a live memory is at revision 1
+hive memory delete <memory-id> [--revision <n>]        # tombstone at the supplied revision (default 1)
+hive memory consolidate --bot <bot-id> [--channel <channel-id>]  # queues a consolidation Job
+hive memory promote <memory-id>                        # copies a proposed Memory to workspace scope
+hive conversation summarize <conversation-id>          # queues a summary Job
+hive conversation summary <conversation-id>            # latest summary and coverage
 hive agent send <bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]
 hive message post (--channel <channel-id> | --conversation <dm-id>) [--thread-of <message-id>] --text <text> [--resolve-names]  # <@bot:ID> wakes that Bot (a DM always wakes its Bot); --thread-of replies in that message's thread (Bots already in it wake too); --resolve-names maps @name
 hive thread list                                      # threads you started or replied in, newest reply first
@@ -110,7 +114,8 @@ a fresh UUID per invocation).
   `--environment <name> --cwd-mode environment` then runs in that checkout on devices that registered the name.
 - **`search`** and **`memory`** follow `apps/api-worker/README.md`, Search and memory. `search` is the one
   one-word command: the dispatcher tries `<group> <action>`, then `<group>`. `memory delete` defaults `--revision` to
-  1 because a memory's content never changes (corrections supersede it); a deleted one is 422 (exit 2).
+  1; pass the current revision after promotion changes proposal metadata. Corrections supersede immutable content;
+  a deleted memory is 422 (exit 2).
 - **`effect resolve`** is manual recovery of an `unknown` effect (`--succeeded` / `--failed`) or a re-send of an
   `unknown` or performed `failed` one (`--retry`); see `apps/api-worker/README.md`, External effects. `--tools` and
   `--effects` each replace their own list on `bot update`; the other is kept.

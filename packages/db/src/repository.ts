@@ -36,7 +36,7 @@ export type ReceiptKey = {
   requestDigest: string;
 };
 
-const readReceipt = async (db: D1Database, key: ReceiptKey) => {
+export const readReceipt = async (db: D1Database, key: ReceiptKey) => {
   const [row] = await drizzle(db)
     .select()
     .from(operationReceipts)
@@ -1073,6 +1073,10 @@ export const createJob = (
     workspaceId: string;
     botId: string;
     triggerKey: string;
+    jobKind?: "normal" | "summarize" | "consolidate";
+    conversationId?: string;
+    consolidationScopeKind?: "bot" | "channel";
+    consolidationScopeId?: string;
     taskId?: string;
     inboxBatchId?: string;
     placement?: unknown;
@@ -1083,9 +1087,9 @@ export const createJob = (
 ) =>
   db
     .prepare(
-      `INSERT INTO jobs (id, workspace_id, bot_id, state, trigger_key, task_id, inbox_batch_id, correlation_id,
-         delegation_id, placement)
-       VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?,
+      `INSERT INTO jobs (id, workspace_id, bot_id, state, trigger_key, job_kind, conversation_id, task_id, inbox_batch_id, correlation_id,
+         delegation_id, consolidation_scope_kind, consolidation_scope_id, placement)
+       VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?,
          COALESCE(?, (SELECT placement_policy FROM bots WHERE workspace_id = ? AND id = ?)))`,
     )
     .bind(
@@ -1093,10 +1097,14 @@ export const createJob = (
       input.workspaceId,
       input.botId,
       input.triggerKey,
+      input.jobKind ?? "normal",
+      input.conversationId ?? null,
       input.taskId ?? null,
       input.inboxBatchId ?? null,
       input.correlationId ?? null,
       input.delegationId ?? null,
+      input.consolidationScopeKind ?? (input.jobKind === "consolidate" ? "bot" : null),
+      input.consolidationScopeId ?? (input.jobKind === "consolidate" ? input.botId : null),
       input.placement === undefined ? null : JSON.stringify(input.placement),
       input.workspaceId,
       input.botId,

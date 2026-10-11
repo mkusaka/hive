@@ -28,6 +28,10 @@ import {
   JobStart,
   MemoryDelete,
   MemoryWrite,
+  ConversationSummarize,
+  MemoryConsolidate,
+  MemoryPromote,
+  SummaryWrite,
   mentionedBotIds,
   MessagePost,
   type MessagePostAccepted,
@@ -40,6 +44,7 @@ import {
   RoutineRun,
   type RoutineSchedule,
   type ToolPolicy,
+  type ContextSnapshot,
   RoutineUpdate,
   RunAgentSend,
   type RunAgentSendAccepted,
@@ -71,6 +76,7 @@ import {
   insertInboxItem,
   insertMessage,
   readiness,
+  readReceipt,
   resumeRunAfterApproval,
   settleEffectApproval,
   withOperationReceipt,
@@ -83,7 +89,22 @@ import { queuePerform, summarize } from "./effects.ts";
 import { HttpError } from "./errors.ts";
 import { eventColumns, type EventRow, type SubscriptionRow, subscriptionMatches } from "./pump.ts";
 import { occurrenceStatements, routineColumns, routineFrom, type RoutineRow } from "./routines.ts";
-import { indexLater } from "./search.ts";
+import {
+  botSearchAccess,
+  conversationReadableSql,
+  indexLater,
+  memoryProvenance,
+  memoryReadableSql,
+  searchAccess,
+  sourcesReadableSql,
+  type SearchAccess,
+} from "./search.ts";
+import {
+  activeSummaryJob,
+  contextAccess,
+  requireSnapshotAccess,
+  summaryRangeEnd,
+} from "./executor.ts";
 
 export const CommandEnvelope = commandEnvelope(
   v.variant("type", [
@@ -127,6 +148,9 @@ export const CommandEnvelope = commandEnvelope(
     ApprovalResolve,
     MemoryWrite,
     MemoryDelete,
+    ConversationSummarize,
+    MemoryConsolidate,
+    MemoryPromote,
     EffectResolve,
     SidebarUpdate,
   ]),
@@ -479,6 +503,16 @@ const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env
   const { workspaceId, command } = env;
   const actorId = crypto.randomUUID();
   const botId = crypto.randomUUID();
+  const timezone =
+    (
+      await db
+        .prepare("SELECT timezone FROM workspaces WHERE id = ?")
+        .bind(workspaceId)
+        .first<{ timezone: string }>()
+    )?.timezone ?? "UTC";
+  const nightlyId = crypto.randomUUID();
+  const nightlySchedule = { kind: "cron" as const, expr: "0 3 * * *", timezone };
+  const nightlyNext = firstFireAt(nightlySchedule, Date.now());
   const run = receipt(
     db,
     user.userId,
@@ -503,9 +537,23 @@ const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env
           command.instructions,
           JSON.stringify(command.toolPolicy),
         ),
+      db
+        .prepare(
+          `INSERT INTO routines (id, workspace_id, bot_id, name, input_text, job_kind, schedule, misfire, next_fire_at)
+           VALUES (?, ?, ?, 'Nightly memory consolidation', '', 'consolidate', ?, 'coalesce', ?)`,
+        )
+        .bind(nightlyId, workspaceId, botId, JSON.stringify(nightlySchedule), nightlyNext),
     ],
     { operationId: env.operationId, status: "accepted", botId },
-    [{ entityKind: "bot", entityId: botId, revision: 1, scope: `workspace:${workspaceId}` }],
+    [
+      { entityKind: "bot", entityId: botId, revision: 1, scope: `workspace:${workspaceId}` },
+      {
+        entityKind: "routine",
+        entityId: nightlyId,
+        revision: 1,
+        scope: `workspace:${workspaceId}`,
+      },
+    ],
   );
   return uniqueName(db, "bots", workspaceId, command.name, run);
 };
@@ -2181,6 +2229,13 @@ const staleRoutine = (revision: number) =>
 const routineUpdate: Handler<v.InferOutput<typeof RoutineUpdate>> = async (db, user, env) => {
   const { workspaceId, command } = env;
   const current = await loadRoutine(db, workspaceId, command.routineId);
+  if (
+    current.job_kind === "consolidate" &&
+    command.inputText !== undefined &&
+    command.inputText !== ""
+  ) {
+    throw new HttpError("INVALID_INPUT", "system consolidation routines have empty inputText");
+  }
   const schedule = command.schedule;
   const nextFireAt = schedule ? firstFireAt(schedule, Date.now()) : current.next_fire_at;
   const [setGuard, clearGuard] = guard(db);
@@ -2418,9 +2473,9 @@ const snapshotMemory = (db: D1Database, memoryId: string) =>
   db
     .prepare(
       `INSERT INTO memory_revisions (memory_id, workspace_id, scope_kind, scope_id, content, source_kind, source_id,
-         created_by_actor_id, revision, supersedes_id, deleted_at)
-       SELECT id, workspace_id, scope_kind, scope_id, content, source_kind, source_id, created_by_actor_id, revision,
-              supersedes_id, deleted_at
+         source, merged_from_ids, source_conversation_ids, proposed_scope, created_by_actor_id, revision, supersedes_id, deleted_at)
+       SELECT id, workspace_id, scope_kind, scope_id, content, source_kind, source_id, source, merged_from_ids,
+              source_conversation_ids, proposed_scope, created_by_actor_id, revision, supersedes_id, deleted_at
          FROM memories WHERE id = ?`,
     )
     .bind(memoryId);
@@ -2450,7 +2505,7 @@ const tombstoneMemory = (
   return [
     db
       .prepare(
-        `UPDATE memories SET deleted_at = ?, revision = revision + 1, updated_at = ?
+        `UPDATE memories AS m SET deleted_at = ?, revision = revision + 1, updated_at = ?
           WHERE workspace_id = ? AND id = ? AND deleted_at IS NULL AND ${input.where}`,
       )
       .bind(now, now, input.workspaceId, input.memoryId, ...params),
@@ -2497,28 +2552,120 @@ const explainMemory = async (
 /** The write itself; the caller has checked that the writer may use the scope. */
 const memoryWrite = async (
   db: D1Database,
-  writer: { receiptActorId: string; actorId: string; sourceKind: "user" | "bot"; sourceId: string },
+  writer: {
+    receiptActorId: string;
+    actorId: string;
+    sourceKind: "user" | "bot";
+    sourceId: string;
+    access: SearchAccess;
+    snapshot?: ContextSnapshot;
+    run?: Run;
+  },
   env: Envelope & { command: MemoryWriteCommand },
 ) => {
   const { workspaceId, command } = env;
-  if (command.supersedesId) {
-    const old = await loadMemory(db, workspaceId, command.supersedesId);
-    if (old.scope_kind !== command.scopeKind || old.scope_id !== command.scopeId) {
-      throw new HttpError("INVALID_INPUT", "supersedesId must be a memory of the same scope");
-    }
+  const consolidation = writer.snapshot?.context.consolidation;
+  if (command.proposedScope && command.scopeKind !== "bot") {
+    throw new HttpError("INVALID_INPUT", "only bot memory may propose workspace promotion");
   }
+  if (writer.run && command.source === "consolidation" && !consolidation) {
+    throw new HttpError("FORBIDDEN", "consolidation source requires a consolidation run");
+  }
+  const references = new Map((command.mergedFrom ?? []).map((m) => [m.id, m.revision]));
+  if (references.size !== (command.mergedFrom?.length ?? 0)) {
+    throw new HttpError("INVALID_INPUT", "mergedFrom contains duplicate memories");
+  }
+  if (command.supersedesId) {
+    if (consolidation && command.expectedSupersedesRevision === undefined) {
+      throw new HttpError("INVALID_INPUT", "expectedSupersedesRevision is required");
+    }
+    const revision = command.expectedSupersedesRevision ?? 1;
+    if (references.has(command.supersedesId) && references.get(command.supersedesId) !== revision) {
+      throw new HttpError("INVALID_INPUT", "supersedes revision must match mergedFrom");
+    }
+    references.set(command.supersedesId, revision);
+  }
+  const sources = new Set(writer.snapshot?.sourceConversationIds ?? []);
+  if (writer.run?.conversationId) sources.add(writer.run.conversationId);
+  if (writer.run && (command.sourceConversationIds ?? []).some((id) => !sources.has(id))) {
+    throw new HttpError("FORBIDDEN", "conversation was not read by this run");
+  }
+  if (!writer.run) for (const id of command.sourceConversationIds ?? []) sources.add(id);
+  const statements: D1PreparedStatement[] = [];
+  const inputs = await Promise.all(
+    [...references].map(async ([id, revision]) => {
+      if (
+        consolidation &&
+        !writer.snapshot?.memoryRevisions.some((m) => m.id === id && m.revision === revision)
+      ) {
+        throw new HttpError("FORBIDDEN", "memory revision was not read by this run");
+      }
+      const old = await loadMemory(db, workspaceId, id);
+      if (old.scope_kind !== command.scopeKind || old.scope_id !== command.scopeId) {
+        throw new HttpError("INVALID_INPUT", "source memory must have the same scope");
+      }
+      if (old.deleted_at !== null || old.revision !== revision) {
+        throw new HttpError(
+          "REVISION_CONFLICT",
+          "a source memory changed",
+          false,
+          "stale_revision",
+        );
+      }
+      const [permitted, provenance] = await Promise.all([
+        db
+          .prepare(
+            `SELECT 1 FROM memories m WHERE workspace_id = ? AND id = ? AND ${memoryReadableSql(writer.access)}`,
+          )
+          .bind(workspaceId, id)
+          .first(),
+        memoryProvenance(db, workspaceId, id),
+      ]);
+      if (!permitted) throw new HttpError("FORBIDDEN", "source memory is not readable");
+      return { id, revision, provenance };
+    }),
+  );
+  for (const { id, revision, provenance } of inputs) {
+    for (const source of provenance) sources.add(source);
+    const [setGuard, clearGuard] = guard(db);
+    statements.push(
+      db
+        .prepare(`UPDATE memories AS m SET updated_at = updated_at
+      WHERE workspace_id = ? AND id = ? AND revision = ? AND deleted_at IS NULL AND ${memoryReadableSql(writer.access)}`)
+        .bind(workspaceId, id, revision),
+      setGuard,
+      clearGuard,
+    );
+  }
+  const sourceIds = [...sources];
+  const allowed = await db
+    .prepare(`SELECT ${sourcesReadableSql(writer.access, sourceIds)} AS allowed`)
+    .first<{ allowed: number }>();
+  if (!allowed?.allowed) throw new HttpError("FORBIDDEN", "source access is not permitted");
+  if (writer.run)
+    statements.unshift(...runMemoryFence(db, writer.run, writer.access, writer.snapshot));
+  const aclGuard = crypto.randomUUID();
+  statements.push(
+    db
+      .prepare(
+        `INSERT INTO atomic_guards (operation_id, ok) VALUES (?, ${sourcesReadableSql(writer.access, sourceIds)})`,
+      )
+      .bind(aclGuard),
+    db.prepare("DELETE FROM atomic_guards WHERE operation_id = ?").bind(aclGuard),
+  );
   const memoryId = crypto.randomUUID();
   const memory = { id: memoryId, scopeKind: command.scopeKind, scopeId: command.scopeId };
-  const run = receipt(
+  const result = receipt(
     db,
     writer.receiptActorId,
     env,
     [
+      ...statements,
       db
         .prepare(
           `INSERT INTO memories (id, workspace_id, scope_kind, scope_id, content, source_kind, source_id,
-             created_by_actor_id, revision, supersedes_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+        source, merged_from_ids, source_conversation_ids, proposed_scope, created_by_actor_id, revision, supersedes_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
         )
         .bind(
           memoryId,
@@ -2528,27 +2675,57 @@ const memoryWrite = async (
           command.content,
           writer.sourceKind,
           writer.sourceId,
+          consolidation ? "consolidation" : (command.source ?? "explicit"),
+          JSON.stringify([...references.keys()]),
+          JSON.stringify(sourceIds),
+          command.proposedScope ?? null,
           writer.actorId,
           command.supersedesId ?? null,
         ),
       snapshotMemory(db, memoryId),
       indexLater(db, workspaceId, "memory", memoryId),
       ...(command.supersedesId
-        ? tombstoneMemory(db, { workspaceId, memoryId: command.supersedesId, where: "1" })
+        ? tombstoneMemory(
+            db,
+            { workspaceId, memoryId: command.supersedesId, where: "revision = ?" },
+            references.get(command.supersedesId),
+          )
         : []),
     ],
     { operationId: env.operationId, status: "accepted", memoryId, revision: 1 },
     [
       memoryChange(workspaceId, memory, "upsert", 1),
-      // The superseded revision is unknown when the batch is built.
       ...(command.supersedesId
-        ? [memoryChange(workspaceId, { ...memory, id: command.supersedesId }, "delete")]
+        ? [
+            memoryChange(
+              workspaceId,
+              { ...memory, id: command.supersedesId },
+              "delete",
+              references.get(command.supersedesId)! + 1,
+            ),
+          ]
         : []),
     ],
   );
-  return command.supersedesId
-    ? explainFailure(run, () => explainMemory(db, workspaceId, command.supersedesId!))
-    : run;
+  return explainFailure(result, async () => {
+    if (writer.run) {
+      const problem = await explainRunNotRunning(db, workspaceId, writer.run);
+      if (problem) return problem;
+    }
+    const problems = await Promise.all(
+      [...references].map(([id, revision]) => explainMemory(db, workspaceId, id, revision)),
+    );
+    const problem = problems.find((value) => value !== null);
+    if (problem) return problem;
+    const current = await db
+      .prepare(
+        `SELECT ${sourcesReadableSql(writer.access, sourceIds, [...references.keys()])} AS allowed`,
+      )
+      .first<{ allowed: number }>();
+    return current?.allowed
+      ? null
+      : new HttpError("FORBIDDEN", "source access is no longer permitted");
+  });
 };
 
 /**
@@ -2597,7 +2774,13 @@ const userMemoryWrite: Handler<MemoryWriteCommand> = async (db, user, env) => {
   const actorId = await userActorId(db, workspaceId, user.userId);
   return memoryWrite(
     db,
-    { receiptActorId: user.userId, actorId, sourceKind: "user", sourceId: user.userId },
+    {
+      receiptActorId: user.userId,
+      actorId,
+      sourceKind: "user",
+      sourceId: user.userId,
+      access: await searchAccess(db, workspaceId, user),
+    },
     env,
   );
 };
@@ -2609,13 +2792,27 @@ const memoryDelete: Handler<v.InferOutput<typeof MemoryDelete>> = async (db, use
     kind: memory.scope_kind,
     id: memory.scope_id,
   });
+  const access = await searchAccess(db, workspaceId, user);
+  if (
+    !(await db
+      .prepare(
+        `SELECT 1 FROM memories m WHERE workspace_id = ? AND id = ? AND ${memoryReadableSql(access)}`,
+      )
+      .bind(workspaceId, command.memoryId)
+      .first())
+  )
+    throw new HttpError("FORBIDDEN", "memory is not readable");
   const run = receipt(
     db,
     user.userId,
     env,
     tombstoneMemory(
       db,
-      { workspaceId, memoryId: command.memoryId, where: "revision = ?" },
+      {
+        workspaceId,
+        memoryId: command.memoryId,
+        where: `revision = ? AND ${memoryReadableSql(access)}`,
+      },
       command.expectedRevision,
     ),
     {
@@ -2766,6 +2963,259 @@ const sidebarUpdate: Handler<v.InferOutput<typeof SidebarUpdate>> = async (db, u
   });
 };
 
+const conversationSummarize: Handler<v.InferOutput<typeof ConversationSummarize>> = async (
+  db,
+  user,
+  env,
+) => {
+  const access = await searchAccess(db, env.workspaceId, user);
+  if (
+    !(await db
+      .prepare(
+        `SELECT 1 FROM conversations c WHERE c.workspace_id = ? AND c.id = ? AND ${conversationReadableSql(access)}`,
+      )
+      .bind(env.workspaceId, env.command.conversationId)
+      .first())
+  )
+    throw new HttpError("NOT_FOUND", "conversation not found");
+  const existing = await activeSummaryJob(db, env.workspaceId, env.command.conversationId);
+  const accepted = (id: string) =>
+    receipt(
+      db,
+      user.userId,
+      env,
+      [],
+      { operationId: env.operationId, status: "accepted", jobId: id },
+      [],
+    );
+  if (existing) return accepted(existing.id);
+  const bot = await db
+    .prepare(
+      `SELECT b.id FROM bots b
+      JOIN conversations c ON c.workspace_id = b.workspace_id AND c.id = ?
+      JOIN conversations p ON p.workspace_id = c.workspace_id AND p.id = COALESCE(c.parent_conversation_id, c.id)
+      WHERE b.workspace_id = ? AND (
+        (p.kind = 'dm' AND p.dm_bot_id = b.id)
+        OR (p.kind = 'bot_pair' AND (p.id LIKE 'botpair:' || b.id || ':%' OR p.id LIKE 'botpair:%:' || b.id))
+        OR (p.kind = 'channel' AND EXISTS (SELECT 1 FROM channel_members cm
+          WHERE cm.workspace_id = p.workspace_id AND cm.channel_id = p.channel_id AND cm.actor_id = b.actor_id)))
+      ORDER BY (SELECT MAX(i.created_at) FROM inbox_items i WHERE i.workspace_id = b.workspace_id
+        AND i.bot_id = b.id AND i.conversation_id = c.id) DESC, b.id LIMIT 1`,
+    )
+    .bind(env.command.conversationId, env.workspaceId)
+    .first<{ id: string }>();
+  const botId = bot?.id ?? null;
+  if (!botId) throw new HttpError("INVALID_INPUT", "conversation has no bot with source access");
+  const end = await summaryRangeEnd(db, env.workspaceId, env.command.conversationId, botId);
+  if (end === null)
+    throw new HttpError("INVALID_INPUT", "conversation has no unsummarized messages");
+  const jobId = crypto.randomUUID();
+  try {
+    return await receipt(
+      db,
+      user.userId,
+      env,
+      [
+        createJob(db, {
+          id: jobId,
+          workspaceId: env.workspaceId,
+          botId,
+          conversationId: env.command.conversationId,
+          triggerKey: `summary:${env.command.conversationId}:${jobId}:${end}`,
+          jobKind: "summarize",
+        }),
+      ],
+      { operationId: env.operationId, status: "accepted", jobId },
+      [{ entityKind: "job", entityId: jobId, revision: 1, scope: `workspace:${env.workspaceId}` }],
+    );
+  } catch (error) {
+    if (error instanceof IdempotencyConflict) throw error;
+    const raced = await activeSummaryJob(db, env.workspaceId, env.command.conversationId);
+    if (raced) return accepted(raced.id);
+    throw error;
+  }
+};
+
+const activeConsolidationJob = (
+  db: D1Database,
+  workspaceId: string,
+  scopeKind: string,
+  scopeId: string,
+) =>
+  db
+    .prepare(
+      `SELECT id FROM jobs WHERE workspace_id = ? AND job_kind = 'consolidate' AND consolidation_scope_kind = ? AND consolidation_scope_id = ?
+    AND state IN ('queued', 'waiting_device', 'active', 'waiting_input', 'recovery_required')`,
+    )
+    .bind(workspaceId, scopeKind, scopeId)
+    .first<{ id: string }>();
+
+const memoryConsolidate: Handler<v.InferOutput<typeof MemoryConsolidate>> = async (
+  db,
+  user,
+  env,
+) => {
+  const bot = await db
+    .prepare("SELECT 1 FROM bots WHERE workspace_id = ? AND id = ?")
+    .bind(env.workspaceId, env.command.botId)
+    .first();
+  if (!bot) throw new HttpError("NOT_FOUND", "bot not found");
+  const scopeKind = env.command.channelId ? "channel" : "bot";
+  const scopeId = env.command.channelId ?? env.command.botId;
+  let conversationId: string | undefined;
+  if (env.command.channelId) {
+    await userMayUseMemoryScope(db, user, env.workspaceId, {
+      kind: "channel",
+      id: env.command.channelId,
+    });
+    const access = await botSearchAccess(db, env.workspaceId, env.command.botId);
+    const conversation = await db
+      .prepare(`SELECT c.id FROM conversations c WHERE c.workspace_id = ? AND c.channel_id = ?
+      AND c.kind != 'thread' AND ${conversationReadableSql(access)}`)
+      .bind(env.workspaceId, env.command.channelId)
+      .first<{ id: string }>();
+    if (!conversation)
+      throw new HttpError("FORBIDDEN", "bot cannot read the consolidation channel");
+    conversationId = conversation.id;
+  }
+  const accepted = (id: string) =>
+    receipt(
+      db,
+      user.userId,
+      env,
+      [],
+      { operationId: env.operationId, status: "accepted", jobId: id },
+      [],
+    );
+  const existing = await activeConsolidationJob(db, env.workspaceId, scopeKind, scopeId);
+  if (existing) return accepted(existing.id);
+  const jobId = crypto.randomUUID();
+  try {
+    return await receipt(
+      db,
+      user.userId,
+      env,
+      [
+        createJob(db, {
+          id: jobId,
+          workspaceId: env.workspaceId,
+          botId: env.command.botId,
+          conversationId,
+          consolidationScopeKind: scopeKind,
+          consolidationScopeId: scopeId,
+          triggerKey: `consolidate:${scopeKind}:${scopeId}:${jobId}`,
+          jobKind: "consolidate",
+        }),
+      ],
+      { operationId: env.operationId, status: "accepted", jobId },
+      [{ entityKind: "job", entityId: jobId, revision: 1, scope: `workspace:${env.workspaceId}` }],
+    );
+  } catch (error) {
+    if (error instanceof IdempotencyConflict) throw error;
+    const raced = await activeConsolidationJob(db, env.workspaceId, scopeKind, scopeId);
+    if (raced) return accepted(raced.id);
+    throw error;
+  }
+};
+
+const memoryPromote: Handler<v.InferOutput<typeof MemoryPromote>> = async (db, user, env) => {
+  const access = await searchAccess(db, env.workspaceId, user);
+  const memory = await db
+    .prepare(
+      `SELECT content, scope_kind, scope_id, source, merged_from_ids, proposed_scope, revision
+      FROM memories WHERE workspace_id = ? AND id = ? AND deleted_at IS NULL`,
+    )
+    .bind(env.workspaceId, env.command.memoryId)
+    .first<{
+      content: string;
+      scope_kind: string;
+      scope_id: string;
+      source: "explicit" | "consolidation";
+      merged_from_ids: string;
+      proposed_scope: string | null;
+      revision: number;
+    }>();
+  if (!memory) throw new HttpError("NOT_FOUND", "memory not found");
+  const readable = await db
+    .prepare(
+      `SELECT 1 FROM memories m WHERE workspace_id = ? AND id = ? AND ${memoryReadableSql(access)}`,
+    )
+    .bind(env.workspaceId, env.command.memoryId)
+    .first();
+  if (!readable) throw new HttpError("FORBIDDEN", "memory source access is not permitted");
+  if (memory.proposed_scope !== "workspace" || memory.scope_kind !== "bot") {
+    throw new HttpError("INVALID_INPUT", "memory is not a bot proposal for workspace");
+  }
+  const sourceConversationIds = await memoryProvenance(db, env.workspaceId, env.command.memoryId);
+  const actorId = await userActorId(db, env.workspaceId, user.userId);
+  const memoryId = crypto.randomUUID();
+  const [setGuard, clearGuard] = guard(db);
+  const promoted = receipt(
+    db,
+    user.userId,
+    env,
+    [
+      db
+        .prepare(`UPDATE memories AS m SET proposed_scope = NULL, revision = revision + 1, updated_at = ?
+      WHERE workspace_id = ? AND id = ? AND revision = ? AND proposed_scope = 'workspace' AND deleted_at IS NULL
+        AND ${memoryReadableSql(access)}`)
+        .bind(new Date().toISOString(), env.workspaceId, env.command.memoryId, memory.revision),
+      setGuard,
+      clearGuard,
+      snapshotMemory(db, env.command.memoryId),
+      indexLater(db, env.workspaceId, "memory", env.command.memoryId),
+      db
+        .prepare(
+          `INSERT INTO memories (id, workspace_id, scope_kind, scope_id, content, source_kind, source_id, source,
+        merged_from_ids, source_conversation_ids, created_by_actor_id, revision)
+        VALUES (?, ?, 'workspace', ?, ?, 'user', ?, ?, ?, ?, ?, 1)`,
+        )
+        .bind(
+          memoryId,
+          env.workspaceId,
+          env.workspaceId,
+          memory.content,
+          user.userId,
+          memory.source,
+          JSON.stringify([
+            ...new Set([env.command.memoryId, ...(JSON.parse(memory.merged_from_ids) as string[])]),
+          ]),
+          JSON.stringify(sourceConversationIds),
+          actorId,
+        ),
+      snapshotMemory(db, memoryId),
+      indexLater(db, env.workspaceId, "memory", memoryId),
+    ],
+    { operationId: env.operationId, status: "accepted", memoryId, revision: 1 },
+    [
+      memoryChange(
+        env.workspaceId,
+        { id: env.command.memoryId, scopeKind: memory.scope_kind, scopeId: memory.scope_id },
+        "upsert",
+        memory.revision + 1,
+      ),
+      memoryChange(
+        env.workspaceId,
+        { id: memoryId, scopeKind: "workspace", scopeId: env.workspaceId },
+        "upsert",
+        1,
+      ),
+    ],
+  );
+  return explainFailure(promoted, async () => {
+    if (
+      !(await db
+        .prepare(
+          `SELECT 1 FROM memories m WHERE workspace_id = ? AND id = ? AND ${memoryReadableSql(access)}`,
+        )
+        .bind(env.workspaceId, env.command.memoryId)
+        .first())
+    )
+      return new HttpError("FORBIDDEN", "memory source access is no longer permitted");
+    return explainMemory(db, env.workspaceId, env.command.memoryId, memory.revision);
+  });
+};
+
 const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>> } = {
   "workspace.create": workspaceCreate,
   "device.register": deviceRegister,
@@ -2807,15 +3257,33 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "approval.resolve": approvalResolve,
   "memory.write": userMemoryWrite,
   "memory.delete": memoryDelete,
+  "conversation.summarize": conversationSummarize,
+  "memory.consolidate": memoryConsolidate,
+  "memory.promote": memoryPromote,
   "effect.resolve": effectResolve,
   "sidebar.update": sidebarUpdate,
 };
 
-export const runCommand = (db: D1Database, principal: Principal, envelope: Envelope) => {
+export const runCommand = async (db: D1Database, principal: Principal, envelope: Envelope) => {
   if (principal.kind !== "user") throw new HttpError("FORBIDDEN", "user principal required");
   const { type } = envelope.command;
   if (type !== "workspace.create" && !principal.workspaceIds.includes(envelope.workspaceId)) {
     throw new HttpError("FORBIDDEN", "not a member of this workspace");
+  }
+  if (
+    type === "conversation.summarize" ||
+    type === "memory.consolidate" ||
+    type === "memory.promote" ||
+    type === "memory.write" ||
+    type === "memory.delete"
+  ) {
+    const replay = await readReceipt(db, {
+      workspaceId: envelope.workspaceId,
+      actorId: principal.userId,
+      idempotencyKey: envelope.idempotencyKey,
+      requestDigest: await digest(envelope.command),
+    });
+    if (replay) return { ...replay, scopes: [] };
   }
   return (handlers[type] as Handler<Command>)(db, principal, envelope);
 };
@@ -3313,30 +3781,286 @@ const runEffectPrepare: RunHandler<EffectPrepareCommand> = async (db, run, env) 
   });
 };
 
-/**
- * A Run writes only to its own Bot, its Task or its Conversation's Channel. Workspace (and Project) scope would carry
- * what the Run read out of its sources' ACL: that promotion goes through policy, not a Run (AT-33).
- */
+const loadRunSnapshot = async (db: D1Database, run: Run) => {
+  const row = await db
+    .prepare(
+      "SELECT context_snapshot FROM runs WHERE workspace_id = ? AND id = ? AND execution_generation = ?",
+    )
+    .bind(run.workspaceId, run.runId, run.executionGeneration)
+    .first<{ context_snapshot: string | null }>();
+  return row?.context_snapshot ? (JSON.parse(row.context_snapshot) as ContextSnapshot) : undefined;
+};
+
+const runMemoryFence = (
+  db: D1Database,
+  run: Run,
+  access: SearchAccess,
+  snapshot?: ContextSnapshot,
+) => {
+  const [setGuard, clearGuard] = guard(db);
+  return [
+    db
+      .prepare(`UPDATE runs SET updated_at = updated_at WHERE workspace_id = ? AND id = ? AND execution_generation = ?
+    AND state IN ('starting', 'running', 'waiting_approval')
+    AND (? IS NULL OR context_snapshot = ?)
+    AND ${sourcesReadableSql(
+      access,
+      snapshot?.sourceConversationIds ?? (run.conversationId ? [run.conversationId] : []),
+      snapshot?.memoryRevisions.map((m) => m.id) ?? [],
+    )}`)
+      .bind(
+        run.workspaceId,
+        run.runId,
+        run.executionGeneration,
+        snapshot ? JSON.stringify(snapshot) : null,
+        snapshot ? JSON.stringify(snapshot) : null,
+      ),
+    setGuard,
+    clearGuard,
+  ];
+};
+
 const runMemoryWrite: RunHandler<MemoryWriteCommand> = async (db, run, env) => {
   requireScope(run, "memory.write");
+  const snapshot = await loadRunSnapshot(db, run);
+  const job = await db
+    .prepare("SELECT job_kind FROM jobs WHERE workspace_id = ? AND id = ?")
+    .bind(run.workspaceId, run.jobId)
+    .first<{ job_kind: string }>();
+  if (job?.job_kind === "consolidate" && !snapshot?.context.consolidation) {
+    throw new HttpError("FORBIDDEN", "consolidation requires its persisted context");
+  }
   const { scopeKind, scopeId } = env.command;
+  const consolidation = snapshot?.context.consolidation;
   const own = { bot: run.botId, task: run.taskId, channel: run.channelId } as Record<
     string,
     string | null
   >;
-  if (!(scopeKind in own) || own[scopeKind] === null || own[scopeKind] !== scopeId) {
+  if (
+    consolidation
+      ? scopeKind !== consolidation.scopeKind || scopeId !== consolidation.scopeId
+      : !(scopeKind in own) || own[scopeKind] === null || own[scopeKind] !== scopeId
+  ) {
     throw new HttpError(
       "FORBIDDEN",
-      "a run may write memory only to its bot, task or channel; wider scopes need promotion",
+      "memory is outside this run's scope",
       false,
       "scope_not_permitted",
     );
   }
+  const access = await contextAccess(
+    db,
+    run.workspaceId,
+    run.botId,
+    job!.job_kind,
+    run.channelId,
+    run.taskId,
+    consolidation?.scopeKind ?? null,
+    run.jobId,
+  );
+  if (snapshot) await requireSnapshotAccess(db, access, snapshot);
   return memoryWrite(
     db,
-    { receiptActorId: run.runId, actorId: run.botActorId, sourceKind: "bot", sourceId: run.runId },
+    {
+      receiptActorId: run.runId,
+      actorId: run.botActorId,
+      sourceKind: "bot",
+      sourceId: run.runId,
+      access,
+      snapshot,
+      run,
+    },
     env as unknown as Envelope & { command: MemoryWriteCommand },
   );
+};
+
+const runSummaryWrite: RunHandler<v.InferOutput<typeof SummaryWrite>> = async (db, run, env) => {
+  requireScope(run, "summary.write");
+  const snapshot = await loadRunSnapshot(db, run);
+  const selected = snapshot?.context.summarization;
+  if (snapshot?.context.jobKind !== "summarize" || !selected) {
+    throw new HttpError("FORBIDDEN", "summary.write requires a persisted summarize context");
+  }
+  const command = env.command;
+  if (
+    command.conversationId !== selected.conversationId ||
+    command.coversFromSeq !== selected.coversFromSeq ||
+    command.coversToSeq !== selected.coversToSeq
+  ) {
+    throw new HttpError("INVALID_INPUT", "summary range does not match its selected context");
+  }
+  const sourceIds = new Set([
+    ...selected.messages.map((m) => m.id),
+    ...(selected.previousSummary?.pinnedFacts.flatMap((f) => f.sourceMessageIds) ?? []),
+  ]);
+  if (
+    command.pinnedFacts.some(
+      (f) => f.sourceMessageIds.length === 0 || f.sourceMessageIds.some((id) => !sourceIds.has(id)),
+    )
+  ) {
+    throw new HttpError(
+      "INVALID_INPUT",
+      "pinned facts must cite selected or previous pinned sources",
+    );
+  }
+  const access = await contextAccess(
+    db,
+    run.workspaceId,
+    run.botId,
+    "summarize",
+    run.channelId,
+    run.taskId,
+    null,
+    run.jobId,
+  );
+  await requireSnapshotAccess(db, access, snapshot);
+  const facts = new Map<
+    string,
+    {
+      kind: (typeof command.pinnedFacts)[number]["kind"];
+      text: string;
+      sourceMessageIds: Set<string>;
+    }
+  >();
+  for (const collection of [selected.previousSummary?.pinnedFacts ?? [], command.pinnedFacts]) {
+    for (const fact of collection) {
+      const key = `${fact.kind}\0${fact.text}`;
+      const existing = facts.get(key);
+      if (existing) {
+        for (const id of fact.sourceMessageIds) existing.sourceMessageIds.add(id);
+      } else {
+        facts.set(key, { ...fact, sourceMessageIds: new Set(fact.sourceMessageIds) });
+      }
+    }
+  }
+  const pinned = Array.from(facts.values(), (fact) => ({
+    ...fact,
+    sourceMessageIds: [...fact.sourceMessageIds],
+  }));
+  const id = crypto.randomUUID();
+  const revision = (selected.previousSummary?.revision ?? 0) + 1;
+  const written = receipt(
+    db,
+    run.runId,
+    env as unknown as Envelope,
+    [
+      ...runMemoryFence(db, run, access, snapshot),
+      db
+        .prepare(`INSERT INTO conversation_summaries (id, workspace_id, conversation_id, bot_id, covers_from_seq, covers_to_seq,
+      text, pinned_facts, revision, created_by_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .bind(
+          id,
+          run.workspaceId,
+          command.conversationId,
+          selected.botId,
+          selected.previousSummary?.coversFromSeq ?? selected.coversFromSeq,
+          selected.coversToSeq,
+          command.text,
+          JSON.stringify(pinned),
+          revision,
+          run.runId,
+        ),
+    ],
+    { operationId: env.operationId, status: "accepted", summaryId: id, revision },
+    [
+      {
+        entityKind: "conversation_summary",
+        entityId: id,
+        revision,
+        scope: `channel:${run.channelId}`,
+      },
+    ],
+  );
+  return explainFailure(written, async () => {
+    const problem = await explainRunNotRunning(db, run.workspaceId, run);
+    if (problem) return problem;
+    await requireSnapshotAccess(db, access, snapshot);
+    if (
+      await db
+        .prepare(
+          "SELECT 1 FROM conversation_summaries WHERE workspace_id = ? AND created_by_run_id = ?",
+        )
+        .bind(run.workspaceId, run.runId)
+        .first()
+    )
+      return new HttpError("REVISION_CONFLICT", "run already wrote its summary");
+    return null;
+  });
+};
+
+const runMemoryDelete: RunHandler<v.InferOutput<typeof MemoryDelete>> = async (db, run, env) => {
+  requireScope(run, "memory.delete");
+  const snapshot = await loadRunSnapshot(db, run);
+  const consolidation = snapshot?.context.consolidation;
+  if (snapshot?.context.jobKind !== "consolidate" || !consolidation) {
+    throw new HttpError("FORBIDDEN", "memory.delete requires a persisted consolidation context");
+  }
+  if (
+    !snapshot.memoryRevisions.some(
+      (m) => m.id === env.command.memoryId && m.revision === env.command.expectedRevision,
+    )
+  ) {
+    throw new HttpError("FORBIDDEN", "memory revision was not read by this run");
+  }
+  const memory = await loadMemory(db, run.workspaceId, env.command.memoryId);
+  if (memory.scope_kind !== consolidation.scopeKind || memory.scope_id !== consolidation.scopeId) {
+    throw new HttpError("FORBIDDEN", "memory is outside this consolidation scope");
+  }
+  const problem = await explainMemory(
+    db,
+    run.workspaceId,
+    env.command.memoryId,
+    env.command.expectedRevision,
+  );
+  if (problem) throw problem;
+  const access = await contextAccess(
+    db,
+    run.workspaceId,
+    run.botId,
+    "consolidate",
+    run.channelId,
+    run.taskId,
+    consolidation.scopeKind,
+    run.jobId,
+  );
+  await requireSnapshotAccess(db, access, snapshot);
+  const deleted = receipt(
+    db,
+    run.runId,
+    env as unknown as Envelope,
+    [
+      ...runMemoryFence(db, run, access, snapshot),
+      ...tombstoneMemory(
+        db,
+        {
+          workspaceId: run.workspaceId,
+          memoryId: env.command.memoryId,
+          where: `revision = ? AND ${memoryReadableSql(access)}`,
+        },
+        env.command.expectedRevision,
+      ),
+    ],
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      memoryId: env.command.memoryId,
+      revision: env.command.expectedRevision + 1,
+    },
+    [
+      memoryChange(
+        run.workspaceId,
+        { id: env.command.memoryId, scopeKind: memory.scope_kind, scopeId: memory.scope_id },
+        "delete",
+        env.command.expectedRevision + 1,
+      ),
+    ],
+  );
+  return explainFailure(deleted, async () => {
+    const stale = await explainRunNotRunning(db, run.workspaceId, run);
+    if (stale) return stale;
+    await requireSnapshotAccess(db, access, snapshot);
+    return explainMemory(db, run.workspaceId, env.command.memoryId, env.command.expectedRevision);
+  });
 };
 
 const taskHandlers = {
@@ -3389,11 +4113,25 @@ const runTaskCommand = async (
   );
 };
 
-export const runRunCommand = (db: D1Database, run: Run, envelope: RunEnvelopeValue) => {
+export const runRunCommand = async (db: D1Database, run: Run, envelope: RunEnvelopeValue) => {
   if (envelope.workspaceId !== run.workspaceId) {
     throw new HttpError("FORBIDDEN", "capability is for another workspace");
   }
   const { command } = envelope;
+  if (
+    command.type === "memory.write" ||
+    command.type === "memory.delete" ||
+    command.type === "summary.write"
+  ) {
+    requireScope(run, command.type);
+    const replay = await readReceipt(db, {
+      workspaceId: run.workspaceId,
+      actorId: run.runId,
+      idempotencyKey: envelope.idempotencyKey,
+      requestDigest: await digest(command),
+    });
+    if (replay) return { ...replay, scopes: [] };
+  }
   if (command.type === "agent.send") {
     return runAgentSend(db, run, envelope as RunEnvelopeValue & { command: typeof command });
   }
@@ -3405,6 +4143,12 @@ export const runRunCommand = (db: D1Database, run: Run, envelope: RunEnvelopeVal
   }
   if (command.type === "memory.write") {
     return runMemoryWrite(db, run, envelope as RunEnvelopeValue & { command: typeof command });
+  }
+  if (command.type === "memory.delete") {
+    return runMemoryDelete(db, run, envelope as RunEnvelopeValue & { command: typeof command });
+  }
+  if (command.type === "summary.write") {
+    return runSummaryWrite(db, run, envelope as RunEnvelopeValue & { command: typeof command });
   }
   if (command.type === "effect.prepare") {
     return runEffectPrepare(db, run, envelope as RunEnvelopeValue & { command: typeof command });

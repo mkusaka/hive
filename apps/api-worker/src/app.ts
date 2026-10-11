@@ -35,6 +35,7 @@ import {
   getRunApproval,
   getSidebar,
   getTask,
+  getConversationSummary,
   listBotConversations,
   listBots,
   listApprovals,
@@ -380,9 +381,15 @@ export const createApp = ({
       await listMemories(c.env.DB, await searchAccess(c.env.DB, workspaceId, user(c)), {
         scopeKind: c.req.query("scopeKind"),
         scopeId: c.req.query("scopeId"),
+        source: c.req.query("source"),
       }),
     );
   });
+  app.get("/v1/conversations/:id/summary", async (c) =>
+    c.json(
+      await getConversationSummary(c.env.DB, workspaceParam(c), c.req.param("id"), user(c).userId),
+    ),
+  );
   app.post("/v1/admin/search/rebuild", async (c) => {
     const workspaceId = workspaceParam(c);
     const owner = await c.env.DB.prepare(

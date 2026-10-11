@@ -36,6 +36,25 @@ describe("channel panel", () => {
     expect(hive.calls.command).toEqual([]);
   });
 
+  it("shows the latest summary range and requests a new summary", async () => {
+    const { panel, user, hive } = await openGeneral();
+    expect(await panel.findByText("The deploy window is Friday at 15:00.")).toBeTruthy();
+    expect(panel.getByText("Covers messages 1–12")).toBeTruthy();
+    const before = hive.calls.get.filter((path) => path.includes("/summary?")).length;
+    await user.click(panel.getByRole("button", { name: "Summarize now" }));
+    expect(hive.sent("conversation.summarize")).toEqual([
+      {
+        workspaceId: "ws-1",
+        command: { type: "conversation.summarize", conversationId: "conv-1" },
+      },
+    ]);
+    await vi.waitFor(() =>
+      expect(hive.calls.get.filter((path) => path.includes("/summary?")).length).toBeGreaterThan(
+        before,
+      ),
+    );
+  });
+
   it("lists members, marks you, and opens a bot member's panel", async () => {
     const { panel, user, container } = await openGeneral();
     await user.click(panel.getByRole("tab", { name: "Members" }));
