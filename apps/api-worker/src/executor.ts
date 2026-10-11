@@ -17,6 +17,7 @@ import {
   type RunObservation,
   type RunResultSubmit,
   type ToolPolicy,
+  renderMentions,
 } from "@hive/contracts";
 import {
   appendChange,
@@ -702,6 +703,17 @@ export const getRunContext = async (
     )
     .bind(workspaceId, input.jobId, input.executionGeneration)
     .first<{ provider_session_id: string }>();
+  // Runs read `@name`, never `<@bot:ID>` tokens (MENTION-01).
+  const { results: botNames } = await db
+    .prepare("SELECT id, name FROM bots WHERE workspace_id = ?")
+    .bind(workspaceId)
+    .all<{ id: string; name: string }>();
+  const names = new Map(botNames.map((b) => [b.id, b.name]));
+  const named = (text: string) => renderMentions(text, names);
+  if (conversation) {
+    conversation.recent = conversation.recent.map((m) => ({ ...m, body: named(m.body) }));
+  }
+  if (batch) batch.items = batch.items.map((i) => ({ ...i, body: named(i.body) }));
   return {
     previousProviderSessionId: previous?.provider_session_id ?? null,
     bot: {
@@ -724,7 +736,7 @@ export const getRunContext = async (
     inboxItem: row.item_id
       ? {
           id: row.item_id,
-          body: row.body ?? "",
+          body: named(row.body ?? ""),
           messageId: row.message_id,
           kind: row.message_kind,
           fromBot: row.from_bot_id ? { id: row.from_bot_id, name: row.from_bot_name ?? "" } : null,
@@ -735,7 +747,7 @@ export const getRunContext = async (
       messageId: r.id,
       requestMessageId: r.reply_to_message_id,
       fromBot: { id: r.bot_id, name: r.name },
-      body: r.body,
+      body: named(r.body),
       createdAt: r.created_at,
     })),
     memories,

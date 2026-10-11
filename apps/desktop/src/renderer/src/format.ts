@@ -3,15 +3,17 @@
 
 export type Inline =
   | { kind: "text" | "bold" | "code"; text: string }
-  | { kind: "link"; text: string; url: string };
+  | { kind: "link"; text: string; url: string }
+  /** A `<@bot:ID>` token (contracts `mentionToken`); the view shows the Bot's name. */
+  | { kind: "mention"; id: string };
 export type Block =
   | { kind: "p"; inlines: Inline[] }
   | { kind: "ul" | "ol"; items: Inline[][] }
   | { kind: "code"; text: string };
 
-const inlinePattern = /\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\)/g;
+const inlinePattern = /\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\)|<@bot:([^>\s]+)>/g;
 
-/** `**bold**`, `` `code` `` and `[text](url)`; everything else is text. */
+/** `**bold**`, `` `code` ``, `[text](url)` and mention tokens; everything else is text. */
 export const parseInline = (text: string): Inline[] => {
   const out: Inline[] = [];
   let last = 0;
@@ -19,6 +21,7 @@ export const parseInline = (text: string): Inline[] => {
     if (m.index > last) out.push({ kind: "text", text: text.slice(last, m.index) });
     if (m[1] !== undefined) out.push({ kind: "bold", text: m[1] });
     else if (m[2] !== undefined) out.push({ kind: "code", text: m[2] });
+    else if (m[5] !== undefined) out.push({ kind: "mention", id: m[5] });
     else out.push({ kind: "link", text: m[3]!, url: m[4]! });
     last = m.index + m[0].length;
   }

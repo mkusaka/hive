@@ -154,6 +154,18 @@ describe("IPC handlers", () => {
     expect(requests).toHaveLength(1);
   });
 
+  it("posts message.post and rejects an unknown field", async () => {
+    const { h, requests } = setup();
+    const post = (command: Record<string, unknown>) =>
+      h.command({ ...envelope, command: { type: "message.post", channelId: "ch-1", ...command } });
+    expect((await post({ text: "<@bot:bot-1> hi", mentions: ["bot-1"] })).ok).toBe(true);
+    expect(await post({ text: "hi", recipientBotId: "bot-1" })).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_ARGS" },
+    });
+    expect(requests).toHaveLength(1);
+  });
+
   it("posts a valid agent.send envelope", async () => {
     const { h, requests } = setup();
     expect((await h.command(envelope)).ok).toBe(true);

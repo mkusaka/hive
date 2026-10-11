@@ -25,6 +25,9 @@ import {
   JobStart,
   MemoryDelete,
   MemoryWrite,
+  mentionedBotIds,
+  MessagePost,
+  type MessagePostAccepted,
   type PlacementPolicy,
   ProjectCreate,
   RoutineCreate,
@@ -89,6 +92,7 @@ export const CommandEnvelope = commandEnvelope(
     BotCreate,
     BotUpdate,
     AgentSend,
+    MessagePost,
     EventEmit,
     ProjectCreate,
     TaskCreate,
@@ -527,9 +531,13 @@ const deviceEnvironmentRegister: Handler<v.InferOutput<typeof DeviceEnvironmentR
   );
 };
 
-/** §11.1: Message, Inbox item, Event, Change Log, Outbox and Receipt in one batch. Routing creates the Job later. */
-const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env) => {
-  const { workspaceId, command } = env;
+/** The caller's actor in the Channel and its Conversation; 403 when not a member. */
+const channelMember = async (
+  db: D1Database,
+  workspaceId: string,
+  channelId: string,
+  userId: string,
+) => {
   const member = await db
     .prepare(
       `SELECT c.id AS conversation_id, a.id AS actor_id
@@ -538,9 +546,73 @@ const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env
          JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
         WHERE c.workspace_id = ? AND c.channel_id = ? AND a.user_id = ?`,
     )
-    .bind(workspaceId, command.channelId, user.userId)
+    .bind(workspaceId, channelId, userId)
     .first<{ conversation_id: string; actor_id: string }>();
   if (!member) throw new HttpError("FORBIDDEN", "not a member of this channel");
+  return member;
+};
+
+/** Event, Inbox item and outbox row delivering a user's channel message to one Bot; routing creates the Job later. */
+const deliveryStatements = (
+  db: D1Database,
+  env: Envelope,
+  input: {
+    userId: string;
+    messageId: string;
+    botId: string;
+    channelId: string;
+    conversationId: string;
+    kind: "request" | "notification";
+    delivery: "wake" | "notify";
+    inboxItemId: string;
+    receivedAt: string;
+  },
+) => {
+  const { workspaceId } = env;
+  const eventId = crypto.randomUUID();
+  return [
+    insertEvent(db, {
+      id: eventId,
+      workspaceId,
+      type: "agent.message.sent",
+      schemaVersion: 1,
+      sourceKind: "cli",
+      actorKind: "user",
+      actorId: input.userId,
+      subjectKind: "message",
+      subjectId: input.messageId,
+      // Read by the event router (pump.ts); the message text stays in `messages`.
+      data: {
+        messageId: input.messageId,
+        kind: input.kind,
+        recipientBotId: input.botId,
+        channelId: input.channelId,
+        conversationId: input.conversationId,
+        inboxItemId: input.inboxItemId,
+        delivery: input.delivery,
+      },
+      correlationId: env.operationId,
+      occurredAt: input.receivedAt,
+      receivedAt: input.receivedAt,
+    }),
+    insertInboxItem(db, {
+      id: input.inboxItemId,
+      workspaceId,
+      inputId: eventId,
+      botId: input.botId,
+      conversationId: input.conversationId,
+      lane: input.channelId,
+      purpose: "agent.send",
+      deliveryMode: input.delivery,
+    }),
+    enqueueOutbox(db, { workspaceId, topic: "event.route", payload: { eventId } }),
+  ];
+};
+
+/** §11.1: Message, Inbox item, Event, Change Log, Outbox and Receipt in one batch. Routing creates the Job later. */
+const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const member = await channelMember(db, workspaceId, command.channelId, user.userId);
   const bot = await db
     .prepare("SELECT 1 FROM bots WHERE workspace_id = ? AND id = ?")
     .bind(workspaceId, command.recipientBotId)
@@ -549,7 +621,6 @@ const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env
 
   const receivedAt = new Date().toISOString();
   const messageId = crypto.randomUUID();
-  const eventId = crypto.randomUUID();
   const inboxItemId = crypto.randomUUID();
   const response: AgentSendAccepted = {
     operationId: env.operationId,
@@ -573,47 +644,98 @@ const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env
         clientMessageId: env.idempotencyKey,
         body: command.message.text,
       }),
-      insertEvent(db, {
-        id: eventId,
-        workspaceId,
-        type: "agent.message.sent",
-        schemaVersion: 1,
-        sourceKind: "cli",
-        actorKind: "user",
-        actorId: user.userId,
-        subjectKind: "message",
-        subjectId: messageId,
-        // Read by the event router (pump.ts); the message text stays in `messages`.
-        data: {
-          messageId,
-          kind: command.message.kind,
-          recipientBotId: command.recipientBotId,
-          channelId: command.channelId,
-          conversationId: member.conversation_id,
-          inboxItemId,
-          delivery: command.delivery,
-        },
-        correlationId: env.operationId,
-        occurredAt: receivedAt,
+      ...deliveryStatements(db, env, {
+        userId: user.userId,
+        messageId,
+        botId: command.recipientBotId,
+        channelId: command.channelId,
+        conversationId: member.conversation_id,
+        kind: command.message.kind,
+        delivery: command.delivery,
+        inboxItemId,
         receivedAt,
       }),
-      insertInboxItem(db, {
-        id: inboxItemId,
-        workspaceId,
-        inputId: eventId,
-        botId: command.recipientBotId,
-        conversationId: member.conversation_id,
-        lane: command.channelId,
-        purpose: "agent.send",
-        deliveryMode: command.delivery,
-      }),
-      enqueueOutbox(db, { workspaceId, topic: "event.route", payload: { eventId } }),
       indexLater(db, workspaceId, "message", messageId),
     ],
     response,
     [
       { entityKind: "message", entityId: messageId, scope: `channel:${command.channelId}` },
       { entityKind: "inbox_item", entityId: inboxItemId, scope: `channel:${command.channelId}` },
+    ],
+  );
+};
+
+/**
+ * One channel message; each Bot mentioned by a `<@bot:ID>` token gets the delivery of a waking `agent.send` request.
+ * A token naming no Bot of the Workspace, or `mentions` differing from the tokens, is 422.
+ */
+const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const member = await channelMember(db, workspaceId, command.channelId, user.userId);
+  const botIds = mentionedBotIds(command.text);
+  if (
+    command.mentions &&
+    (new Set(command.mentions).size !== botIds.length ||
+      !command.mentions.every((id) => botIds.includes(id)))
+  ) {
+    throw new HttpError("INVALID_INPUT", "mentions must equal the <@bot:ID> tokens in text");
+  }
+  if (botIds.length > 0) {
+    const { results } = await db
+      .prepare(
+        `SELECT id FROM bots WHERE workspace_id = ? AND id IN (${botIds.map(() => "?").join(", ")})`,
+      )
+      .bind(workspaceId, ...botIds)
+      .all<{ id: string }>();
+    const unknown = botIds.filter((id) => !results.some((r) => r.id === id));
+    if (unknown.length > 0) {
+      throw new HttpError("INVALID_INPUT", `unknown bot in mention: ${unknown.join(", ")}`);
+    }
+  }
+
+  const receivedAt = new Date().toISOString();
+  const messageId = crypto.randomUUID();
+  const deliveries = botIds.map((botId) => ({ botId, inboxItemId: crypto.randomUUID() }));
+  const response: MessagePostAccepted = {
+    operationId: env.operationId,
+    status: "accepted",
+    messageId,
+    inboxItemIds: deliveries.map((d) => d.inboxItemId),
+    receivedAt,
+  };
+  const scope = `channel:${command.channelId}`;
+  return receipt(
+    db,
+    user.userId,
+    env,
+    [
+      insertMessage(db, {
+        id: messageId,
+        workspaceId,
+        conversationId: member.conversation_id,
+        actorId: member.actor_id,
+        clientMessageId: env.idempotencyKey,
+        body: command.text,
+      }),
+      ...deliveries.flatMap((d) =>
+        deliveryStatements(db, env, {
+          userId: user.userId,
+          messageId,
+          botId: d.botId,
+          channelId: command.channelId,
+          conversationId: member.conversation_id,
+          kind: "request",
+          delivery: "wake",
+          inboxItemId: d.inboxItemId,
+          receivedAt,
+        }),
+      ),
+      indexLater(db, workspaceId, "message", messageId),
+    ],
+    response,
+    [
+      { entityKind: "message", entityId: messageId, scope },
+      ...deliveries.map((d) => ({ entityKind: "inbox_item", entityId: d.inboxItemId, scope })),
     ],
   );
 };
@@ -2407,6 +2529,7 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "bot.update": botUpdate,
   "device.environment.register": deviceEnvironmentRegister,
   "agent.send": agentSend,
+  "message.post": messagePost,
   "event.emit": eventEmit,
   "project.create": projectCreate,
   "task.create": (db, user, env) => taskCreate(db, user.userId, env),

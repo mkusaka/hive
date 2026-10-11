@@ -210,6 +210,28 @@ export const AgentSend = v.strictObject({
   delivery: v.picklist(["wake", "notify"]),
 });
 
+/** A Bot mention inside a message body (Slack's `<@U123>`, namespaced): stored by id, shown by name. */
+export const mentionToken = (botId: string) => `<@bot:${botId}>`;
+const mentionPattern = /<@bot:([^>\s]+)>/g;
+/** The mentioned Bot ids, each once, in order of first appearance. */
+export const mentionedBotIds = (text: string) => [
+  ...new Set(Array.from(text.matchAll(mentionPattern), (m) => m[1]!)),
+];
+/** Tokens → `@name`, `@unknown` for an id `names` does not know. */
+export const renderMentions = (text: string, names: ReadonlyMap<string, string>) =>
+  text.replaceAll(mentionPattern, (_, botId: string) => `@${names.get(botId) ?? "unknown"}`);
+
+/**
+ * A user's Channel message (docs/architecture.md §7.2). Every Bot mentioned with a token gets the Inbox item + Job that
+ * `agent.send` with `request` / `wake` gives; no mention = only posted. `mentions`, when given, must equal the tokens.
+ */
+export const MessagePost = v.strictObject({
+  type: v.literal("message.post"),
+  channelId: ChannelId,
+  text: MessageText,
+  mentions: v.optional(v.array(BotId)),
+});
+
 // --------------------------------------------- Run commands (docs/architecture.md §8, §18.2)
 // `POST /v1/run/commands` with a Run capability: the sender is the Run's Bot, never a declared one.
 
@@ -568,6 +590,14 @@ export type AgentSendAccepted = {
   inboxItemId: string;
   jobId: null;
   routingStatus: "pending";
+  receivedAt: string;
+};
+export type MessagePostAccepted = {
+  operationId: string;
+  status: "accepted";
+  messageId: string;
+  /** One per mentioned Bot, in mention order; empty when nobody was mentioned. */
+  inboxItemIds: string[];
   receivedAt: string;
 };
 export type EventEmitAccepted = {

@@ -10,7 +10,7 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /healthz`                                                  | none                              | Liveness                                                                                                                                                                                             |
 | `GET /v1/me`                                                    | Access assertion (user)           | Returns the user principal (CLI login check)                                                                                                                                                         |
 | `POST /v1/commands`                                             | Access assertion (user)           | Command intake (see below)                                                                                                                                                                           |
-| `GET /v1/operations/:id`                                        | Access assertion (user)           | Receipt of the user's command; for `agent.send` also the inbox item, routing status and Job id                                                                                                       |
+| `GET /v1/operations/:id`                                        | Access assertion (user)           | Receipt of the user's command; for `agent.send` also the inbox item, routing status and Job id; for `message.post` `jobIds` (one per mention, null until routed)                                     |
 | `GET /v1/jobs/:id`                                              | Access assertion (user)           | A Job in one of the user's Workspaces, with `cancelRequestedAt` and its root `runs`                                                                                                                  |
 | `GET /v1/runs/:id`                                              | Access assertion (user)           | A Run of the user's Workspaces: state, generation, device, `persistence`, started / finished, result, `hasProviderSession`, transcript parts and watermark, `git` (or null)                          |
 | `GET /v1/runs/:id/transcript?cursor=`                           | Access assertion (user)           | Normalized, redacted transcript, one confirmed part per page; channel member or owner (404 otherwise); see Transcripts                                                                               |
@@ -84,6 +84,11 @@ token). The Worker falls back to `Authorization: Bearer <token>` for local dev a
   Message, the `agent.message.sent` Event, the Bot's inbox item (lane = channel, purpose `agent.send`,
   `delivery_mode` wake/notify), an `event.route` outbox row and the receipt. The response has `jobId: null` and
   `routingStatus: "pending"`; the Job appears after routing (`GET /v1/operations/:id`).
+- **`message.post`** `{channelId, text, mentions?}` requires channel membership (403). It commits one Message
+  (body kept with its `<@bot:ID>` tokens) and, for each distinct mentioned Bot, the `agent.send` request / `wake`
+  delivery rows above (Event, inbox item, outbox), so routing creates one Job per Bot. The response has
+  `inboxItemIds` (empty: posted, nobody woken). An unknown Bot id in a token, or `mentions` not equal to the tokens,
+  is 422. Run contexts show tokens as `@name`.
 - **`event.emit`** takes `{event: {type, subject?, data, occurredAt?}}` (data ≤ 64 KiB of JSON). Users may emit
   only `custom.*` (403 otherwise). One batch commits the Event, an `event.route` outbox row and the receipt.
 - **`device.register` returns the plaintext token once.** The receipt stores the response with
@@ -323,6 +328,7 @@ member).
   | `channel.update`                           | channel (channel)                                                        |
   | `bot.create`                               | bot (workspace)                                                          |
   | `agent.send`                               | message, inbox item (channel)                                            |
+  | `message.post`                             | message, one inbox item per mention (channel)                            |
   | event route                                | inbox item (channel), Job (workspace) for `wake`                         |
   | `job.claim`                                | Job, Run (workspace)                                                     |
   | `run.result.submit`                        | Run, Job (workspace), trigger inbox item (its channel)                   |

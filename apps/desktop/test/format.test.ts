@@ -68,6 +68,14 @@ describe("parseInline", () => {
     ]);
   });
 
+  it("parses mention tokens", () => {
+    expect(parseInline("<@bot:b-1> hi <@bot:b-2>")).toEqual([
+      { kind: "mention", id: "b-1" },
+      { kind: "text", text: " hi " },
+      { kind: "mention", id: "b-2" },
+    ]);
+  });
+
   it("leaves unmatched markers as text", () => {
     expect(parseInline("2 * 3 ** 4 `x")).toEqual([{ kind: "text", text: "2 * 3 ** 4 `x" }]);
   });

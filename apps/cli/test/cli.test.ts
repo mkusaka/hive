@@ -69,6 +69,38 @@ const accessHeaders = (calls: Call[]) =>
   calls.map((c) => [c.headers.get("Cf-Access-Jwt-Assertion"), c.headers.get("Authorization")]);
 
 describe("argv → request", () => {
+  it("message post resolves @names to Bot mention tokens with --resolve-names", async () => {
+    const h = harness((call) =>
+      Response.json(
+        call.method === "GET"
+          ? {
+              bots: [
+                { id: "b-1", name: "coder" },
+                { id: "b-2", name: "coder-2" },
+              ],
+            }
+          : { ok: true },
+      ),
+    );
+    const post = (...flags: string[]) =>
+      h.hive("message", "post", "--channel", "ch-1", "--text", "@coder-2 @coder hi", ...flags);
+    expect(await post()).toBe(0);
+    expect(await post("--resolve-names")).toBe(0);
+    expect(h.calls.map((c) => [c.method, c.path])).toEqual([
+      ["POST", "/v1/commands"],
+      ["GET", "/v1/bots?workspaceId=ws-1"],
+      ["POST", "/v1/commands"],
+    ]);
+    expect(
+      h.calls
+        .filter((c) => c.method === "POST")
+        .map((c) => (c.body as { command: unknown }).command),
+    ).toEqual([
+      { type: "message.post", channelId: "ch-1", text: "@coder-2 @coder hi" },
+      { type: "message.post", channelId: "ch-1", text: "<@bot:b-2> <@bot:b-1> hi" },
+    ]);
+  });
+
   it("agent send builds the command envelope with the Access assertion", async () => {
     const h = harness();
     const code = await h.hive(

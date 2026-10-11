@@ -1,12 +1,19 @@
-// The Channel conversation: header pill, date-divided Markdown bubbles and the composer (agent.send).
+// The Channel conversation: header pill, date-divided Markdown bubbles and the composer (message.post with @mentions).
 /* oxlint-disable no-await-in-loop */
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { type Inline, parseMarkdown } from "./format.ts";
 import { Avatar, Icon, type Row, text } from "./ui.tsx";
 
-const Inlines = ({ inlines }: { inlines: Inline[] }) =>
+/** Bot id → name, for mention tokens. */
+export type Names = ReadonlyMap<string, string>;
+
+export const Inlines = ({ inlines, names }: { inlines: Inline[]; names: Names }) =>
   inlines.map((part, i) =>
-    part.kind === "bold" ? (
+    part.kind === "mention" ? (
+      <span key={i} className="mention">
+        @{names.get(part.id) ?? "unknown"}
+      </span>
+    ) : part.kind === "bold" ? (
       <strong key={i}>{part.text}</strong>
     ) : part.kind === "code" ? (
       <code key={i}>{part.text}</code>
@@ -21,13 +28,13 @@ const Inlines = ({ inlines }: { inlines: Inline[] }) =>
   );
 
 /** The parsed subset as React elements: no HTML is ever injected. */
-export const Markdown = ({ source }: { source: string }) =>
+export const Markdown = ({ source, names }: { source: string; names: Names }) =>
   parseMarkdown(source).map((block, i) => {
     if (block.kind === "code") return <pre key={i}>{block.text}</pre>;
     if (block.kind === "p")
       return (
         <p key={i}>
-          <Inlines inlines={block.inlines} />
+          <Inlines inlines={block.inlines} names={names} />
         </p>
       );
     const List = block.kind;
@@ -35,7 +42,7 @@ export const Markdown = ({ source }: { source: string }) =>
       <List key={i}>
         {block.items.map((item, j) => (
           <li key={j}>
-            <Inlines inlines={item} />
+            <Inlines inlines={item} names={names} />
           </li>
         ))}
       </List>
@@ -52,29 +59,71 @@ const dayLabel = (at: Date) => {
   return `${at.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })} ${time}`;
 };
 
-type Operation = { operationId: string; jobId: string | null; error?: string };
+/** `jobIds`: null while routing is pending, then one per mentioned Bot (empty: nobody was mentioned). */
+type Operation = { operationId: string; jobIds: string[] | null; error?: string };
+
+const escapeRegExp = (s: string) => s.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** `@name` → `<@bot:ID>` for the names picked from the popup, longest first. */
+const withTokens = (draft: string, picked: Names) =>
+  [...picked]
+    .toSorted(([a], [b]) => b.length - a.length)
+    .reduce(
+      (out, [name, id]) =>
+        out.replaceAll(new RegExp(`@${escapeRegExp(name)}(?![\\w-])`, "g"), `<@bot:${id}>`),
+      draft,
+    );
 
 export const ChannelView = (props: {
   ws: string;
   channel: Row | undefined;
   messages: Row[];
   bots: Row[];
-  botId: string;
-  setBotId: (id: string) => void;
   me: string | null;
   openBot: (id: string) => void;
   toggleChannelPanel: () => void;
 }) => {
   const [draft, setDraft] = useState("");
+  const [caret, setCaret] = useState(0);
+  const [active, setActive] = useState(0);
+  /** The draft at the last Esc: the popup stays closed until the draft changes. */
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  const picked = useRef(new Map<string, string>());
+  const box = useRef<HTMLTextAreaElement>(null);
+  const nextCaret = useRef<number | null>(null);
   const [op, setOp] = useState<Operation | null>(null);
   const end = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    if (nextCaret.current === null) return;
+    box.current?.setSelectionRange(nextCaret.current, nextCaret.current);
+    nextCaret.current = null;
+  });
   // Braces: Chromium's scrollIntoView returns a Promise, which React would call as the cleanup.
   useEffect(() => {
     void end.current?.scrollIntoView({ block: "end" });
   }, [props.messages]);
 
   const botByActor = new Map(props.bots.map((b) => [String(b.actorId), b]));
-  const bot = props.bots.find((b) => b.id === props.botId);
+  const names: Names = new Map(props.bots.map((b) => [b.id, String(b.name)]));
+  // The `@prefix` right before the caret opens the popup.
+  const typed = dismissed === draft ? null : /(?:^|\s)@([^\s@]*)$/.exec(draft.slice(0, caret));
+  const query = typed?.[1]?.toLowerCase() ?? "";
+  const matches = typed
+    ? props.bots.filter((b) => String(b.name).toLowerCase().startsWith(query))
+    : [];
+  const highlighted = Math.min(active, matches.length - 1);
+  const edit = (value: string, position: number) => {
+    setDraft(value);
+    setCaret(position);
+    setActive(0);
+  };
+  const pick = (b: Row) => {
+    const name = String(b.name);
+    const start = caret - query.length - 1;
+    picked.current.set(name, b.id);
+    nextCaret.current = start + name.length + 2;
+    edit(`${draft.slice(0, start)}@${name} ${draft.slice(caret)}`, nextCaret.current);
+  };
   const posted = [
     ...new Map(
       props.messages.flatMap((m) => {
@@ -85,29 +134,31 @@ export const ChannelView = (props: {
   ];
 
   const send = async () => {
-    if (!draft.trim() || !props.botId || !props.channel) return;
+    if (!draft.trim() || !props.channel) return;
     const operationId = crypto.randomUUID();
     const result = await window.hive.api.command({
       operationId,
       idempotencyKey: crypto.randomUUID(),
       workspaceId: props.ws,
       command: {
-        type: "agent.send",
-        recipientBotId: props.botId,
+        type: "message.post",
         channelId: props.channel.id,
-        message: { kind: "request", text: draft },
-        delivery: "wake",
+        text: withTokens(draft, picked.current),
       },
     });
-    if (!result.ok) return setOp({ operationId, jobId: null, error: result.error.message });
-    setDraft("");
-    setOp({ operationId, jobId: null });
-    // Accepted is not started: the Job id appears once routing created it (§22.4). ponytail: polls 2 s for 10 min.
+    if (!result.ok) return setOp({ operationId, jobIds: null, error: result.error.message });
+    edit("", 0);
+    picked.current.clear();
+    const mentioned = (result.value.inboxItemIds as unknown[] | undefined)?.length ?? 0;
+    setOp({ operationId, jobIds: mentioned === 0 ? [] : null });
+    if (mentioned === 0) return;
+    // Accepted is not started: Job ids appear once routing created them (§22.4). ponytail: polls 2 s for 10 min.
     for (let i = 0; i < 300; i++) {
       await new Promise((resolve) => setTimeout(resolve, 2000));
       const res = await window.hive.api.get(`/v1/operations/${encodeURIComponent(operationId)}`);
-      if (res.ok && typeof res.value.jobId === "string")
-        return setOp({ operationId, jobId: res.value.jobId });
+      const jobIds = res.ok ? (res.value.jobIds as (string | null)[] | undefined) : undefined;
+      if (jobIds?.every((id) => typeof id === "string"))
+        return setOp({ operationId, jobIds: jobIds as string[] });
     }
   };
 
@@ -159,13 +210,20 @@ export const ChannelView = (props: {
                   </time>
                 </div>
                 <div className="bubble">
-                  <Markdown source={String(m.body ?? "")} />
+                  <Markdown source={String(m.body ?? "")} names={names} />
                 </div>
                 <div className="hover-actions">
                   <button
                     title="Copy"
                     aria-label="Copy"
-                    onClick={() => void navigator.clipboard.writeText(String(m.body ?? ""))}
+                    onClick={() =>
+                      void navigator.clipboard.writeText(
+                        String(m.body ?? "").replaceAll(
+                          /<@bot:([^>\s]+)>/g,
+                          (_, id: string) => `@${names.get(id) ?? "unknown"}`,
+                        ),
+                      )
+                    }
                   >
                     <Icon name="copy" />
                   </button>
@@ -183,36 +241,53 @@ export const ChannelView = (props: {
           void send();
         }}
       >
-        <select
-          className="bot-pick"
-          value={props.botId}
-          onChange={(e) => props.setBotId(e.target.value)}
-          aria-label="Bot"
-        >
-          {props.bots.map((b) => (
-            <option key={b.id} value={b.id}>
-              {text(b.name)}
-            </option>
-          ))}
-        </select>
+        {matches.length > 0 && (
+          <ul className="mentions" role="listbox" aria-label="Mention a Bot">
+            {matches.map((b, i) => (
+              <li
+                key={b.id}
+                role="option"
+                aria-selected={i === highlighted}
+                // mousedown, not click: the textarea keeps focus and its caret.
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  pick(b);
+                }}
+              >
+                <Avatar id={b.id} name={String(b.name)} size={20} /> {text(b.name)}
+              </li>
+            ))}
+          </ul>
+        )}
         <textarea
+          ref={box}
           rows={1}
           value={draft}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => edit(e.target.value, e.target.selectionStart)}
+          onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+            if (e.nativeEvent.isComposing) return;
+            if (matches.length > 0) {
+              const step = { ArrowDown: 1, ArrowUp: -1 }[e.key];
+              if (step) {
+                e.preventDefault();
+                return setActive((highlighted + step + matches.length) % matches.length);
+              }
+              if (e.key === "Enter" || e.key === "Tab") {
+                e.preventDefault();
+                return pick(matches[highlighted]!);
+              }
+              if (e.key === "Escape") return setDismissed(draft);
+            }
+            if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               void send();
             }
           }}
-          placeholder={`Message ${bot ? text(bot.name) : "a Bot"}`}
+          placeholder={`Message #${text(props.channel.name)}`}
           aria-label="Message"
         />
-        <button
-          className="send"
-          aria-label="Send"
-          disabled={!draft.trim() || !props.botId || !props.channel}
-        >
+        <button className="send" aria-label="Send" disabled={!draft.trim()}>
           <Icon name="send" />
         </button>
       </form>
@@ -221,13 +296,16 @@ export const ChannelView = (props: {
           <>
             operation <span className="mono">{op.operationId}</span>:{" "}
             {op.error ??
-              (op.jobId ? (
-                <>
-                  job <span className="mono">{op.jobId}</span>
-                </>
-              ) : (
-                "accepted, routing pending"
-              ))}
+              (op.jobIds === null
+                ? "accepted, routing pending"
+                : op.jobIds.length === 0
+                  ? "posted, no Bot mentioned"
+                  : op.jobIds.map((id, i) => (
+                      <Fragment key={id}>
+                        {i === 0 ? (op.jobIds!.length > 1 ? "jobs " : "job ") : ", "}
+                        <span className="mono">{id}</span>
+                      </Fragment>
+                    )))}
           </>
         )}
       </p>

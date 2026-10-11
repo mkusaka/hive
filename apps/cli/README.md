@@ -36,6 +36,7 @@ hive memory write --scope <workspace|channel:<id>|project:<id>|bot:<id>|task:<id
 hive memory list --scope <...>                         # live memories of the scope, newest first
 hive memory delete <memory-id> [--revision <n>]        # tombstone; a live memory is at revision 1
 hive agent send <bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]
+hive message post --channel <channel-id> --text <text> [--resolve-names]  # <@bot:ID> wakes that Bot; --resolve-names maps @name
 hive event emit <type> [--data-file <path|->] [--subject <kind:id>]
 hive op get <operation-id>
 hive run get <run-id>                                  # state, persistence (pending|complete), transcript parts, git

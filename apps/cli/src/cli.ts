@@ -466,6 +466,18 @@ const specs: Record<string, Spec> = {
       return exitForJob(job);
     },
   },
+  "message post": {
+    usage: "--channel <channel-id> --text <text with <@bot:ID> tokens> [--resolve-names]",
+    options: { channel: str, text: str, "resolve-names": flag },
+    run: async (c) =>
+      c.print(
+        await cmd.messagePost(c.client(), c.envelope(), {
+          channelId: need(c.values, "channel"),
+          text: need(c.values, "text"),
+          resolveNames: c.values["resolve-names"] === true,
+        }),
+      ),
+  },
   "event emit": {
     usage: "<type> [--data-file <path|->] [--subject <kind:id>]",
     args: 1,

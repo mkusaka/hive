@@ -6,6 +6,7 @@ import type {
   commandEnvelope,
   JobCancel,
   MemoryWrite,
+  MessagePost,
   RoutineCreate,
   RoutineDelete,
   RoutinePause,
@@ -20,13 +21,14 @@ export type ApiResult =
   | { ok: true; value: Record<string, unknown> }
   | { ok: false; error: { code: string; message: string; body?: unknown } };
 
-/** The commands the UI sends today: agent.send, job.cancel, approval.resolve, memory.write, channel.update and the routine commands. */
+/** The commands the UI sends today: message.post, agent.send, job.cancel, approval.resolve, memory.write, channel.update and the routine commands. */
 export type UiCommand = v.InferInput<
   ReturnType<
     typeof commandEnvelope<
       v.VariantSchema<
         "type",
         [
+          typeof MessagePost,
           typeof AgentSend,
           typeof JobCancel,
           typeof ApprovalResolve,

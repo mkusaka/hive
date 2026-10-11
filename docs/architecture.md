@@ -426,6 +426,14 @@ handled. Each Run pins an input snapshot; retries track the same input range.
 - Batches go `open → sealed`; membership is fixed at seal. Events arriving during a Run go to the next batch.
   Completion never marks "all pending items of that Bot" handled.
 
+Implemented as (MENTION-01): a user's channel message addresses Bots with mention tokens `<@bot:BOT_ID>` (Slack's
+`<@U123>` shape, namespaced for a later `<@user:ID>`) stored in the body; names are resolved only for display.
+`message.post {channelId, text, mentions?}` writes one message and, per mentioned Bot, the same `agent.message.sent`
+Event + `wake` Inbox item (purpose `agent.send`) + outbox row as a `request` `agent.send`, so routing gives one Job per
+Bot; no mention = only posted. A token naming no Bot of the Workspace, or `mentions` differing from the tokens, is 422.
+The run context renders tokens as `@<bot name>` (`@unknown` for a missing Bot). `agent.send` stays for the CLI,
+bot-to-bot and integrations.
+
 ### 7.3 Concurrency (§10.3)
 
 - At most one external model turn per ProviderBinding. Background Runs may use separate Bindings per Task / lane.

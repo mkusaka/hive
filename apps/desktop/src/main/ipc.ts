@@ -8,6 +8,7 @@ import {
   commandEnvelope,
   JobCancel,
   MemoryWrite,
+  MessagePost,
   parse,
   RoutineCreate,
   RoutineDelete,
@@ -33,6 +34,7 @@ export const ApiPath = v.pipe(
 
 export const UiCommandSchema = commandEnvelope(
   v.variant("type", [
+    MessagePost,
     AgentSend,
     JobCancel,
     ApprovalResolve,

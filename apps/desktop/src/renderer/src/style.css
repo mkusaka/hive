@@ -398,6 +398,7 @@ button.pill:hover {
   color: var(--text-2);
 }
 .composer {
+  position: relative;
   display: flex;
   align-items: flex-end;
   gap: 8px;
@@ -414,11 +415,35 @@ button.pill:hover {
   background: none;
   field-sizing: content;
 }
-.bot-pick {
-  height: 36px;
-  max-width: 160px;
-  border-radius: 999px;
-  background: var(--bg-secondary);
+.mentions {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  min-width: 220px;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 40%);
+}
+.mentions li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: var(--r-lg);
+  cursor: pointer;
+}
+.mentions li[aria-selected="true"] {
+  background: var(--hover);
+}
+.mention {
+  padding: 0 4px;
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent);
+  font-weight: 500;
 }
 .send {
   display: grid;

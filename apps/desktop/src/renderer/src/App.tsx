@@ -3,8 +3,9 @@
 /* oxlint-disable no-await-in-loop */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HiveConfig } from "../../shared/api.ts";
-import { ChannelView } from "./chat.tsx";
+import { ChannelView, Inlines } from "./chat.tsx";
 import { BotPanel, ChannelPanel } from "./panel.tsx";
+import { parseInline } from "./format.ts";
 import { createSync, type ListKey, type SyncStatus } from "./sync.ts";
 import {
   Avatar,
@@ -236,6 +237,7 @@ export const App = () => {
 
   const panelBotRow = panelBot ? bots.find((b) => b.id === panelBot) : undefined;
   const channel = channels.find((c) => c.id === channelId);
+  const botNames = new Map(bots.map((b) => [b.id, String(b.name)]));
   const channelPanel = panel?.kind === "channel" && view === "channel" ? channel : undefined;
 
   return (
@@ -283,12 +285,19 @@ export const App = () => {
                     <span className="conv-text">
                       <span className="ellipsis"># {text(c.name)}</span>
                       <span className="preview ellipsis">
-                        {last
-                          ? last.body
-                              .split("\n")[0]!
-                              .replace(/^\s*([-*]|\d+[.)])\s+/, "")
-                              .replaceAll(/\*\*|`/g, "")
-                          : "No messages yet"}
+                        {last ? (
+                          <Inlines
+                            inlines={parseInline(
+                              last.body
+                                .split("\n")[0]!
+                                .replace(/^\s*([-*]|\d+[.)])\s+/, "")
+                                .replaceAll(/\*\*|`/g, ""),
+                            )}
+                            names={botNames}
+                          />
+                        ) : (
+                          "No messages yet"
+                        )}
                       </span>
                     </span>
                   )}
@@ -324,8 +333,6 @@ export const App = () => {
             channel={channel}
             messages={messages}
             bots={bots}
-            botId={botId}
-            setBotId={setBotId}
             me={me}
             openBot={openBot}
             toggleChannelPanel={() => setPanel(channelPanel ? null : { kind: "channel" })}

@@ -12,7 +12,10 @@ const inboxItemColumns = `i.id, i.workspace_id AS workspaceId, i.bot_id AS botId
   i.lane, i.purpose, i.delivery_mode AS delivery, i.delivery_id AS deliveryId, i.state,
   i.created_at AS createdAt, i.updated_at AS updatedAt`;
 
-/** The receipt of one of the user's own commands, plus current routing state for an agent.send. */
+/**
+ * The receipt of one of the user's own commands, plus current routing state for an agent.send (`jobId`) or a
+ * message.post (`jobIds`, one per mentioned Bot, null until routed).
+ */
 export const getOperation = async (db: D1Database, userId: string, wsIds: string[], id: string) => {
   if (wsIds.length === 0) throw notFound("operation");
   // ponytail: receipts have no operation_id column, so this scans the user's receipts in their
@@ -26,8 +29,24 @@ export const getOperation = async (db: D1Database, userId: string, wsIds: string
     .bind(...wsIds, userId, id)
     .first<{ status: number; response: string }>();
   if (!receipt) throw notFound("operation");
-  const response = JSON.parse(receipt.response) as { inboxItemId?: string };
+  const response = JSON.parse(receipt.response) as {
+    inboxItemId?: string;
+    inboxItemIds?: string[];
+  };
   const base = { operationId: id, receiptStatus: receipt.status, response };
+  if (response.inboxItemIds) {
+    const ids = response.inboxItemIds;
+    const { results } = await db
+      .prepare(
+        `SELECT i.id, j.id AS jobId FROM inbox_items i
+           LEFT JOIN jobs j ON j.workspace_id = i.workspace_id AND j.trigger_key = 'inbox:' || i.id
+          WHERE i.id IN (${placeholders(ids)})`,
+      )
+      .bind(...ids)
+      .all<{ id: string; jobId: string | null }>();
+    const jobIds = ids.map((itemId) => results.find((r) => r.id === itemId)?.jobId ?? null);
+    return { ...base, routingStatus: jobIds.includes(null) ? "pending" : "routed", jobIds };
+  }
   if (!response.inboxItemId) return base;
   const item = await db
     .prepare(
