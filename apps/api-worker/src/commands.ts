@@ -29,6 +29,7 @@ import {
   MemoryDelete,
   MemoryWrite,
   mentionedBotIds,
+  mentionedUserIds,
   MessagePost,
   type MessagePostAccepted,
   type PlacementPolicy,
@@ -84,6 +85,7 @@ import { HttpError } from "./errors.ts";
 import { eventColumns, type EventRow, type SubscriptionRow, subscriptionMatches } from "./pump.ts";
 import { occurrenceStatements, routineColumns, routineFrom, type RoutineRow } from "./routines.ts";
 import { indexLater } from "./search.ts";
+import { mentionedUserRecipients } from "./push.ts";
 
 export const CommandEnvelope = commandEnvelope(
   v.variant("type", [
@@ -794,12 +796,28 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
         dm_bot_id: null,
       };
   const botIds = mentionedBotIds(command.text);
+  const userIds = mentionedUserIds(command.text);
   if (
     command.mentions &&
     (new Set(command.mentions).size !== botIds.length ||
       !command.mentions.every((id) => botIds.includes(id)))
   ) {
     throw new HttpError("INVALID_INPUT", "mentions must equal the <@bot:ID> tokens in text");
+  }
+  if (parent.dm_bot_id) {
+    if (userIds.some((id) => id !== user.userId)) {
+      throw new HttpError("INVALID_INPUT", "a DM can only mention its own user");
+    }
+  } else {
+    const mentionedUsers = await mentionedUserRecipients(
+      db,
+      workspaceId,
+      parent.channel_id,
+      userIds,
+    );
+    if (mentionedUsers.length !== userIds.length) {
+      throw new HttpError("INVALID_INPUT", "unknown or unavailable user in mention");
+    }
   }
   // The root must be a message of the addressed conversation itself (a reply lives in its thread, so no nesting).
   const root = command.threadOf

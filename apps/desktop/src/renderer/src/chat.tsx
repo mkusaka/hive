@@ -8,7 +8,7 @@ import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import type { SuggestionProps } from "@tiptap/suggestion";
 import { Fragment, useEffect, useRef, useState } from "react";
-import { type Inline, parseMarkdown, toMarkdown } from "./format.ts";
+import { type Inline, parseMarkdown, toMarkdown } from "@hive/ui-text";
 import { Avatar, Icon, type Row, text } from "./ui.tsx";
 
 /** Bot id → name, for mention tokens. */

@@ -7,7 +7,7 @@
   ],
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit -p packages/contracts && tsc --noEmit -p packages/db && tsc --noEmit -p apps/api-worker && tsc --noEmit -p apps/integration-worker && tsc --noEmit -p apps/executor && tsc --noEmit -p apps/cli && bun run --cwd apps/desktop typecheck",
+    "typecheck": "tsc --noEmit -p packages/contracts && tsc --noEmit -p packages/db && tsc --noEmit -p packages/access && tsc --noEmit -p packages/sync && tsc --noEmit -p packages/ui-text && tsc --noEmit -p apps/api-worker && tsc --noEmit -p apps/integration-worker && tsc --noEmit -p apps/executor && tsc --noEmit -p apps/cli && bun run --cwd apps/desktop typecheck && bun run --cwd apps/mobile typecheck",
     "lint": "oxlint . --deny-warnings",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",

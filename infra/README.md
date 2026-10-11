@@ -79,3 +79,37 @@ pointing at an R2 bucket.
    bunx wrangler secret put SLACK_SIGNING_SECRET
    bunx wrangler deploy
    ```
+
+## Android App Links and FCM (MOBILE-01)
+
+Build `apps/mobile` with `HIVE_API_URL=https://<api_hostname>` to configure the Android HTTPS callback intent filter.
+Allow the exact `https://<api_hostname>/mobile/callback` redirect for Managed OAuth DCR; loopback-only redirect
+permissions do not cover Android. This tenant configuration and real-device PKCE/refresh remain G-03, not executed.
+
+Set Worker vars `MOBILE_APP_PACKAGE=com.hive.mobile` and `MOBILE_APP_SHA256` (colon-delimited SHA-256 certificate
+fingerprints, comma-separated for multiple release/debug certificates). `GET /.well-known/assetlinks.json` publishes
+the Android association; `GET /mobile/callback` is a no-store page with an explicit HTTPS Android intent handoff.
+Android's association fetch is unauthenticated: configure a path-specific Access application/bypass for
+`/.well-known/assetlinks.json` (and the callback page if needed), without bypassing any `/v1/*` API route.
+The current Terraform hostname application does not configure these path exceptions automatically.
+`MOBILE_DEV_SCHEME=true` enables a custom `hive://callback` handoff only on a dev Worker; the matching mobile build
+flag is `HIVE_MOBILE_DEV_SCHEME=1`. Do not enable these in production.
+
+For FCM, enable the Firebase Cloud Messaging HTTP v1 API, provision a service account allowed to send messages in
+the Firebase project, and put its JSON in a Worker secret without printing it:
+
+```sh
+bun run --cwd apps/api-worker wrangler secret put FCM_SERVICE_ACCOUNT_JSON < /path/to/service-account.json
+```
+
+Before mobile prebuild, set `HIVE_GOOGLE_SERVICES_FILE` to the Firebase Android configuration for `com.hive.mobile`;
+never commit credential files. The Worker exchanges a signed service-account assertion for an OAuth token and sends
+directly to FCM HTTP v1, not through the Expo push gateway. If the secret is absent, push is disabled and HTTP/sync/
+approvals still work.
+
+Apply migration `0029_mobile_push_tokens.sql` before deploying. `POST /v1/devices/mobile` registers `{instanceId, token}`
+for the authenticated user; DELETE unregisters their instance. A native token has only one owner and changes account
+atomically on re-registration. Approval requests and authorized user mentions/DM replies carry only `{kind, id}` in
+FCM data plus generic visible notification text; there are no excerpts or approval credentials. Target lookups and
+approval answers are authorized against current state. Real FCM delivery requires Firebase credentials and has not
+been verified by the local emulator check.

@@ -7,7 +7,7 @@ import type { HiveConfig } from "../../shared/api.ts";
 import { ChannelView, ThreadPanel } from "./chat.tsx";
 import { BotPanel, ChannelPanel, type ChannelTab } from "./panel.tsx";
 import { Sidebar, togglePin, type View } from "./sidebar.tsx";
-import { createSync, type ListKey, type SyncStatus } from "./sync.ts";
+import { createSync, type ListKey, type SyncStatus } from "@hive/sync";
 import { Badge, failure, get, inWorkspace, MemoryList, type Row, text } from "./ui.tsx";
 import { Welcome } from "./welcome.tsx";
 

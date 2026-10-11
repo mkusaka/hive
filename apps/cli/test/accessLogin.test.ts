@@ -1,8 +1,9 @@
 // Managed OAuth against a fake Access: discovery, registration and the token endpoint are stubbed `fetch`
 // responses; the loopback callback is a real local server. No real network.
+import { prepareLogin, type OAuthToken } from "@hive/access";
 import * as oauth from "oauth4webapi";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { accessTokens, login, type OAuthToken } from "../src/accessLogin.ts";
+import { accessTokens, login } from "../src/accessLogin.ts";
 
 const API = "https://hive.test";
 const ISSUER = "https://team.cloudflareaccess.com";
@@ -10,7 +11,10 @@ const ISSUER = "https://team.cloudflareaccess.com";
 afterEach(() => void vi.unstubAllGlobals());
 
 /** `refreshError(refreshToken)`: the OAuth error for that refresh grant, if any; it may also act as the other client. */
-const fakeAccess = (refreshError?: string | ((refreshToken: string) => string | undefined)) => {
+const fakeAccess = (
+  refreshError?: string | ((refreshToken: string) => string | undefined),
+  omitRefreshedToken = false,
+) => {
   const tokenRequests: URLSearchParams[] = [];
   let authorizationUrl: URL | undefined;
   const realFetch = globalThis.fetch;
@@ -61,12 +65,18 @@ const fakeAccess = (refreshError?: string | ((refreshToken: string) => string | 
           ? refreshError(params.get("refresh_token") ?? "")
           : refreshError;
       if (grant === "refresh_token" && error) return Response.json({ error }, { status: 400 });
-      return Response.json({
+      const response = {
         access_token: grant === "refresh_token" ? "refreshed" : "initial",
-        refresh_token: grant === "refresh_token" ? "rt-2" : "rt-1",
         token_type: "Bearer",
         expires_in: 900,
-      });
+      };
+      if (grant !== "refresh_token" || !omitRefreshedToken) {
+        return Response.json({
+          ...response,
+          refresh_token: grant === "refresh_token" ? "rt-2" : "rt-1",
+        });
+      }
+      return Response.json(response);
     }
     return realFetch(input, init);
   });
@@ -123,6 +133,14 @@ describe("Access managed OAuth", () => {
     );
   });
 
+  it("rejects a callback whose state differs from the authorization request", async () => {
+    const access = fakeAccess();
+    const prepared = await prepareLogin(API, "hive://callback");
+
+    await expect(prepared.complete("hive://callback?code=code-1&state=wrong")).rejects.toThrow();
+    expect(access.tokenRequests).toEqual([]);
+  });
+
   it("reuses a fresh token and refreshes one within 30 s of expiry without a browser", async () => {
     const access = fakeAccess();
     expect(await tokens(grant(Date.now() + 600_000)).get()).toBe("stored");
@@ -133,6 +151,14 @@ describe("Access managed OAuth", () => {
     expect(access.tokenRequests.map((p) => p.get("refresh_token"))).toEqual(["rt-0"]);
     expect(t.saved).toMatchObject([{ accessToken: "refreshed", refreshToken: "rt-2" }]);
     expect(access.authorizationUrl()).toBeUndefined();
+  });
+
+  it("retains the prior refresh token when Access does not rotate it", async () => {
+    fakeAccess(undefined, true);
+    const t = tokens(grant(0));
+
+    expect(await t.get()).toBe("refreshed");
+    expect(t.saved).toMatchObject([{ refreshToken: "rt-0" }]);
   });
 
   it("logs in again only on invalid_grant, and only with a browser", async () => {

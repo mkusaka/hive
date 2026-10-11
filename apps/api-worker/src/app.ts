@@ -1,6 +1,7 @@
 import {
   ExecutorHeartbeat,
   maxTranscriptPartBytes,
+  mentionedUserIds,
   parse,
   RunObservation,
   type RunPrincipal,
@@ -11,8 +12,9 @@ import {
 import { type Context, Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { JWTVerifyGetKey } from "jose";
+import * as v from "valibot";
 import { authenticateUser, remoteJwks } from "./auth/access.ts";
-import { authenticateDevice, hiveToken } from "./auth/device.ts";
+import { authenticateDevice, hasDeviceBearerToken, hiveToken } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
 import { authenticateRun } from "./auth/run.ts";
 import { CommandEnvelope, RunEnvelope, runCommand, runRunCommand } from "./commands.ts";
@@ -59,6 +61,15 @@ import {
   type Realtime,
 } from "./realtime.ts";
 import { listMemories, rebuildSearch, search, searchAccess } from "./search.ts";
+import {
+  approvalRecipients,
+  dmReplyRecipient,
+  mentionedUserRecipients,
+  registerMobilePushToken,
+  sendMobilePush,
+  unregisterMobilePushToken,
+} from "./push.ts";
+import { mobileLinks } from "./mobileLinks.ts";
 import { listChanges, permittedScopes } from "./sync.ts";
 import {
   completeUpload,
@@ -83,11 +94,21 @@ export type Bindings = {
   GITHUB_APP_ID?: string;
   GITHUB_APP_PRIVATE_KEY?: string;
   GITHUB_INSTALLATION_ID?: string;
+  /** Firebase service-account JSON for FCM HTTP v1. Unset disables mobile push delivery. */
+  FCM_SERVICE_ACCOUNT_JSON?: string;
 };
 export type AppEnv = {
   Bindings: Bindings;
   Variables: { requestId: string; operationId?: string; principal: Principal };
 };
+
+const MobileRegistration = v.strictObject({
+  instanceId: v.pipe(v.string(), v.minLength(1), v.maxLength(256)),
+  token: v.pipe(v.string(), v.minLength(1), v.maxLength(4096)),
+});
+const MobileUnregistration = v.strictObject({
+  instanceId: v.pipe(v.string(), v.minLength(1), v.maxLength(256)),
+});
 
 const user = (c: { get: (key: "principal") => Principal }) => {
   const principal = c.get("principal");
@@ -138,10 +159,11 @@ const limitParam = (c: Context<AppEnv>, fallback: number, max: number) => {
 /** Realtime hint after the response; losing it is fine (§12.2). */
 const hint = (c: Context<AppEnv>, n: Notification) => c.executionCtx.waitUntil(notify(c.env, n));
 
-/** `jwks` is injectable so tests can sign Access assertions with a local key. */
+/** `jwks` and `fetchImpl` are injectable so tests can sign Access assertions and observe FCM requests. */
 export const createApp = ({
   jwks = remoteJwks,
-}: { jwks?: (env: Bindings) => JWTVerifyGetKey } = {}) => {
+  fetchImpl = fetch,
+}: { jwks?: (env: Bindings) => JWTVerifyGetKey; fetchImpl?: typeof fetch } = {}) => {
   const app = new Hono<AppEnv>();
 
   app.use(async (c, next) => {
@@ -153,17 +175,17 @@ export const createApp = ({
   app.notFound((c) => toErrorResponse(new HttpError("NOT_FOUND", "route not found"), c));
 
   app.get("/healthz", (c) => c.json({ ok: true }));
+  app.route("/", mobileLinks);
 
-  // Executor routes take device tokens (uploads also a Run capability) and `/v1/run/` routes a Run capability; every other /v1 route takes a user's
-  // Access assertion, except `/v1/realtime`, which takes a device token when one is presented (hiveToken). A Bearer
-  // next to an Access assertion is the user's OAuth token that Access already resolved, not a device token.
+  // Executor routes take device tokens (uploads also a Run capability) and `/v1/run/` routes a Run capability; every
+  // other /v1 route takes a user's Access assertion. Realtime only treats X-Hive-Token or a device-shaped Bearer as a
+  // device credential, so a local Access JWT in Authorization can upgrade a user socket.
   app.use("/v1/*", async (c, next) => {
     const token = hiveToken(c.req.raw);
     const deviceAuth =
       c.req.path.startsWith("/v1/executor/") ||
       (c.req.path === "/v1/realtime" &&
-        (c.req.header("X-Hive-Token") !== undefined ||
-          (token !== undefined && c.req.header("Cf-Access-Jwt-Assertion") === undefined)));
+        (c.req.header("X-Hive-Token") !== undefined || hasDeviceBearerToken(c.req.raw)));
     const capability =
       c.req.path.startsWith("/v1/run/") ||
       (c.req.path.startsWith("/v1/executor/uploads/") && token?.startsWith("cap.") === true);
@@ -201,17 +223,113 @@ export const createApp = ({
   });
   app.get("/v1/executor/me", (c) => c.json(c.get("principal")));
 
+  app.post("/v1/devices/mobile", async (c) => {
+    const parsed = parse(MobileRegistration, await c.req.json().catch(() => null));
+    if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
+    await registerMobilePushToken(c.env.DB, user(c).userId, parsed.value);
+    return c.json({ ok: true });
+  });
+  app.delete("/v1/devices/mobile", async (c) => {
+    const parsed = parse(MobileUnregistration, await c.req.json().catch(() => null));
+    if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
+    await unregisterMobilePushToken(c.env.DB, user(c).userId, parsed.value.instanceId);
+    return c.json({ ok: true });
+  });
+
+  app.get("/v1/mobile/targets/:kind/:id", async (c) => {
+    const principal = user(c);
+    const { kind, id } = c.req.param();
+    if (kind === "approval") {
+      const target = await c.env.DB.prepare(
+        `SELECT a.workspace_id AS workspaceId FROM approvals a
+           JOIN workspace_members m ON m.workspace_id = a.workspace_id
+           WHERE a.id = ? AND m.user_id = ?`,
+      )
+        .bind(id, principal.userId)
+        .first<{ workspaceId: string }>();
+      if (!target) throw new HttpError("NOT_FOUND", "notification target not found");
+      return c.json({ kind, id, ...target });
+    }
+    if (kind === "job") {
+      const target = await c.env.DB.prepare(
+        `SELECT j.workspace_id AS workspaceId FROM jobs j
+           JOIN workspace_members m ON m.workspace_id = j.workspace_id
+           WHERE j.id = ? AND m.user_id = ?`,
+      )
+        .bind(id, principal.userId)
+        .first<{ workspaceId: string }>();
+      if (!target) throw new HttpError("NOT_FOUND", "notification target not found");
+      return c.json({ kind, id, ...target });
+    }
+    if (kind !== "mention")
+      throw new HttpError("INVALID_INPUT", "unknown notification target kind");
+    const target = await c.env.DB.prepare(
+      `SELECT c.workspace_id AS workspaceId, c.channel_id AS channelId, c.id AS conversationId,
+                c.kind AS conversationKind, COALESCE(c.dm_bot_id, parent.dm_bot_id) AS botId
+           FROM conversations c
+           LEFT JOIN conversations parent
+             ON parent.workspace_id = c.workspace_id
+            AND parent.id = COALESCE(c.parent_conversation_id, c.id)
+          WHERE c.id = ?
+            AND EXISTS (SELECT 1 FROM workspace_members m
+                         WHERE m.workspace_id = c.workspace_id AND m.user_id = ?)
+            AND EXISTS (
+              SELECT 1 FROM conversations p
+               WHERE p.workspace_id = c.workspace_id
+                 AND p.id = COALESCE(c.parent_conversation_id, c.id)
+                 AND ((p.kind = 'dm' AND p.dm_user_id = ?)
+                      OR (p.kind = 'channel' AND EXISTS (
+                        SELECT 1 FROM channel_members cm
+                        JOIN actors a ON a.workspace_id = cm.workspace_id AND a.id = cm.actor_id
+                        WHERE cm.workspace_id = p.workspace_id AND cm.channel_id = p.channel_id
+                          AND a.user_id = ?))))`,
+    )
+      .bind(id, principal.userId, principal.userId, principal.userId)
+      .first<{
+        workspaceId: string;
+        channelId: string;
+        conversationId: string;
+        conversationKind: string;
+        botId: string | null;
+      }>();
+    if (!target) throw new HttpError("NOT_FOUND", "notification target not found");
+    return c.json({ kind, id, ...target });
+  });
+
   app.post("/v1/commands", async (c) => {
     const parsed = parse(CommandEnvelope, await c.req.json().catch(() => null));
     if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
     c.set("operationId", parsed.value.operationId);
-    const { status, response, scopes } = await runCommand(
-      c.env.DB,
-      c.get("principal"),
-      parsed.value,
-    );
-    hint(c, { workspaceId: parsed.value.workspaceId, scopes: scopes ?? [] });
-    return c.json(response, status as ContentfulStatusCode);
+    const result = await runCommand(c.env.DB, c.get("principal"), parsed.value);
+    hint(c, { workspaceId: parsed.value.workspaceId, scopes: result.scopes ?? [] });
+    if (parsed.value.command.type === "message.post" && result.scopes?.length) {
+      const recipientIds = parsed.value.command.conversationId
+        ? []
+        : await mentionedUserRecipients(
+            c.env.DB,
+            parsed.value.workspaceId,
+            parsed.value.command.channelId!,
+            mentionedUserIds(parsed.value.command.text),
+          );
+      const conversationId =
+        result.response &&
+        typeof result.response === "object" &&
+        "conversationId" in result.response &&
+        typeof result.response.conversationId === "string"
+          ? result.response.conversationId
+          : null;
+      if (recipientIds.length > 0 && conversationId) {
+        c.executionCtx.waitUntil(
+          sendMobilePush(
+            c.env.DB,
+            c.env,
+            { recipients: recipientIds, kind: "mention", id: conversationId },
+            fetchImpl,
+          ),
+        );
+      }
+    }
+    return c.json(result.response, result.status as ContentfulStatusCode);
   });
 
   app.post("/v1/executor/pump", async (c) =>
@@ -229,13 +347,34 @@ export const createApp = ({
     const parsed = parse(ExecutorEnvelope, await c.req.json().catch(() => null));
     if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
     c.set("operationId", parsed.value.operationId);
-    const { status, response, scopes } = await runExecutorCommand(
-      c.env.DB,
-      device(c),
-      parsed.value,
-    );
-    hint(c, { workspaceId: parsed.value.workspaceId, scopes: scopes ?? [] });
-    return c.json(response, status as ContentfulStatusCode);
+    const result = await runExecutorCommand(c.env.DB, device(c), parsed.value);
+    hint(c, { workspaceId: parsed.value.workspaceId, scopes: result.scopes ?? [] });
+    if (
+      result.scopes?.length &&
+      parsed.value.command.type === "run.result.submit" &&
+      parsed.value.command.reply
+    ) {
+      const recipient = await dmReplyRecipient(
+        c.env.DB,
+        parsed.value.workspaceId,
+        parsed.value.command.reply.conversationId,
+      );
+      if (recipient) {
+        c.executionCtx.waitUntil(
+          sendMobilePush(
+            c.env.DB,
+            c.env,
+            {
+              recipients: [recipient],
+              kind: "mention",
+              id: parsed.value.command.reply.conversationId,
+            },
+            fetchImpl,
+          ),
+        );
+      }
+    }
+    return c.json(result.response, result.status as ContentfulStatusCode);
   });
   app.post("/v1/executor/heartbeat", async (c) => {
     const parsed = parse(ExecutorHeartbeat, await c.req.json().catch(() => ({})));
@@ -311,9 +450,27 @@ export const createApp = ({
     const parsed = parse(RunEnvelope, await c.req.json().catch(() => null));
     if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
     c.set("operationId", parsed.value.operationId);
-    const { status, response, scopes } = await runRunCommand(c.env.DB, run, parsed.value);
-    hint(c, { workspaceId: run.workspaceId, scopes: scopes ?? [] });
-    return c.json(response, status as ContentfulStatusCode);
+    const result = await runRunCommand(c.env.DB, run, parsed.value);
+    hint(c, { workspaceId: run.workspaceId, scopes: result.scopes ?? [] });
+    const approvalId =
+      result.response &&
+      typeof result.response === "object" &&
+      "approvalId" in result.response &&
+      typeof result.response.approvalId === "string"
+        ? result.response.approvalId
+        : null;
+    if (result.scopes?.length && approvalId) {
+      const recipients = await approvalRecipients(c.env.DB, run.workspaceId);
+      c.executionCtx.waitUntil(
+        sendMobilePush(
+          c.env.DB,
+          c.env,
+          { recipients, kind: "approval", id: approvalId },
+          fetchImpl,
+        ),
+      );
+    }
+    return c.json(result.response, result.status as ContentfulStatusCode);
   });
   app.get("/v1/run/me", (c) => {
     const run = runPrincipal(c);

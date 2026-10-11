@@ -1,6 +1,8 @@
 // Sync controller (docs/architecture.md §12.2, §12.3). Pure: HTTP and refetching are injected.
 /* oxlint-disable no-await-in-loop */
-import type { ApiResult } from "../../shared/api.ts";
+export type ApiResult =
+  | { ok: true; value: Record<string, unknown> }
+  | { ok: false; error: { code: string; message: string; body?: unknown } };
 
 /** `run`: the Run open in the Run Inspector (state, persistence, transcript); `thread`: the open Thread panel. */
 export type ListKey =
@@ -57,7 +59,7 @@ export type SyncStatus = { cursor: string | null; unsynced: number; error: strin
 export const createSync = (deps: {
   workspaceId: string;
   get: (path: string) => Promise<ApiResult>;
-  refetch: (keys: Set<ListKey>) => void;
+  refetch: (keys: Set<ListKey>) => void | Promise<void>;
   onStatus: (status: SyncStatus) => void;
 }) => {
   let cursor: string | null = null;
@@ -66,10 +68,7 @@ export const createSync = (deps: {
   let dirty = false;
 
   const changes = async (from?: string) => {
-    const query = new URLSearchParams({
-      workspaceId: deps.workspaceId,
-      ...(from ? { cursor: from } : {}),
-    });
+    const query = `workspaceId=${encodeURIComponent(deps.workspaceId)}${from ? `&cursor=${encodeURIComponent(from)}` : ""}`;
     const result = await deps.get(`/v1/sync/changes?${query}`);
     if (!result.ok)
       throw Object.assign(new Error(result.error.message), { code: result.error.code });
@@ -78,27 +77,30 @@ export const createSync = (deps: {
 
   // Head cursor first, then the lists: replaying from it converges (§12.3).
   const bootstrap = async () => {
-    cursor = (await changes()).cursor;
-    deps.refetch(new Set(allLists));
+    const head = (await changes()).cursor;
+    await deps.refetch(new Set(allLists));
+    cursor = head;
   };
 
   const pullOnce = async () => {
     if (cursor === null) return bootstrap();
     const keys = new Set<ListKey>();
+    let nextCursor = cursor;
     for (;;) {
       let page;
       try {
-        page = await changes(cursor);
+        page = await changes(nextCursor);
       } catch (error) {
         if ((error as { code?: string }).code !== "CURSOR_EXPIRED") throw error;
         cursor = null;
         return bootstrap();
       }
-      cursor = page.cursor;
+      nextCursor = page.cursor;
       for (const key of refetchFor(page.changes)) keys.add(key);
       if (!page.hasMore) break;
     }
-    if (keys.size > 0) deps.refetch(keys);
+    if (keys.size > 0) await deps.refetch(keys);
+    cursor = nextCursor;
   };
 
   /** Serialized; a hint arriving mid-pull runs one more pull after it. */

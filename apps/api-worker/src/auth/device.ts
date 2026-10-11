@@ -22,6 +22,12 @@ export const hiveToken = (request: Request) =>
   request.headers.get("X-Hive-Token") ??
   request.headers.get("Authorization")?.match(/^Bearer (.+)$/)?.[1];
 
+/** A device token's generated UUID and 32-byte hexadecimal secret, unlike an Access JWT. */
+export const hasDeviceBearerToken = (request: Request) =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[0-9a-f]{64}$/i.test(
+    request.headers.get("Authorization")?.match(/^Bearer (.+)$/)?.[1] ?? "",
+  );
+
 export const authenticateDevice = async (request: Request, env: Bindings): Promise<Principal> => {
   const token = hiveToken(request);
   const dot = token?.indexOf(".") ?? -1;

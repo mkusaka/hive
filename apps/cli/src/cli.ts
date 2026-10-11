@@ -8,7 +8,8 @@ import {
   createCloudClient,
   serviceTokenHeaders,
 } from "@hive/executor/cloudClient";
-import { accessTokens, login, type OAuthToken, type OpenBrowser } from "./accessLogin.ts";
+import type { OAuthToken } from "@hive/access";
+import { accessTokens, login, type OpenBrowser } from "./accessLogin.ts";
 import { CliError, type Client, createClient, type Fetch, invalid } from "./client.ts";
 import * as cmd from "./commands.ts";
 

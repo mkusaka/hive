@@ -2,58 +2,12 @@
 // WWW-Authenticate header, OAuth discovery, dynamic client registration on a loopback redirect, PKCE, refresh.
 // Access turns `Authorization: Bearer <access token>` into the `Cf-Access-Jwt-Assertion` the Worker verifies.
 // Node only (loopback server, browser opener): used by src/main.ts and the Electron main process.
+import { isInvalidGrant, prepareLogin, refresh, type OAuthToken } from "@hive/access";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import * as oauth from "oauth4webapi";
 import { CliError } from "./client.ts";
 
-/** The `oauth` field of the credentials file. */
-export type OAuthToken = {
-  authorizationServer: string;
-  clientId: string;
-  accessToken: string;
-  refreshToken: string;
-  expiresAt: number;
-};
-
 export type OpenBrowser = (url: string) => Promise<void>;
-
-const discover = async (issuer: string) => {
-  const url = new URL(issuer);
-  return oauth.processDiscoveryResponse(
-    url,
-    await oauth.discoveryRequest(url, { algorithm: "oauth2" }),
-  );
-};
-
-const toStored = (
-  server: oauth.AuthorizationServer,
-  clientId: string,
-  token: oauth.TokenEndpointResponse,
-  previousRefreshToken?: string,
-): OAuthToken => {
-  // Access may not rotate the refresh token; keep the old one then.
-  const refreshToken = token.refresh_token ?? previousRefreshToken;
-  if (!refreshToken) throw new Error("Access did not return a refresh token");
-  return {
-    authorizationServer: server.issuer,
-    clientId,
-    accessToken: token.access_token,
-    refreshToken,
-    expiresAt: Date.now() + (token.expires_in ?? 900) * 1000,
-  };
-};
-
-const refresh = async (stored: OAuthToken) => {
-  const server = await discover(stored.authorizationServer);
-  const client: oauth.Client = { client_id: stored.clientId };
-  const token = await oauth.processRefreshTokenResponse(
-    server,
-    client,
-    await oauth.refreshTokenGrantRequest(server, client, oauth.None(), stored.refreshToken),
-  );
-  return toStored(server, client.client_id, token, stored.refreshToken);
-};
 
 /** Loopback callback on 127.0.0.1; the OS picks the port. */
 const callbackServer = async () => {
@@ -79,66 +33,11 @@ const callbackServer = async () => {
 
 /** Full browser login against the Access application in front of `apiUrl`. */
 export const login = async (apiUrl: string, openBrowser: OpenBrowser): Promise<OAuthToken> => {
-  const resource = new URL(apiUrl).href;
-  // Managed OAuth answers an unauthenticated API request with 401 + `resource_metadata` instead of a redirect.
-  const probe = await fetch(resource, {
-    headers: { accept: "application/json" },
-    redirect: "manual",
-  });
-  const metadataUrl = /resource_metadata="([^"]+)"/.exec(
-    probe.headers.get("www-authenticate") ?? "",
-  )?.[1];
-  if (!metadataUrl) throw new Error(`Access Managed OAuth is not enabled for ${resource}`);
-  const metadata = await fetch(metadataUrl);
-  if (!metadata.ok) throw new Error(`resource metadata fetch failed: HTTP ${metadata.status}`);
-  const issuer = ((await metadata.json()) as { authorization_servers?: unknown })
-    .authorization_servers;
-  if (!Array.isArray(issuer) || typeof issuer[0] !== "string")
-    throw new Error("no authorization server in the resource metadata");
-  const server = await discover(issuer[0]);
-  if (!server.authorization_endpoint || !server.registration_endpoint)
-    throw new Error("Access OAuth endpoints are incomplete");
-
   const { callback, redirectUri, close } = await callbackServer();
   try {
-    const client = await oauth.processDynamicClientRegistrationResponse(
-      await oauth.dynamicClientRegistrationRequest(server, {
-        client_name: "hive",
-        redirect_uris: [redirectUri],
-        grant_types: ["authorization_code", "refresh_token"],
-        response_types: ["code"],
-        token_endpoint_auth_method: "none",
-        resource,
-      }),
-    );
-    const verifier = oauth.generateRandomCodeVerifier();
-    const state = oauth.generateRandomState();
-    const url = new URL(server.authorization_endpoint);
-    for (const [key, value] of Object.entries({
-      client_id: client.client_id,
-      redirect_uri: redirectUri,
-      response_type: "code",
-      code_challenge: await oauth.calculatePKCECodeChallenge(verifier),
-      code_challenge_method: "S256",
-      state,
-      resource,
-    }))
-      url.searchParams.set(key, value);
-    await openBrowser(url.href);
-    const params = oauth.validateAuthResponse(server, client, await callback, state);
-    const token = await oauth.processAuthorizationCodeResponse(
-      server,
-      client,
-      await oauth.authorizationCodeGrantRequest(
-        server,
-        client,
-        oauth.None(),
-        params,
-        redirectUri,
-        verifier,
-      ),
-    );
-    return toStored(server, client.client_id, token);
+    const prepared = await prepareLogin(apiUrl, redirectUri);
+    await openBrowser(prepared.authorizationUrl);
+    return await prepared.complete((await callback).href);
   } finally {
     close();
   }
@@ -151,7 +50,7 @@ const usable = (token: OAuthToken | undefined) =>
 /** `undefined` on `invalid_grant` (refresh token expired, revoked or already rotated); other errors propagate. */
 const tryRefresh = (stored: OAuthToken) =>
   refresh(stored).catch((error: unknown) => {
-    if (!(error instanceof oauth.ResponseBodyError && error.error === "invalid_grant")) throw error;
+    if (!isInvalidGrant(error)) throw error;
     return undefined;
   });
 

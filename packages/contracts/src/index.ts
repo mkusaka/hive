@@ -227,9 +227,14 @@ export const AgentSend = v.strictObject({
 /** A Bot mention inside a message body (Slack's `<@U123>`, namespaced): stored by id, shown by name. */
 export const mentionToken = (botId: string) => `<@bot:${botId}>`;
 const mentionPattern = /<@bot:([^>\s]+)>/g;
+const userMentionPattern = /<@user:([^>\s]+)>/g;
 /** The mentioned Bot ids, each once, in order of first appearance. */
 export const mentionedBotIds = (text: string) => [
   ...new Set(Array.from(text.matchAll(mentionPattern), (m) => m[1]!)),
+];
+/** The mentioned User ids, each once, in order of first appearance. */
+export const mentionedUserIds = (text: string) => [
+  ...new Set(Array.from(text.matchAll(userMentionPattern), (m) => m[1]!)),
 ];
 /** Tokens → `@name`, `@unknown` for an id `names` does not know. */
 export const renderMentions = (text: string, names: ReadonlyMap<string, string>) =>
@@ -237,10 +242,11 @@ export const renderMentions = (text: string, names: ReadonlyMap<string, string>)
 
 /**
  * A user's Channel message (docs/architecture.md §7.2). Every Bot mentioned with a token gets the Inbox item + Job that
- * `agent.send` with `request` / `wake` gives (and joins the Channel); no mention = only posted. `mentions`, when given,
- * must equal the tokens. With `conversationId` (a DM) instead of `channelId`, the DM's Bot is always the recipient.
- * `threadOf` (a message of that Channel / DM) posts the reply in the message's thread, created on the first reply;
- * in a Channel thread every Bot that already took part in it is woken too, mentioned or not.
+ * `agent.send` with `request` / `wake` gives (and joins the Channel); user mention tokens notify that Channel's
+ * members. `mentions`, when given, must equal the Bot tokens. With `conversationId` (a DM) instead of `channelId`,
+ * the DM's Bot is always the recipient. `threadOf` (a message of that Channel / DM) posts the reply in the message's
+ * thread, created on the first reply; in a Channel thread every Bot that already took part in it is woken too,
+ * mentioned or not.
  */
 export const MessagePost = v.pipe(
   v.strictObject({

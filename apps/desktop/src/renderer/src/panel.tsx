@@ -2,7 +2,7 @@
 // and editor shared by both, and the executor service section of the Computer tab.
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import type { ExecutorProvider, UiCommand } from "../../shared/api.ts";
-import { type Schedule, scheduleLine } from "./format.ts";
+import { type Schedule, scheduleLine } from "@hive/ui-text";
 import { Avatar, failure, Icon, inWorkspace, MemoryList, Menu, type Row, text } from "./ui.tsx";
 import { SetUpPc } from "./welcome.tsx";
 

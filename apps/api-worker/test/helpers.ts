@@ -4,8 +4,10 @@ import { expect } from "vitest";
 import { createApp } from "../src/app.ts";
 
 const { publicKey, privateKey } = await generateKeyPair("ES256", { extractable: true });
-const jwks = createLocalJWKSet({ keys: [{ ...(await exportJWK(publicKey)), kid: "k1" }] });
-export const app = createApp({ jwks: () => jwks });
+export const localJwks = createLocalJWKSet({
+  keys: [{ ...(await exportJWK(publicKey)), kid: "k1" }],
+});
+export const app = createApp({ jwks: () => localJwks });
 export const issuer = `https://${env.ACCESS_TEAM_DOMAIN}`;
 
 export const assertion = (sub: string, overrides: { audience?: string; issuer?: string } = {}) =>

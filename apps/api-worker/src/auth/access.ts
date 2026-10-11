@@ -32,7 +32,11 @@ export const authenticateUser = async (
   env: Bindings,
   jwks: JWTVerifyGetKey,
 ): Promise<Principal> => {
-  const assertion = request.headers.get("Cf-Access-Jwt-Assertion");
+  const assertion =
+    request.headers.get("Cf-Access-Jwt-Assertion") ??
+    (env.ACCESS_DEV_JWKS
+      ? (request.headers.get("Authorization")?.match(/^Bearer (.+)$/)?.[1] ?? null)
+      : null);
   if (!assertion) throw unauthenticated();
   const issuer = issuerOf(env);
   const payload = await jwtVerify(assertion, jwks, { issuer, audience: env.ACCESS_AUD }).then(

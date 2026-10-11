@@ -1,6 +1,13 @@
 // Pure formatting for the chat UI: a small safe Markdown subset (as data, rendered by React without HTML), Routine
 // schedule lines and avatar colors.
-import type { JSONContent } from "@tiptap/core";
+/** The editor's JSON data shape; no editor, DOM or native runtime dependency. */
+type JSONContent = {
+  type?: string;
+  text?: string;
+  attrs?: Record<string, unknown>;
+  marks?: { type: string }[];
+  content?: JSONContent[];
+};
 
 export type Inline =
   | { kind: "text" | "bold" | "italic" | "code"; text: string }
