@@ -25,5 +25,7 @@ export default defineConfig({
     name: "api-worker",
     include: ["test/**/*.test.ts"],
     setupFiles: ["./test/setup.ts"],
+    // Miniflare D1 + R2 round trips on a cold CI runner exceed vitest's 5 s default (sessions.test.ts timed out once).
+    testTimeout: 20_000,
   },
 });
