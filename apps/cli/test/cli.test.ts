@@ -228,14 +228,18 @@ describe("argv → request", () => {
     expect(await h.hive("routine", "pause", "r-1")).toBe(0);
     expect(command(3)).toEqual({ type: "routine.run", routineId: "r-1" });
     expect(command(4)).toEqual({ type: "routine.pause", routineId: "r-1" });
+    expect(await h.hive("routine", "delete", "r-1")).toBe(0);
+    expect(await h.hive("channel", "update", "ch-1", "--topic", "Daily ops")).toBe(0);
+    expect(command(5)).toEqual({ type: "routine.delete", routineId: "r-1" });
+    expect(command(6)).toEqual({ type: "channel.update", channelId: "ch-1", topic: "Daily ops" });
 
     expect(await h.hive("job", "cancel", "job-1")).toBe(0);
-    expect(command(5)).toEqual({ type: "job.cancel", jobId: "job-1" });
+    expect(command(7)).toEqual({ type: "job.cancel", jobId: "job-1" });
     expect(await h.hive("job", "resolve", "job-1", "--mark-failed")).toBe(0);
-    expect(command(6)).toEqual({ type: "job.resolve", jobId: "job-1", action: "mark_failed" });
+    expect(command(8)).toEqual({ type: "job.resolve", jobId: "job-1", action: "mark_failed" });
     expect(await h.hive("job", "resolve", "job-1")).toBe(2);
     expect(await h.hive("job", "resolve", "job-1", "--retry", "--cancel")).toBe(2);
-    expect(h.calls).toHaveLength(7);
+    expect(h.calls).toHaveLength(9);
   });
 
   it("rejects invalid input locally with exit 2 and sends nothing", async () => {

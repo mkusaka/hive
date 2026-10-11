@@ -63,11 +63,15 @@ export const ChannelView = (props: {
   setBotId: (id: string) => void;
   me: string | null;
   openBot: (id: string) => void;
+  toggleChannelPanel: () => void;
 }) => {
   const [draft, setDraft] = useState("");
   const [op, setOp] = useState<Operation | null>(null);
   const end = useRef<HTMLDivElement>(null);
-  useEffect(() => end.current?.scrollIntoView({ block: "end" }), [props.messages]);
+  // Braces: Chromium's scrollIntoView returns a Promise, which React would call as the cleanup.
+  useEffect(() => {
+    void end.current?.scrollIntoView({ block: "end" });
+  }, [props.messages]);
 
   const botByActor = new Map(props.bots.map((b) => [String(b.actorId), b]));
   const bot = props.bots.find((b) => b.id === props.botId);
@@ -112,9 +116,12 @@ export const ChannelView = (props: {
   return (
     <div className="chat">
       <header className="chat-head">
-        <span className="pill">
+        <button className="pill" onClick={props.toggleChannelPanel}>
           <span className="hash">#</span> {text(props.channel.name)}
-        </span>
+        </button>
+        {props.channel.topic ? (
+          <span className="topic-line ellipsis">{text(props.channel.topic)}</span>
+        ) : null}
       </header>
       <div className="scroll">
         <p className="subtitle">

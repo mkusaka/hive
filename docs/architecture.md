@@ -974,6 +974,13 @@ type Subscription = {
   identified separately.
 - Routines never call a model directly; they create Events / Jobs. Manual runs use the same Job contract.
 
+Implemented as (UI-03): the desktop presents Routines per Channel. The Channel panel lists the Routines whose
+Conversation is the Channel's (`GET /v1/routines?conversationId=`), each with its assigned Bot, and creates new ones
+into that Conversation; the Bot panel lists a Bot's Routines across Channels. `routine.delete` removes the Routine and
+its occurrence history in one batch; Jobs it already created stay. The Channel panel also shows the Channel's topic
+(`channels.topic`, set by `channel.update`, members only) and its members; Bots join no Channel today, so the members
+list adds the actors that posted in it.
+
 ### 17.3 Webhook / MCP (§20.3)
 
 - Generic webhooks have integration ID, schema, HMAC secret, replay window, payload size and rate budget. Bots may

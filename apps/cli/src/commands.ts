@@ -17,6 +17,9 @@ export const deviceRegister = (
 
 export const channelCreate = (c: Client, e: Envelope, name: string) =>
   c.command(e, { type: "channel.create", name });
+/** An empty topic clears it. */
+export const channelUpdate = (c: Client, e: Envelope, channelId: string, topic: string) =>
+  c.command(e, { type: "channel.update", channelId, topic });
 
 /** `toolPolicy` / `placementPolicy`: @hive/contracts ToolPolicy / PlacementPolicy (§10.2). */
 export const botCreate = (
@@ -315,7 +318,7 @@ export const routineCreate = (
   });
 export const listRoutines = (c: Client, workspaceId: string) =>
   c.get(inWorkspace("routines", workspaceId));
-/** `routine.run` / `routine.pause` / `routine.resume`. */
+/** `routine.run` / `routine.pause` / `routine.resume` / `routine.delete`. */
 export const routineAction = (c: Client, e: Envelope, type: string, routineId: string) =>
   c.command(e, { type, routineId });
 

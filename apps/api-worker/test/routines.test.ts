@@ -161,6 +161,34 @@ describe("routines", () => {
     expect(await list("other-bot")).toEqual([]);
   });
 
+  it("lists routines filtered by conversationId", async () => {
+    const { s, routineId, conversationId } = await withRoutine();
+    const list = async (id: string) =>
+      (
+        await (
+          await s.user.get(`/v1/routines?workspaceId=${s.workspaceId}&conversationId=${id}`)
+        ).json<{ routines: { id: string }[] }>()
+      ).routines.map((r) => r.id);
+    expect(await list(conversationId)).toEqual([routineId]);
+    expect(await list("other-conversation")).toEqual([]);
+  });
+
+  it("routine.delete removes the Routine and its occurrences, keeps its Jobs; a missing one is a 404", async () => {
+    const { s, routineId, occurrences } = await withRoutine();
+    const ran = await s.ok({ type: "routine.run", routineId });
+    expect(await occurrences()).toHaveLength(1);
+    await s.ok({ type: "routine.delete", routineId });
+    expect(await occurrences()).toEqual([]);
+    expect(await count("routines WHERE id = ?", routineId)).toBe(0);
+    expect(await (await s.user.get(`/v1/jobs/${ran.jobId as string}`)).json()).toMatchObject({
+      state: "queued",
+    });
+    const missing = await s.user.command(
+      envelope(s.workspaceId, { type: "routine.delete", routineId }),
+    );
+    expect(missing.status).toBe(404);
+  });
+
   it("routine.run creates an occurrence and Job at now through the same path; a replay creates nothing", async () => {
     const { s, routineId, occurrences } = await withRoutine();
     const request = envelope(s.workspaceId, { type: "routine.run", routineId });

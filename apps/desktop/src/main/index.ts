@@ -103,6 +103,9 @@ const createWindow = async () => {
     width: 1200,
     height: 800,
     title: "hive",
+    // Frameless like the reference app: the traffic lights sit in the sidebar's top strip (style.css `.side-top`).
+    titleBarStyle: "hiddenInset",
+    trafficLightPosition: { x: 18, y: 18 },
     webPreferences: {
       preload: fileURLToPath(new URL("../preload/index.cjs", import.meta.url)),
       contextIsolation: true,

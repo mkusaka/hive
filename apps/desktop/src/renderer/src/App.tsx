@@ -4,7 +4,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HiveConfig } from "../../shared/api.ts";
 import { ChannelView } from "./chat.tsx";
-import { BotPanel } from "./panel.tsx";
+import { BotPanel, ChannelPanel } from "./panel.tsx";
 import { createSync, type ListKey, type SyncStatus } from "./sync.ts";
 import {
   Avatar,
@@ -50,7 +50,12 @@ export const App = () => {
   const [runId, setRunId] = useState("");
   const [run, setRun] = useState<Inspected | null>(null);
   const [me, setMe] = useState<string | null>(null);
-  const [panelBot, setPanelBot] = useState<string | null>(null);
+  // One right panel at a time: a Bot's, or the current Channel's.
+  const [panel, setPanel] = useState<{ kind: "bot"; id: string } | { kind: "channel" } | null>(
+    null,
+  );
+  const panelBot = panel?.kind === "bot" ? panel.id : null;
+  const openBot = useCallback((id: string | null) => setPanel(id ? { kind: "bot", id } : null), []);
   const [collapsed, setCollapsed] = useState(() => {
     try {
       return localStorage.getItem(collapsedKey) === "1";
@@ -139,10 +144,10 @@ export const App = () => {
     void window.hive.getConfig().then((c) => {
       setConfig(c);
       setConnection(c.connection);
-      if (c.openBot) setPanelBot(c.openBot);
+      if (c.openBot) openBot(c.openBot);
     });
     return off;
-  }, []);
+  }, [openBot]);
 
   useEffect(() => {
     if (!config || config.problem || config.loginRequired) return;
@@ -229,15 +234,17 @@ export const App = () => {
     );
   const ws = config.workspaceId;
 
-  const panel = panelBot ? bots.find((b) => b.id === panelBot) : undefined;
+  const panelBotRow = panelBot ? bots.find((b) => b.id === panelBot) : undefined;
+  const channel = channels.find((c) => c.id === channelId);
+  const channelPanel = panel?.kind === "channel" && view === "channel" ? channel : undefined;
 
   return (
-    <div className={`app ${panel ? "with-panel" : ""}`}>
+    <div className={`app ${panelBotRow || channelPanel ? "with-panel" : ""}`}>
       <aside className={`sidebar ${collapsed ? "collapsed" : ""}`}>
         <div className="side-top">
           <button
-            className="icon"
-            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            className="icon tip-below"
+            data-tip={collapsed ? "Expand sidebar" : "Collapse sidebar"}
             aria-label="Toggle sidebar"
             onClick={() => setCollapsed(!collapsed)}
           >
@@ -249,8 +256,9 @@ export const App = () => {
             <button
               key={b.id}
               className={`bot ${b.id === panelBot ? "active" : ""}`}
-              title={text(b.name)}
-              onClick={() => setPanelBot(b.id === panelBot ? null : b.id)}
+              {...(collapsed ? { "data-tip": text(b.name) } : {})}
+              aria-label={text(b.name)}
+              onClick={() => openBot(b.id === panelBot ? null : b.id)}
             >
               <Avatar id={b.id} name={String(b.name)} size={collapsed ? 40 : 56} />
               {!collapsed && <span className="ellipsis">{text(b.name)}</span>}
@@ -294,7 +302,7 @@ export const App = () => {
             <button
               key={v}
               className={`icon ${v === view ? "active" : ""}`}
-              title={label}
+              data-tip={label}
               aria-label={label}
               onClick={() => setView(v)}
             >
@@ -313,13 +321,14 @@ export const App = () => {
         {view === "channel" && (
           <ChannelView
             ws={ws}
-            channel={channels.find((c) => c.id === channelId)}
+            channel={channel}
             messages={messages}
             bots={bots}
             botId={botId}
             setBotId={setBotId}
             me={me}
-            openBot={setPanelBot}
+            openBot={openBot}
+            toggleChannelPanel={() => setPanel(channelPanel ? null : { kind: "channel" })}
           />
         )}
         {view === "inbox" && (
@@ -454,13 +463,27 @@ export const App = () => {
           </section>
         )}
       </main>
-      {panel && (
+      {panelBotRow && (
         <BotPanel
           ws={ws}
-          bot={panel}
+          bot={panelBotRow}
+          bots={bots}
+          channels={channels}
           devices={devices}
           refreshDevices={refreshDevices}
-          close={() => setPanelBot(null)}
+          close={() => setPanel(null)}
+        />
+      )}
+      {channelPanel && (
+        <ChannelPanel
+          ws={ws}
+          channel={channelPanel}
+          bots={bots}
+          me={me}
+          defaultBotId={botId}
+          openBot={openBot}
+          refreshChannels={() => void refetch(new Set(["channels"]), ws)}
+          close={() => setPanel(null)}
         />
       )}
     </div>

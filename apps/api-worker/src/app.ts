@@ -43,6 +43,7 @@ import {
   listJobs,
   listMessages,
   listProjects,
+  listChannelMembers,
   listRoutines,
   listSubscriptions,
   listTasks,
@@ -397,6 +398,15 @@ export const createApp = ({
   app.get("/v1/channels", async (c) =>
     c.json(await listChannels(c.env.DB, workspaceParam(c), user(c).userId)),
   );
+  app.get("/v1/channels/:id/members", async (c) =>
+    c.json(
+      await listChannelMembers(c.env.DB, {
+        workspaceId: workspaceParam(c),
+        userId: user(c).userId,
+        channelId: c.req.param("id"),
+      }),
+    ),
+  );
   app.get("/v1/channels/:id/messages", async (c) =>
     c.json(
       await listMessages(c.env.DB, {
@@ -443,7 +453,14 @@ export const createApp = ({
     ),
   );
   app.get("/v1/routines", async (c) =>
-    c.json(await listRoutines(c.env.DB, workspaceParam(c), c.req.query("botId"))),
+    c.json(
+      await listRoutines(
+        c.env.DB,
+        workspaceParam(c),
+        c.req.query("botId"),
+        c.req.query("conversationId"),
+      ),
+    ),
   );
   app.get("/v1/subscriptions", async (c) =>
     c.json(await listSubscriptions(c.env.DB, workspaceParam(c))),

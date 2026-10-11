@@ -537,6 +537,15 @@ const specs: Record<string, Spec> = {
       return exitForJob(job);
     },
   },
+  "channel update": {
+    usage: "<channel-id> --topic <text>",
+    args: 1,
+    options: { topic: str },
+    run: async (c) =>
+      c.print(
+        await cmd.channelUpdate(c.client(), c.envelope(), c.args[0]!, need(c.values, "topic")),
+      ),
+  },
   "channel list": {
     usage: "",
     run: async (c) => c.print(await cmd.listChannels(c.client(), c.workspace())),
@@ -793,7 +802,7 @@ const specs: Record<string, Spec> = {
     run: async (c) => c.print(await cmd.listRoutines(c.client(), c.workspace())),
   },
   ...Object.fromEntries(
-    (["run", "pause", "resume"] as const).map((action) => [
+    (["run", "pause", "resume", "delete"] as const).map((action) => [
       `routine ${action}`,
       {
         usage: "<routine-id>",

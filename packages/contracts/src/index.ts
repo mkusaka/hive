@@ -93,6 +93,12 @@ export const DeviceRevoke = v.strictObject({
 });
 
 export const ChannelCreate = v.strictObject({ type: v.literal("channel.create"), name: Name });
+/** Sets the Channel's topic; an empty string clears it. Members only. */
+export const ChannelUpdate = v.strictObject({
+  type: v.literal("channel.update"),
+  channelId: ChannelId,
+  topic: v.pipe(v.string(), v.maxLength(250)),
+});
 
 const DeviceIds = v.optional(v.array(DeviceId), []);
 
@@ -501,6 +507,11 @@ export const RoutineResume = v.strictObject({
 });
 /** Manual run: an occurrence at now through the same Inbox item + Job path; the schedule is not advanced. */
 export const RoutineRun = v.strictObject({ type: v.literal("routine.run"), routineId: RoutineId });
+/** Deletes the Routine and its occurrence history; Jobs it already created stay. */
+export const RoutineDelete = v.strictObject({
+  type: v.literal("routine.delete"),
+  routineId: RoutineId,
+});
 
 // ------------------------------------------------- Job control (§9.3, §10.4)
 

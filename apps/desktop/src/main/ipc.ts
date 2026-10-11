@@ -4,13 +4,17 @@ import * as service from "@hive/cli/service";
 import {
   AgentSend,
   ApprovalResolve,
+  ChannelUpdate,
   commandEnvelope,
   JobCancel,
   MemoryWrite,
   parse,
+  RoutineCreate,
+  RoutineDelete,
   RoutinePause,
   RoutineResume,
   RoutineRun,
+  RoutineUpdate,
 } from "@hive/contracts";
 import * as v from "valibot";
 import type { ApiResult } from "../shared/api.ts";
@@ -33,6 +37,10 @@ export const UiCommandSchema = commandEnvelope(
     JobCancel,
     ApprovalResolve,
     MemoryWrite,
+    ChannelUpdate,
+    RoutineCreate,
+    RoutineUpdate,
+    RoutineDelete,
     RoutinePause,
     RoutineResume,
     RoutineRun,

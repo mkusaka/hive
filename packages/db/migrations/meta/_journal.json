@@ -134,6 +134,13 @@
       "when": 1791711768680,
       "tag": "0018_delegations",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1791735354298,
+      "tag": "0019_channel_topic",
+      "breakpoints": true
     }
   ]
 }

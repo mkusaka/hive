@@ -1,32 +1,74 @@
-// The Bot panel (Details / Library / Computer) and the executor service section of the Computer tab.
-import { useCallback, useEffect, useState } from "react";
+// The Bot panel (Details / Library / Computer), the Channel panel (About / Members / Routines), the routine list with its menu
+// and editor shared by both, and the executor service section of the Computer tab.
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import type { ExecutorProvider, UiCommand } from "../../shared/api.ts";
 import { type Schedule, scheduleLine } from "./format.ts";
 import { Avatar, failure, Icon, inWorkspace, MemoryList, type Row, text } from "./ui.tsx";
 
 type Tab = "details" | "library" | "computer";
 
+const command = (ws: string, cmd: UiCommand["command"]) =>
+  window.hive.api.command({
+    operationId: crypto.randomUUID(),
+    idempotencyKey: crypto.randomUUID(),
+    workspaceId: ws,
+    command: cmd,
+  });
+
+/** Close button, blob and name, tabs: the chrome both panels share. */
+const PanelChrome = <T extends string>(props: {
+  id: string;
+  name: string;
+  title: ReactNode;
+  tabs: readonly T[];
+  tab: T;
+  setTab: (tab: T) => void;
+  close: () => void;
+  children: ReactNode;
+}) => (
+  <aside className="panel">
+    <div className="panel-top">
+      <button className="round" aria-label="Close" onClick={props.close}>
+        <Icon name="close" />
+      </button>
+    </div>
+    <div className="panel-id">
+      <Avatar id={props.id} name={props.name} size={88} />
+      <h2>{props.title}</h2>
+    </div>
+    <div className="tabs" role="tablist">
+      {props.tabs.map((t) => (
+        <button
+          key={t}
+          role="tab"
+          aria-selected={t === props.tab}
+          className={t === props.tab ? "active" : ""}
+          onClick={() => props.setTab(t)}
+        >
+          {t[0]!.toUpperCase() + t.slice(1)}
+        </button>
+      ))}
+    </div>
+    {props.children}
+  </aside>
+);
+
 export const BotPanel = (props: {
   ws: string;
   bot: Row;
+  bots: Row[];
+  channels: Row[];
   devices: Row[];
   refreshDevices: () => void;
   close: () => void;
 }) => {
   const [tab, setTab] = useState<Tab>("details");
-  const [routines, setRoutines] = useState<Row[]>([]);
   const [memories, setMemories] = useState<Row[]>([]);
   const [error, setError] = useState<string | null>(null);
   const { ws, bot, refreshDevices } = props;
 
-  const loadRoutines = useCallback(async () => {
-    const res = await window.hive.api.get(inWorkspace("routines", ws, { botId: bot.id }));
-    if (!res.ok) return setError(failure(res));
-    setRoutines(res.value.routines as Row[]);
-  }, [ws, bot.id]);
   useEffect(() => {
     setError(null);
-    if (tab === "details") void loadRoutines();
     if (tab === "library")
       void window.hive.api
         .get(inWorkspace("memories", ws, { scopeKind: "bot", scopeId: bot.id }))
@@ -35,46 +77,19 @@ export const BotPanel = (props: {
         );
     // Heartbeats write no change rows, so online state is refetched when the tab opens.
     if (tab === "computer") refreshDevices();
-  }, [tab, ws, bot.id, loadRoutines, refreshDevices]);
+  }, [tab, ws, bot.id, refreshDevices]);
 
-  const routineCommand = async (
-    type: "routine.pause" | "routine.resume" | "routine.run",
-    id: string,
-  ) => {
-    const res = await window.hive.api.command({
-      operationId: crypto.randomUUID(),
-      idempotencyKey: crypto.randomUUID(),
-      workspaceId: ws,
-      command: { type, routineId: id } as UiCommand["command"],
-    });
-    if (!res.ok) return setError(failure(res));
-    void loadRoutines();
-  };
-
+  const channelOf = (r: Row) => props.channels.find((c) => c.conversationId === r.conversationId);
   return (
-    <aside className="panel">
-      <div className="panel-top">
-        <button className="round" title="Close" aria-label="Close" onClick={props.close}>
-          <Icon name="close" />
-        </button>
-      </div>
-      <div className="panel-id">
-        <Avatar id={bot.id} name={String(bot.name)} size={88} />
-        <h2>{text(bot.name)}</h2>
-      </div>
-      <div className="tabs" role="tablist">
-        {(["details", "library", "computer"] as const).map((t) => (
-          <button
-            key={t}
-            role="tab"
-            aria-selected={t === tab}
-            className={t === tab ? "active" : ""}
-            onClick={() => setTab(t)}
-          >
-            {t[0]!.toUpperCase() + t.slice(1)}
-          </button>
-        ))}
-      </div>
+    <PanelChrome
+      id={bot.id}
+      name={String(bot.name)}
+      title={text(bot.name)}
+      tabs={["details", "library", "computer"] as const}
+      tab={tab}
+      setTab={setTab}
+      close={props.close}
+    >
       {error && <p className="error">{error}</p>}
       {tab === "details" && (
         <>
@@ -87,35 +102,16 @@ export const BotPanel = (props: {
             <pre className="mono">{JSON.stringify(bot.toolPolicy, null, 2)}</pre>
           </div>
           <h3>Routines</h3>
-          <div className="card">
-            {routines.length === 0 && <p className="meta">No routines.</p>}
-            {routines.map((r) => (
-              <div key={r.id} className="routine">
-                <div>
-                  <div className="ellipsis">{text(r.name)}</div>
-                  <div className="meta ellipsis">{scheduleLine(r.schedule as Schedule)}</div>
-                </div>
-                <button
-                  className="small"
-                  title="Run now"
-                  onClick={() => void routineCommand("routine.run", r.id)}
-                >
-                  Run now
-                </button>
-                <label className="switch" title={r.enabled ? "On" : "Off"}>
-                  <input
-                    type="checkbox"
-                    checked={Boolean(r.enabled)}
-                    aria-label={`${text(r.name)} enabled`}
-                    onChange={() =>
-                      void routineCommand(r.enabled ? "routine.pause" : "routine.resume", r.id)
-                    }
-                  />
-                  <span />
-                </label>
-              </div>
-            ))}
-          </div>
+          {/* All channels; routines are created from a Channel panel. */}
+          <Routines
+            ws={ws}
+            query={{ botId: bot.id }}
+            bots={props.bots}
+            side={(r) => {
+              const channel = channelOf(r);
+              return channel ? `# ${text(channel.name)}` : "no channel";
+            }}
+          />
         </>
       )}
       {tab === "library" && (
@@ -157,7 +153,468 @@ export const BotPanel = (props: {
           </div>
         </>
       )}
-    </aside>
+    </PanelChrome>
+  );
+};
+
+/**
+ * Channel details, like Slack's: About (name, topic edited inline, created date), Members (`GET
+ * /v1/channels/:id/members`: members and actors that posted) and Routines (each with its assigned Bot).
+ */
+export const ChannelPanel = (props: {
+  ws: string;
+  channel: Row;
+  bots: Row[];
+  me: string | null;
+  defaultBotId: string;
+  openBot: (id: string) => void;
+  refreshChannels: () => void;
+  close: () => void;
+}) => {
+  const [tab, setTab] = useState<"about" | "members" | "routines">("about");
+  const [members, setMembers] = useState<Row[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const { ws, channel } = props;
+  const conversationId = String(channel.conversationId);
+  useEffect(() => {
+    setError(null);
+    if (tab === "members")
+      void window.hive.api
+        .get(inWorkspace(`channels/${encodeURIComponent(channel.id)}/members`, ws))
+        .then((res) => (res.ok ? setMembers(res.value.members as Row[]) : setError(failure(res))));
+  }, [tab, ws, channel.id]);
+  const saveTopic = async (topic: string) => {
+    const res = await command(ws, { type: "channel.update", channelId: channel.id, topic });
+    if (!res.ok) return setError(failure(res));
+    setError(null);
+    props.refreshChannels();
+  };
+  return (
+    <PanelChrome
+      id={channel.id}
+      name={String(channel.name)}
+      title={`# ${text(channel.name)}`}
+      tabs={["about", "members", "routines"] as const}
+      tab={tab}
+      setTab={setTab}
+      close={props.close}
+    >
+      {error && <p className="error">{error}</p>}
+      {tab === "about" && (
+        <div className="card about">
+          <div className="meta">Channel name</div>
+          <div># {text(channel.name)}</div>
+          <div className="meta">Topic</div>
+          <Topic key={channel.id} topic={(channel.topic as string | null) ?? ""} save={saveTopic} />
+          <div className="meta">Created</div>
+          <div>
+            {new Date(String(channel.createdAt)).toLocaleDateString("en-US", {
+              month: "long",
+              day: "numeric",
+              year: "numeric",
+            })}
+          </div>
+        </div>
+      )}
+      {tab === "members" && (
+        <div className="card">
+          {members.map((m) => {
+            const label =
+              m.userId && m.userId === props.me ? `${text(m.name)} (you)` : text(m.name);
+            return m.botId ? (
+              <button
+                key={m.actorId as string}
+                className="inline-bot member"
+                onClick={() => props.openBot(String(m.botId))}
+              >
+                <Avatar id={String(m.botId)} name={String(m.name)} size={28} /> {label}
+                {m.role === null && <span className="meta">posted, not a member</span>}
+              </button>
+            ) : (
+              <div key={m.actorId as string} className="member">
+                <Avatar id={String(m.actorId)} name={String(m.name)} size={28} plain /> {label}
+                {m.role === "owner" && <span className="meta">owner</span>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {tab === "routines" && (
+        <Routines
+          key={conversationId}
+          ws={ws}
+          query={{ conversationId }}
+          bots={props.bots}
+          create={{ conversationId, botId: props.defaultBotId }}
+          side={(r) => {
+            const bot = props.bots.find((b) => b.id === r.botId);
+            return (
+              <>
+                <Avatar id={String(r.botId)} name={String(bot?.name ?? "?")} size={16} />{" "}
+                {text(bot?.name)}
+              </>
+            );
+          }}
+        />
+      )}
+    </PanelChrome>
+  );
+};
+
+/** Click to edit; Enter or blur saves (when changed), Escape cancels. */
+const Topic = (props: { topic: string; save: (topic: string) => Promise<void> }) => {
+  const [draft, setDraft] = useState<string | null>(null);
+  // Escape unmounts the focused input, which would blur and save without this.
+  const cancelled = useRef(false);
+  if (draft === null)
+    return (
+      <button
+        className={`topic ${props.topic ? "" : "meta"}`}
+        onClick={() => {
+          cancelled.current = false;
+          setDraft(props.topic);
+        }}
+      >
+        {props.topic || "Add a topic"}
+      </button>
+    );
+  const commit = () => {
+    if (cancelled.current) return;
+    cancelled.current = true;
+    if (draft !== props.topic) void props.save(draft);
+    setDraft(null);
+  };
+  return (
+    <input
+      autoFocus
+      maxLength={250}
+      value={draft}
+      aria-label="Topic"
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" && !e.nativeEvent.isComposing) commit();
+        if (e.key === "Escape") {
+          cancelled.current = true;
+          setDraft(null);
+        }
+      }}
+    />
+  );
+};
+
+type Menu = { routine: Row; x: number; y: number };
+type Editing = { routine: Row | null };
+
+/**
+ * Routines matching `query`: name, schedule line, `side` (the Bot or the Channel), an on / off switch and a menu
+ * ("…" or right-click: Pause / Resume, Edit, Run now, Delete). With `create`, a "New routine" button. Loaded on mount
+ * and after its own commands (no change-row refetch).
+ */
+const Routines = (props: {
+  ws: string;
+  query: Record<string, string>;
+  bots: Row[];
+  side: (r: Row) => ReactNode;
+  create?: { conversationId: string; botId: string };
+}) => {
+  const { ws } = props;
+  const [routines, setRoutines] = useState<Row[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [menu, setMenu] = useState<Menu | null>(null);
+  const [editing, setEditing] = useState<Editing | null>(null);
+  const query = JSON.stringify(props.query);
+
+  const load = useCallback(async () => {
+    const res = await window.hive.api.get(
+      inWorkspace("routines", ws, JSON.parse(query) as Record<string, string>),
+    );
+    if (!res.ok) return setError(failure(res));
+    setRoutines(res.value.routines as Row[]);
+  }, [ws, query]);
+  useEffect(() => void load(), [load]);
+  useEffect(() => {
+    if (!menu) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenu(null);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [menu]);
+
+  const act = async (cmd: UiCommand["command"]) => {
+    setMenu(null);
+    const res = await command(ws, cmd);
+    setError(res.ok ? null : failure(res));
+    void load();
+  };
+  const openMenu = (routine: Row, x: number, y: number) =>
+    // Kept inside the window (the menu is about 200 x 190 px).
+    setMenu({
+      routine,
+      x: Math.min(x, window.innerWidth - 216),
+      y: Math.min(y, window.innerHeight - 206),
+    });
+
+  if (editing)
+    return (
+      <RoutineEditor
+        ws={ws}
+        bots={props.bots}
+        routine={editing.routine}
+        create={props.create}
+        done={(message) => {
+          setEditing(null);
+          setError(message);
+          void load();
+        }}
+      />
+    );
+  return (
+    <>
+      {error && <p className="error">{error}</p>}
+      <div className="card">
+        {routines.length === 0 && <p className="meta">No routines.</p>}
+        {routines.map((r) => (
+          <div
+            key={r.id}
+            className="routine"
+            onContextMenu={(e) => {
+              e.preventDefault();
+              openMenu(r, e.clientX, e.clientY);
+            }}
+          >
+            <div className="routine-text">
+              <div className="ellipsis">{text(r.name)}</div>
+              <div className="meta ellipsis">{scheduleLine(r.schedule as Schedule)}</div>
+              <div className="meta ellipsis routine-side">{props.side(r)}</div>
+            </div>
+            <label className="switch">
+              <input
+                type="checkbox"
+                checked={Boolean(r.enabled)}
+                aria-label={`${text(r.name)} enabled`}
+                onChange={() =>
+                  void act({
+                    type: r.enabled ? "routine.pause" : "routine.resume",
+                    routineId: r.id,
+                  })
+                }
+              />
+              <span />
+            </label>
+            <button
+              className="icon"
+              aria-label={`${text(r.name)} actions`}
+              aria-haspopup="menu"
+              onClick={(e) => {
+                const box = e.currentTarget.getBoundingClientRect();
+                openMenu(r, box.left, box.bottom + 4);
+              }}
+            >
+              <Icon name="more" />
+            </button>
+          </div>
+        ))}
+      </div>
+      {props.create && (
+        <button className="new-routine" onClick={() => setEditing({ routine: null })}>
+          New routine
+        </button>
+      )}
+      {menu && (
+        <>
+          <div className="backdrop" onClick={() => setMenu(null)} />
+          <div className="menu" role="menu" style={{ left: menu.x, top: menu.y }}>
+            <button
+              role="menuitem"
+              onClick={() =>
+                void act({
+                  type: menu.routine.enabled ? "routine.pause" : "routine.resume",
+                  routineId: menu.routine.id,
+                })
+              }
+            >
+              <Icon name={menu.routine.enabled ? "pause" : "play"} />
+              {menu.routine.enabled ? "Pause" : "Resume"}
+            </button>
+            <button
+              role="menuitem"
+              onClick={() => {
+                setEditing({ routine: menu.routine });
+                setMenu(null);
+              }}
+            >
+              <Icon name="edit" /> Edit
+            </button>
+            <button
+              role="menuitem"
+              onClick={() => void act({ type: "routine.run", routineId: menu.routine.id })}
+            >
+              <Icon name="send" /> Run now
+            </button>
+            <hr />
+            <button
+              role="menuitem"
+              className="danger"
+              onClick={() => void act({ type: "routine.delete", routineId: menu.routine.id })}
+            >
+              <Icon name="trash" /> Delete
+            </button>
+          </div>
+        </>
+      )}
+    </>
+  );
+};
+
+/** `datetime-local` value (this machine's zone) for an ISO instant. */
+const localInput = (iso: string) => {
+  const d = new Date(iso);
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+};
+
+/**
+ * Create (`routine.create` into the Channel's conversation) or edit (`routine.update` with `expectedRevision`, only
+ * the changed fields, so a rename keeps the schedule revision). The Bot of an existing routine cannot change.
+ */
+const RoutineEditor = (props: {
+  ws: string;
+  bots: Row[];
+  routine: Row | null;
+  create?: { conversationId: string; botId: string };
+  done: (message: string | null) => void;
+}) => {
+  const r = props.routine;
+  const old = r?.schedule as Schedule | undefined;
+  const [name, setName] = useState(r ? String(r.name) : "");
+  const [botId, setBotId] = useState(
+    r ? String(r.botId) : (props.create?.botId ?? props.bots[0]?.id ?? ""),
+  );
+  const [kind, setKind] = useState<Schedule["kind"]>(old?.kind ?? "cron");
+  const [expr, setExpr] = useState(old?.kind === "cron" ? old.expr : "0 9 * * 1-5");
+  const [timezone, setTimezone] = useState(
+    old?.kind === "cron" ? old.timezone : Intl.DateTimeFormat().resolvedOptions().timeZone,
+  );
+  const [at, setAt] = useState(old?.kind === "once" ? localInput(old.at) : "");
+  const [inputText, setInputText] = useState(r ? String(r.inputText) : "");
+  const [misfire, setMisfire] = useState(r ? String(r.misfire) : "coalesce");
+  const [error, setError] = useState<string | null>(null);
+
+  const save = async () => {
+    const schedule: Schedule =
+      kind === "cron"
+        ? { kind, expr: expr.trim(), timezone }
+        : { kind, at: new Date(at).toISOString() };
+    const misfirePolicy = misfire as "skip" | "coalesce";
+    const res = r
+      ? await command(props.ws, {
+          type: "routine.update",
+          routineId: r.id,
+          expectedRevision: Number(r.revision),
+          ...(name !== r.name ? { name } : {}),
+          ...(JSON.stringify(schedule) !== JSON.stringify(old) ? { schedule } : {}),
+          ...(inputText !== r.inputText ? { inputText } : {}),
+          ...(misfire !== r.misfire ? { misfire: misfirePolicy } : {}),
+        })
+      : await command(props.ws, {
+          type: "routine.create",
+          botId,
+          name,
+          schedule,
+          inputText,
+          misfire: misfirePolicy,
+          conversationId: props.create?.conversationId,
+        });
+    if (res.ok) return props.done(null);
+    if (res.error.code === "REVISION_CONFLICT")
+      return props.done("The routine changed elsewhere; reloaded. Edit it again.");
+    setError(failure(res));
+  };
+
+  return (
+    <form
+      className="card editor"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void save();
+      }}
+    >
+      <h4>{r ? "Edit routine" : "New routine"}</h4>
+      <label>
+        Name
+        <input value={name} onChange={(e) => setName(e.target.value)} required />
+      </label>
+      <label>
+        Bot
+        <select value={botId} disabled={Boolean(r)} onChange={(e) => setBotId(e.target.value)}>
+          {props.bots.map((b) => (
+            <option key={b.id} value={b.id}>
+              {text(b.name)}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Schedule
+        <select value={kind} onChange={(e) => setKind(e.target.value as Schedule["kind"])}>
+          <option value="cron">Repeat (cron)</option>
+          <option value="once">Once</option>
+        </select>
+      </label>
+      {kind === "cron" ? (
+        <>
+          <label>
+            Cron
+            <input
+              className="mono"
+              value={expr}
+              onChange={(e) => setExpr(e.target.value)}
+              placeholder="m h dom mon dow"
+              required
+            />
+          </label>
+          <p className="meta">{scheduleLine({ kind, expr, timezone })}</p>
+          <label>
+            Timezone
+            <input value={timezone} onChange={(e) => setTimezone(e.target.value)} required />
+          </label>
+        </>
+      ) : (
+        <label>
+          At
+          <input
+            type="datetime-local"
+            value={at}
+            onChange={(e) => setAt(e.target.value)}
+            required
+          />
+        </label>
+      )}
+      <label>
+        Input
+        <textarea
+          rows={3}
+          value={inputText}
+          onChange={(e) => setInputText(e.target.value)}
+          required
+        />
+      </label>
+      <label>
+        Misfire
+        <select value={misfire} onChange={(e) => setMisfire(e.target.value)}>
+          <option value="coalesce">coalesce (run the latest missed)</option>
+          <option value="skip">skip (drop if more than 5 min late)</option>
+        </select>
+      </label>
+      {error && <p className="error">{error}</p>}
+      <div className="row">
+        <button type="submit" disabled={!botId}>
+          {r ? "Save" : "Create"}
+        </button>
+        <button type="button" onClick={() => props.done(null)}>
+          Cancel
+        </button>
+      </div>
+    </form>
   );
 };
 

@@ -176,6 +176,8 @@ export const channels = sqliteTable(
     id: text("id").primaryKey(),
     workspaceId: workspaceId(),
     name: text("name").notNull(),
+    /** Free text shown under the channel name; null when unset. At most 250 chars (validated by ChannelUpdate). */
+    topic: text("topic"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },

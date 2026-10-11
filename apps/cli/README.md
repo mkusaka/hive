@@ -17,6 +17,7 @@ hive device register --name <n> --os <os> --agent-version <v>
                      [--access-client-id <id> --access-client-secret-file <path|->]
                                                        # prints the token once, stores it for `executor run`
 hive channel create --name <name>
+hive channel update <channel-id> --topic <text>     # members only; "" clears it
 hive bot create --name <name> [--instructions <text> | --instructions-file <path|->]
                 [--tools <Tool=allow|ask|deny,...>] [--effects <slack.post|github.comment=allow|ask|deny,...>]
                 [--cwd-mode run_scratch|environment] [placement flags]
@@ -69,6 +70,7 @@ hive routine create --bot <bot-id> --name <name> --cron "0 9 * * 1-5" --input <t
 hive routine list
 hive routine run <routine-id>                      # manual run: one Job now
 hive routine pause <routine-id> | hive routine resume <routine-id>
+hive routine delete <routine-id>                   # the Routine and its occurrences; its Jobs stay
 ```
 
 `<task>` is a key (`APP-1`) or an id. The CLI lists the Workspace's Tasks to resolve it and sends the Task's

@@ -9,6 +9,7 @@ import {
   BotCreate,
   BotUpdate,
   ChannelCreate,
+  ChannelUpdate,
   commandEnvelope,
   DeviceEnvironmentRegister,
   DeviceRegister,
@@ -27,6 +28,7 @@ import {
   type PlacementPolicy,
   ProjectCreate,
   RoutineCreate,
+  RoutineDelete,
   RoutinePause,
   RoutineResume,
   RoutineRun,
@@ -83,6 +85,7 @@ export const CommandEnvelope = commandEnvelope(
     DeviceRevoke,
     DeviceEnvironmentRegister,
     ChannelCreate,
+    ChannelUpdate,
     BotCreate,
     BotUpdate,
     AgentSend,
@@ -109,6 +112,7 @@ export const CommandEnvelope = commandEnvelope(
     RoutinePause,
     RoutineResume,
     RoutineRun,
+    RoutineDelete,
     ApprovalResolve,
     MemoryWrite,
     MemoryDelete,
@@ -341,6 +345,41 @@ const channelCreate: Handler<v.InferOutput<typeof ChannelCreate>> = async (db, u
     ],
   );
   return uniqueName(db, "channels", workspaceId, command.name, run);
+};
+
+/** Sets or clears (empty string) the topic. Only a member of the Channel may; a missing Channel is a 404. */
+const channelUpdate: Handler<v.InferOutput<typeof ChannelUpdate>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const row = await db
+    .prepare(
+      `SELECT EXISTS (SELECT 1 FROM channel_members m JOIN actors a
+                ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+             WHERE m.workspace_id = ch.workspace_id AND m.channel_id = ch.id AND a.user_id = ?) AS member
+         FROM channels ch WHERE ch.workspace_id = ? AND ch.id = ?`,
+    )
+    .bind(user.userId, workspaceId, command.channelId)
+    .first<{ member: number }>();
+  if (!row) throw new HttpError("NOT_FOUND", "channel not found");
+  if (!row.member) throw new HttpError("FORBIDDEN", "not a member of this channel");
+  const topic = command.topic.trim() || null;
+  return receipt(
+    db,
+    user.userId,
+    env,
+    [
+      db
+        .prepare("UPDATE channels SET topic = ?, updated_at = ? WHERE workspace_id = ? AND id = ?")
+        .bind(topic, new Date().toISOString(), workspaceId, command.channelId),
+    ],
+    { operationId: env.operationId, status: "accepted", channelId: command.channelId, topic },
+    [
+      {
+        entityKind: "channel",
+        entityId: command.channelId,
+        scope: `channel:${command.channelId}`,
+      },
+    ],
+  );
 };
 
 const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env) => {
@@ -1943,6 +1982,27 @@ const routineRun: Handler<v.InferOutput<typeof RoutineRun>> = async (db, user, e
   );
 };
 
+/** Deletes the Routine and its occurrences in one batch; Jobs it created stay (they do not reference the Routine). */
+const routineDelete: Handler<v.InferOutput<typeof RoutineDelete>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  await loadRoutine(db, workspaceId, command.routineId);
+  return receipt(
+    db,
+    user.userId,
+    env,
+    [
+      db
+        .prepare("DELETE FROM routine_occurrences WHERE workspace_id = ? AND routine_id = ?")
+        .bind(workspaceId, command.routineId),
+      db
+        .prepare("DELETE FROM routines WHERE workspace_id = ? AND id = ?")
+        .bind(workspaceId, command.routineId),
+    ],
+    { operationId: env.operationId, status: "accepted", routineId: command.routineId },
+    [routineChange(workspaceId, command.routineId)],
+  );
+};
+
 // ------------------------------------------------ Approvals (docs/architecture.md §19)
 
 const activeRunStates = "('starting', 'running', 'waiting_approval', 'stopping')";
@@ -2342,6 +2402,7 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "device.register": deviceRegister,
   "device.revoke": deviceRevoke,
   "channel.create": channelCreate,
+  "channel.update": channelUpdate,
   "bot.create": botCreate,
   "bot.update": botUpdate,
   "device.environment.register": deviceEnvironmentRegister,
@@ -2369,6 +2430,7 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "routine.pause": routinePause,
   "routine.resume": routineResume,
   "routine.run": routineRun,
+  "routine.delete": routineDelete,
   "approval.resolve": approvalResolve,
   "memory.write": userMemoryWrite,
   "memory.delete": memoryDelete,

@@ -116,14 +116,14 @@ describe("IPC handlers", () => {
     expect(requests.map((r) => r.path)).toEqual([path, "/v1/commands"]);
   });
 
-  it("posts routine pause / resume / run and rejects other routine commands", async () => {
+  it("posts routine pause / resume / run / delete and rejects invalid routine commands", async () => {
     const { h, requests } = setup();
     const accepted = await Promise.all(
-      ["routine.pause", "routine.resume", "routine.run"].map((type) =>
+      ["routine.pause", "routine.resume", "routine.run", "routine.delete"].map((type) =>
         h.command({ ...envelope, command: { type, routineId: "r-1" } }),
       ),
     );
-    expect(accepted.map((r) => r.ok)).toEqual([true, true, true]);
+    expect(accepted.map((r) => r.ok)).toEqual([true, true, true, true]);
     const rejected = await Promise.all(
       [
         { type: "routine.pause", routineId: "" },
@@ -138,7 +138,20 @@ describe("IPC handlers", () => {
       "routine.pause",
       "routine.resume",
       "routine.run",
+      "routine.delete",
     ]);
+  });
+
+  it("posts channel.update and rejects a topic over 250 chars", async () => {
+    const { h, requests } = setup();
+    const update = (topic: string) =>
+      h.command({ ...envelope, command: { type: "channel.update", channelId: "ch-1", topic } });
+    expect((await update("Daily ops")).ok).toBe(true);
+    expect(await update("x".repeat(251))).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_ARGS" },
+    });
+    expect(requests).toHaveLength(1);
   });
 
   it("posts a valid agent.send envelope", async () => {

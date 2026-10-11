@@ -108,7 +108,7 @@ export const listInbox = async (db: D1Database, wsIds: string[], botId: string) 
 export const listChannels = async (db: D1Database, workspaceId: string, userId: string) => {
   const { results } = await db
     .prepare(
-      `SELECT ch.id, ch.name, c.id AS conversationId, m.role, ch.created_at AS createdAt,
+      `SELECT ch.id, ch.name, ch.topic, c.id AS conversationId, m.role, ch.created_at AS createdAt,
               (SELECT json_object('body', lm.body, 'createdAt', lm.created_at, 'actorId', lm.actor_id)
                  FROM messages lm WHERE lm.workspace_id = c.workspace_id AND lm.conversation_id = c.id
                 ORDER BY lm.seq DESC LIMIT 1) AS lastMessage
@@ -123,6 +123,42 @@ export const listChannels = async (db: D1Database, workspaceId: string, userId: 
     .all<{ lastMessage: string | null }>();
   for (const ch of results) ch.lastMessage = ch.lastMessage && JSON.parse(ch.lastMessage);
   return { channels: results };
+};
+
+/**
+ * The Channel's members (role `owner` / `member`) and the actors that posted in it without being members (role null,
+ * e.g. a Bot replying through its Inbox). Bots carry `botId` and their current name. Callers must be members.
+ */
+export const listChannelMembers = async (
+  db: D1Database,
+  input: { workspaceId: string; userId: string; channelId: string },
+) => {
+  const member = await db
+    .prepare(
+      `SELECT 1 FROM channel_members m
+         JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+        WHERE m.workspace_id = ? AND m.channel_id = ? AND a.user_id = ?`,
+    )
+    .bind(input.workspaceId, input.channelId, input.userId)
+    .first();
+  if (!member) throw notFound("channel");
+  const { results } = await db
+    .prepare(
+      `SELECT a.id AS actorId, a.kind, COALESCE(b.name, a.display_name) AS name, a.user_id AS userId,
+              b.id AS botId, m.role
+         FROM actors a
+         LEFT JOIN channel_members m
+           ON m.workspace_id = a.workspace_id AND m.channel_id = ? AND m.actor_id = a.id
+         LEFT JOIN bots b ON b.workspace_id = a.workspace_id AND b.actor_id = a.id
+        WHERE a.workspace_id = ? AND (m.actor_id IS NOT NULL OR EXISTS (
+                SELECT 1 FROM messages msg JOIN conversations c
+                    ON c.workspace_id = msg.workspace_id AND c.id = msg.conversation_id
+                 WHERE msg.workspace_id = a.workspace_id AND msg.actor_id = a.id AND c.channel_id = ?))
+        ORDER BY m.role IS NULL, a.kind DESC, name LIMIT 500`,
+    )
+    .bind(input.channelId, input.workspaceId, input.channelId)
+    .all();
+  return { members: results };
 };
 
 export const listBots = async (db: D1Database, workspaceId: string) => {
@@ -439,16 +475,22 @@ export const listSubscriptions = async (db: D1Database, workspaceId: string) => 
   return { subscriptions: results };
 };
 
-/** Routines of the Workspace (or of one Bot) with their schedule parsed (max 500). */
-export const listRoutines = async (db: D1Database, workspaceId: string, botId?: string) => {
+/** Routines of the Workspace (or of one Bot / one Conversation) with their schedule parsed (max 500). */
+export const listRoutines = async (
+  db: D1Database,
+  workspaceId: string,
+  botId?: string,
+  conversationId?: string,
+) => {
   const { results } = await db
     .prepare(
       `SELECT id, bot_id AS botId, name, conversation_id AS conversationId, task_id AS taskId, input_text AS inputText,
               schedule, schedule_revision AS scheduleRevision, misfire, next_fire_at AS nextFireAt, enabled, revision,
               created_at AS createdAt, updated_at AS updatedAt
-         FROM routines WHERE workspace_id = ? AND (? IS NULL OR bot_id = ?) ORDER BY created_at, id LIMIT 500`,
+         FROM routines WHERE workspace_id = ? AND (? IS NULL OR bot_id = ?) AND (? IS NULL OR conversation_id = ?)
+        ORDER BY created_at, id LIMIT 500`,
     )
-    .bind(workspaceId, botId ?? null, botId ?? null)
+    .bind(workspaceId, botId ?? null, botId ?? null, conversationId ?? null, conversationId ?? null)
     .all<Record<string, unknown>>();
   for (const r of results) {
     r.schedule = JSON.parse(r.schedule as string);

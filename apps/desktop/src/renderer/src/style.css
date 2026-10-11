@@ -137,9 +137,23 @@ main {
   padding: 12px 8px;
   align-items: center;
 }
+/* The window has no title bar: this strip and the chat header move it; their buttons stay clickable. */
+.side-top,
+.chat-head {
+  -webkit-app-region: drag;
+}
+.side-top button,
+.chat-head button {
+  -webkit-app-region: no-drag;
+}
 .side-top {
   display: flex;
   justify-content: flex-end;
+  min-height: 36px;
+}
+/* The traffic lights (about 70 px wide) cover the top of the 72 px rail: the toggle goes below them. */
+.collapsed .side-top {
+  padding-top: 32px;
 }
 button.icon {
   position: relative;
@@ -264,11 +278,18 @@ button.icon.active {
 }
 .chat-head {
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
   padding: 14px 0 10px;
   border-bottom: 1px solid var(--bg-quaternary);
 }
+button.pill:hover {
+  background: var(--hover);
+}
 .pill {
+  border: 0;
+  color: inherit;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -685,4 +706,143 @@ button.small {
 }
 .row input {
   width: 64px;
+}
+
+/* CSS-only tooltip: `data-tip` above the element after 400 ms (`.tip-below`: under it). */
+[data-tip] {
+  position: relative;
+}
+[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  padding: 4px 8px;
+  border-radius: var(--r-sm);
+  background: #2a2a2a;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.4);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+[data-tip]:hover::after {
+  opacity: 1;
+  transition-delay: 0.4s;
+}
+.tip-below::after {
+  top: calc(100% + 6px);
+  bottom: auto;
+}
+
+/* Routines (both panels): rows, "…" menu, editor */
+.routine-text {
+  min-width: 0;
+}
+.routine-side {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.new-routine {
+  margin-top: 10px;
+  align-self: flex-start;
+  border-radius: 999px;
+  padding: 6px 14px;
+}
+.backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+}
+.menu {
+  position: fixed;
+  z-index: 31;
+  display: flex;
+  flex-direction: column;
+  min-width: 200px;
+  padding: 6px;
+  border: 1px solid var(--bg-tertiary);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.5);
+}
+.menu button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: none;
+  text-align: left;
+}
+.menu hr {
+  width: calc(100% - 16px);
+  margin: 4px 8px;
+  border: 0;
+  border-top: 1px solid var(--bg-tertiary);
+}
+.menu .danger {
+  color: var(--danger);
+}
+.editor {
+  flex-direction: column;
+  padding: 12px 14px;
+}
+.editor h4 {
+  margin: 0;
+}
+.editor label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-2);
+  font-size: 13px;
+}
+.editor label > * {
+  color: var(--text);
+  font-size: 14px;
+}
+.editor .meta {
+  margin: -4px 0 0;
+}
+.editor .row {
+  margin-top: 4px;
+}
+.member {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+}
+
+/* Channel panel: About, user avatars, header topic */
+.about {
+  display: grid;
+  gap: 2px;
+  padding: 12px 14px;
+}
+.about .meta:not(:first-child) {
+  margin-top: 10px;
+}
+button.topic {
+  padding: 0;
+  background: none;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.avatar.plain {
+  border-radius: 50%;
+  background: var(--bg-secondary);
+  color: var(--text);
+}
+.topic-line {
+  max-width: 70%;
+  color: var(--text-3);
+  font-size: 12px;
 }
