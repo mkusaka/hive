@@ -367,6 +367,62 @@ const specs: Record<string, Spec> = {
         }),
       ),
   },
+  "job cancel": {
+    usage: "<job-id>",
+    args: 1,
+    run: async (c) => c.print(await cmd.jobCancel(c.client(), c.envelope(), c.args[0]!)),
+  },
+  "job resolve": {
+    usage: "<job-id> (--retry | --cancel | --mark-failed)",
+    args: 1,
+    options: { retry: flag, cancel: flag, "mark-failed": flag },
+    run: async (c) => {
+      const actions = (["retry", "cancel", "mark-failed"] as const).filter((a) => c.values[a]);
+      if (actions.length !== 1)
+        throw invalid("exactly one of --retry, --cancel, --mark-failed is required");
+      const action = actions[0] === "mark-failed" ? "mark_failed" : actions[0]!;
+      c.print(await cmd.jobResolve(c.client(), c.envelope(), c.args[0]!, action));
+    },
+  },
+  "routine create": {
+    usage:
+      '--bot <bot-id> --name <name> --cron "<m h dom mon dow>" --input <text> [--tz <zone>] [--channel <channel-id>] [--misfire skip|coalesce]',
+    options: { bot: str, name: str, cron: str, input: str, tz: str, channel: str, misfire: str },
+    run: async (c) => {
+      const channel = c.values.channel as string | undefined;
+      c.print(
+        await cmd.routineCreate(c.client(), c.envelope(), {
+          botId: need(c.values, "bot"),
+          name: need(c.values, "name"),
+          cron: need(c.values, "cron"),
+          // Default: this machine's zone.
+          timezone:
+            (c.values.tz as string | undefined) ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
+          inputText: need(c.values, "input"),
+          conversationId:
+            channel && (await cmd.findConversation(c.client(), c.workspace(), channel)),
+          misfire: c.values.misfire as string | undefined,
+        }),
+      );
+    },
+  },
+  "routine list": {
+    usage: "",
+    run: async (c) => c.print(await cmd.listRoutines(c.client(), c.workspace())),
+  },
+  ...Object.fromEntries(
+    (["run", "pause", "resume"] as const).map((action) => [
+      `routine ${action}`,
+      {
+        usage: "<routine-id>",
+        args: 1,
+        run: async (c: Ctx) =>
+          c.print(
+            await cmd.routineAction(c.client(), c.envelope(), `routine.${action}`, c.args[0]!),
+          ),
+      },
+    ]),
+  ),
   "executor run": {
     usage: "[--once] [--provider fake|claude]",
     options: { once: flag, provider: { type: "string", default: "fake" } },

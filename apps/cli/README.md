@@ -36,6 +36,13 @@ hive subscription list
 hive subscription pause <subscription-id>
 hive subscription test <subscription-id> [--limit <n>]   # dry-run over recent events
 hive integration create --kind github|slack [--external-account-id <id>]   # prints the hook path
+hive job cancel <job-id>                           # queued: cancelled now; active: stops at the next lease renewal
+hive job resolve <job-id> (--retry | --cancel | --mark-failed)   # a recovery_required Job
+hive routine create --bot <bot-id> --name <name> --cron "0 9 * * 1-5" --input <text> [--tz <zone>]
+                    [--channel <channel-id>] [--misfire skip|coalesce]
+hive routine list
+hive routine run <routine-id>                      # manual run: one Job now
+hive routine pause <routine-id> | hive routine resume <routine-id>
 ```
 
 `<task>` is a key (`APP-1`) or an id. The CLI lists the Workspace's Tasks to resolve it and sends the Task's
@@ -51,6 +58,9 @@ a fresh UUID per invocation).
 - **`--wait`** polls `GET /v1/operations/:id` until routing created the Job, then watches it. `--notify` creates no
   Job, so `--notify --wait` is invalid. A timeout never cancels the Job. The default timeout is 300 s.
 - **`event emit`** reads JSON from `--data-file` (`-` is stdin); without it `data` is `{}`.
+- **`routine create`** defaults `--tz` to this machine's IANA zone. `--channel` is resolved to the Channel's main
+  Conversation (the Routine's lane and reply target) through `channel list`. `job resolve --retry` is 409 (exit 4)
+  until the old Run's stop is confirmed by its executor.
 - **`subscription create`** sends the file's JSON object as the `subscription.create` command, for example
   `{"botId": "<bot-id>", "eventTypes": ["github.pull_request.*"], "filter": {"op": "eq", "field":
 "data.repositoryId", "value": 42}, "destination": {"conversationId": "<conversation-id>"}, "delivery": {"mode":

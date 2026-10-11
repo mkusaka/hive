@@ -1,7 +1,7 @@
 # @hive/desktop
 
 The Electron desktop app (docs/architecture.md §20.1, §21), Phase 2 UI slice. It talks to the api-worker with
-the credentials file the `hive` CLI writes, shows the Phase 1 state and sends `agent.send` to a Bot.
+the credentials file the `hive` CLI writes, shows the Phase 1 state, sends `agent.send` to a Bot and `job.cancel` for a Job.
 
 ## Run
 
@@ -25,13 +25,13 @@ bun run --cwd apps/desktop build   # out/{main,preload,renderer}
 
 ## Views
 
-| View     | Data                                                                                                |
-| -------- | --------------------------------------------------------------------------------------------------- |
-| Channel  | Channels, the selected channel's latest 50 messages oldest first, Bot picker, composer              |
-| Inbox    | `GET /v1/inbox?botId=` for the picked Bot, with state badges                                        |
-| Activity | `GET /v1/jobs?limit=50` with state badges; selecting a Job shows `GET /v1/jobs/:id`                 |
-| Devices  | Name, OS, last heartbeat, revoked                                                                   |
-| Status   | Workspace, WebSocket state (connected / reconnecting), last sync cursor (tail), unsynced hint count |
+| View     | Data                                                                                                                                                                                     |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Channel  | Channels, the selected channel's latest 50 messages oldest first, Bot picker, composer                                                                                                   |
+| Inbox    | `GET /v1/inbox?botId=` for the picked Bot, with state badges                                                                                                                             |
+| Activity | `GET /v1/jobs?limit=50` with state badges (incl. `waiting_device`, `recovery_required`) and a Cancel button for queued / waiting / active Jobs; selecting a Job shows `GET /v1/jobs/:id` |
+| Devices  | Name, OS, last heartbeat, revoked                                                                                                                                                        |
+| Status   | Workspace, WebSocket state (connected / reconnecting), last sync cursor (tail), unsynced hint count                                                                                      |
 
 The composer sends `agent.send` (`delivery: "wake"`) with a fresh operation id and idempotency key, shows the
 accepted operation, then polls `GET /v1/operations/:id` every 2 s (up to 10 min) until routing created the Job.
@@ -67,12 +67,12 @@ img-src 'self'`. `'unsafe-inline'` styles are for Vite's dev-time `<style>` inje
 
 ## IPC surface (`src/shared/api.ts`)
 
-| `window.hive`      | Channel            | Validation / behavior                                                                       |
-| ------------------ | ------------------ | ------------------------------------------------------------------------------------------- |
-| `api.get(path)`    | `hive:api.get`     | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, no `..` anywhere                    |
-| `api.command(env)` | `hive:api.command` | `commandEnvelope(AgentSend)` from `@hive/contracts`: the UI sends only `agent.send`         |
-| `getConfig()`      | `hive:config`      | `{apiUrl, workspaceId, problem, connection}`; no secrets                                    |
-| `onRealtime(cb)`   | `hive:realtime`    | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}` |
+| `window.hive`      | Channel            | Validation / behavior                                                                                        |
+| ------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `api.get(path)`    | `hive:api.get`     | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, no `..` anywhere                                     |
+| `api.command(env)` | `hive:api.command` | `commandEnvelope(variant [AgentSend, JobCancel])` from `@hive/contracts`: only `agent.send` and `job.cancel` |
+| `getConfig()`      | `hive:config`      | `{apiUrl, workspaceId, problem, connection}`; no secrets                                                     |
+| `onRealtime(cb)`   | `hive:realtime`    | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                  |
 
 `api.*` never rejects: it resolves to `{ok: true, value}` or `{ok: false, error: {code, message, body?}}`, where
 `code` is the `ApiError` code (e.g. `CURSOR_EXPIRED`), `INVALID_ARGS` for rejected arguments, or a CLI client code

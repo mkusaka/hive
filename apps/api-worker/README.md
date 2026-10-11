@@ -11,13 +11,14 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/me`                                                    | Access assertion (user)                | Returns the user principal (CLI login check)                                                   |
 | `POST /v1/commands`                                             | Access assertion (user)                | Command intake (see below)                                                                     |
 | `GET /v1/operations/:id`                                        | Access assertion (user)                | Receipt of the user's command; for `agent.send` also the inbox item, routing status and Job id |
-| `GET /v1/jobs/:id`                                              | Access assertion (user)                | A Job in one of the user's Workspaces                                                          |
+| `GET /v1/jobs/:id`                                              | Access assertion (user)                | A Job in one of the user's Workspaces, with `cancelRequestedAt` and its root `runs`            |
 | `GET /v1/inbox?botId=`                                          | Access assertion (user)                | The Bot's inbox items (first 100, no cursor yet)                                               |
 | `GET /v1/channels?workspaceId=`                                 | Access assertion (user)                | Channels the user is a member of, with the main `conversationId` (max 500)                     |
 | `GET /v1/channels/:id/messages`                                 | Access assertion (user)                | Newest-first messages of a member channel (limit 1..200, default 50; 404 if not a member)      |
 | `GET /v1/bots?workspaceId=`                                     | Access assertion (user)                | Bots of the Workspace (max 500)                                                                |
 | `GET /v1/devices?workspaceId=`                                  | Access assertion (user)                | Devices of the Workspace, no credentials (max 500)                                             |
-| `GET /v1/jobs?limit=`                                           | Access assertion (user)                | Newest-first Jobs (limit 1..200, default 50)                                                   |
+| `GET /v1/jobs?limit=&state=`                                    | Access assertion (user)                | Newest-first Jobs (limit 1..200, default 50), optionally of one state                          |
+| `GET /v1/routines?workspaceId=`                                 | Access assertion (user)                | Routines of the Workspace with their schedule (max 500); see Routines below                    |
 | `GET /v1/projects?workspaceId=`                                 | Access assertion (user)                | Projects of the Workspace (max 500)                                                            |
 | `GET /v1/tasks?workspaceId=&projectKey=&status=`                | Access assertion (user)                | Tasks with computed `display` and `prerequisites` (max 500); see Work below                    |
 | `GET /v1/tasks/:id`                                             | Access assertion (user)                | A Task with prerequisites, dependents, Results and Jobs                                        |
@@ -25,13 +26,13 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/sync/changes?cursor=`                                  | Access assertion (user)                | Permitted changes after the cursor (limit 1..500, default 100); see Sync below                 |
 | `GET /v1/realtime?workspaceId=`                                 | Access assertion, or device Bearer     | WebSocket upgrade to the Workspace's Realtime DO; see Realtime below                           |
 | `GET /v1/executor/me`                                           | `Authorization: Bearer <device-token>` | Returns the device principal                                                                   |
-| `POST /v1/executor/pump`                                        | `Authorization: Bearer <device-token>` | Runs the outbox pump once; returns `{processed, dead}`                                         |
+| `POST /v1/executor/pump`                                        | `Authorization: Bearer <device-token>` | Runs the outbox pump and time-driven work once; returns counts (see Outbox pump)               |
 | `POST /v1/executor/commands`                                    | `Authorization: Bearer <device-token>` | Executor command intake (see below)                                                            |
-| `POST /v1/executor/heartbeat`                                   | `Authorization: Bearer <device-token>` | Sets `devices.last_heartbeat_at` (plain update, no receipt)                                    |
+| `POST /v1/executor/heartbeat`                                   | `Authorization: Bearer <device-token>` | Sets `devices.last_heartbeat_at` and requeues its `waiting_device` Jobs (no receipt)           |
 | `GET /v1/executor/jobs?state=queued&limit=`                     | `Authorization: Bearer <device-token>` | Queued Jobs in the device's Workspace it is eligible for (limit 1..100, default 50)            |
 | `GET /v1/executor/runs/:id`                                     | `Authorization: Bearer <device-token>` | The device's own Run: state, generation, `active` (startup reconcile)                          |
 | `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=` | `Authorization: Bearer <device-token>` | Run context for the adapter's prompt (see Executor commands)                                   |
-| `POST /v1/executor/observations`                                | `Authorization: Bearer <device-token>` | Runtime observations; stores `runtime.run.started`'s provider session id                       |
+| `POST /v1/executor/observations`                                | `Authorization: Bearer <device-token>` | Runtime observations: `runtime.run.started`, `runtime.run.stopped`                             |
 
 - **User auth.** `Cf-Access-Jwt-Assertion` is verified with `jose` against
   `https://<ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs` (issuer `https://<ACCESS_TEAM_DOMAIN>`, audience
@@ -43,7 +44,8 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
   `withOperationReceipt`, so a replay with the same key returns the stored response and a different payload under
   the same key is 409 `IDEMPOTENCY_CONFLICT`.
 - **Command types:** `workspace.create`, `device.register`, `device.revoke`, `channel.create`, `bot.create`,
-  `agent.send`, `event.emit`, the Work commands and the Subscription / integration commands below.
+  `agent.send`, `event.emit`, the Work commands, the Subscription / integration commands, the Routine commands
+  and `job.cancel` / `job.resolve` below.
 - **Actors.** A user's `actors` row is created by `workspace.create` together with the membership (the only path
   that creates a membership today), unique per `(workspace_id, user_id)`. Messages and channel membership use it.
 - **`channel.create`** creates the channel, its main conversation and an `owner` channel membership for the caller.
@@ -75,12 +77,14 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
   Returns `{runId, executionId, executionGeneration, leaseExpiresAt, job: {id, botId, inboxItemId, placement}}`.
   Failures: `stale_revision` / `already_claimed` → 409 `REVISION_CONFLICT`, `resource_busy` → 409 `RESOURCE_BUSY`;
   the error body carries `reason`. Job state is checked by the CAS, not before it, so a replay of a successful claim
-  returns the stored response.
+  returns the stored response. A `waiting_device` Job is claimable like a `queued` one (the claiming device is
+  evidently online).
 - **Eligibility.** A non-empty `allowedDeviceIds` is always intersected, whatever the `mode` (§10.2: safety
   constraints are intersected); an empty list means any device of the Workspace. `GET /v1/executor/jobs` applies
   the same filter in code. Revoked devices are already rejected by device auth.
 - **`run.lease.renew {runId, executionGeneration}`.** Fenced by run + device + generation (`renewLease`); a stale
-  fence is 409 `STALE_GENERATION`. No receipt: renewing twice is harmless.
+  fence is 409 `STALE_GENERATION`. No receipt: renewing twice is harmless. Returns `{leaseExpiresAt,
+cancelRequested}`; `cancelRequested` is true once a user sent `job.cancel` for the Job.
 - **`run.result.submit {runId, executionGeneration, state, summary ≤ 8 KiB, error?}`.** `finishRun` stores the
   summary / error on the Run and, in the same batch, sets the Job's trigger inbox item (`jobs.trigger_key =
 inbox:<id>`) to `processed` (succeeded) or `failed`, plus the `run.finished` outbox row. A stale fence is 409
@@ -88,7 +92,9 @@ inbox:<id>`) to `processed` (succeeded) or `failed`, plus the `run.finished` out
 text}` inserts a message from the Bot's actor (`client_message_id = run:<runId>`) plus its `change_log` row
   (`channel:<id>`) in the same batch. The reply must go to the trigger inbox item's Conversation (403 otherwise),
   so a Task Job without an item cannot reply. `reply` is not part of the receipt digest: a replay with the same
-  key and a different reply is accepted as a replay and inserts nothing.
+  key and a different reply is accepted as a replay and inserts nothing. A `failed` result for a Job with a cancel
+  request finishes `cancelled`: Run and Job `cancelled`, Execution `interrupted`, inbox item `failed`, no Task
+  Result.
 
 Executor reads and observations, outside the command envelope:
 
@@ -100,9 +106,60 @@ Executor reads and observations, outside the command envelope:
   A batch Job (`jobs.inbox_batch_id`) has `inboxItem: null` and `batch: {id, items: [{id, body}]}` (oldest
   first); its `conversation` is the batch lane's. `run.result.submit` then settles every batch member and may
   reply in that Conversation.
-- **`POST /v1/executor/observations {runId, executionGeneration, kind, payload}`.** Only `runtime.run.started` is
-  stored: `payload.providerSessionId` goes to `runs.provider_session_id` with the same fence (409 when stale, 422
-  when missing). Repeating it is harmless. Any other `kind` returns 202 and is dropped.
+- **`POST /v1/executor/observations {runId, executionGeneration, kind, payload}`.** `runtime.run.started`:
+  `payload.providerSessionId` goes to `runs.provider_session_id`, `started_at` is set once and a `starting` Run
+  becomes `running`, with the same fence (409 when stale, 422 when missing). `runtime.run.stopped` with
+  `payload.confirmed: true` (422 otherwise) confirms that the agent of an `unknown` Run is gone: the Run and its
+  Execution become `interrupted` and its reservations are released, in one guarded batch (`confirmRunStopped`). It
+  is fenced by run + device + generation, 200 again for an already terminal Run, 404 for another device's Run and
+  409 `reason: "not_unknown"` for a Run that is still active. Any other `kind` returns 202 and is dropped.
+
+## Recovery
+
+docs/architecture.md §9.1, §9.3, §10.4. Lease expiry is not proof of a stop, so nothing is re-run automatically.
+
+- **Lease expiry** (pump, `expireLeases`): an active Run whose lease expired becomes `unknown` and its `active` Job
+  `recovery_required`, one guarded batch per Run. `result_error` is `lease_expired_before_start` when no
+  `runtime.run.started` arrived (AT-14, "unknown after launch intent") and `lease_expired` otherwise (AT-13). The
+  reservations stay, so the Bot's next Job is `resource_busy` until the stop is confirmed. The old executor's renew
+  / result / context calls are 409 `STALE_GENERATION` from then on (AT-15).
+- **`job.resolve {jobId, action: retry | cancel | mark_failed}`** (user) only for a `recovery_required` Job (409
+  `reason: "job_<state>"` otherwise). `retry` needs every root Run of the Job terminal, i.e. the `unknown` Run's
+  stop confirmed by `runtime.run.stopped`; until then 409 `RESOURCE_BUSY` `reason: "unconfirmed_stop"`. It queues
+  the Job again (revision + 1, cancel request cleared); the next claim, by any eligible device, gets generation + 1
+  (AT-12). `cancel` → `cancelled`, `mark_failed` → `failed`; the `unknown` Run keeps its reservations until its
+  stop is confirmed.
+- **`job.cancel {jobId}`** (user): a `queued` / `waiting_device` Job becomes `cancelled` at once; an `active` Job
+  gets `cancel_requested_at` and stays `active` until the executor sees `cancelRequested` on renewal, stops the agent
+  and submits `failed` (finished as `cancelled`, see `run.result.submit`). Other states are 409 (a
+  `recovery_required` Job goes through `job.resolve`). Both commands are revision CASes with a receipt.
+- **`waiting_device`** (pump, `parkOfflineJobs`): a `queued` Job whose non-empty `allowedDeviceIds` are all offline
+  (no heartbeat within 45 s = 3 × 15 s, or revoked) becomes `waiting_device` (AT-30). A heartbeat of one of those
+  devices returns it to `queued` (`resumeWaitingJobs`, one batch with the change rows). Both bump the revision, so
+  the executor claims with the revision it just listed. A Job with an empty `allowedDeviceIds` (any device) is never
+  parked.
+
+## Routines
+
+docs/architecture.md §17.2. A Routine (`routines`) names a Bot, input text, an optional Conversation (lane and reply
+target) and Task, a schedule and a misfire policy. It creates Inbox items and Jobs; it never calls a model.
+
+- **Schedule.** `{kind: "cron", expr, timezone}` (5 fields, numbers / `*` / lists / ranges / steps, an IANA zone;
+  `@hive/contracts` `cron.ts`) or `{kind: "once", at}`. `next_fire_at` is the next UTC occurrence. A local time in a
+  DST gap is skipped; a repeated local time fires once.
+- **Tick** (pump, `fireDueRoutines`): every enabled Routine with `next_fire_at <= now` gets, in one guarded batch,
+  its occurrences (`routine_occurrences`, UNIQUE (routine, schedule_revision, scheduled_at)), each with a
+  `routine.fired` Event (source `routine`, never routed), an Inbox item (purpose `routine`, lane = Conversation or
+  `routine:<id>`) and a queued Job (`trigger_key = inbox:<item>`, like every Inbox-triggered Job, so the run context
+  and result settle the item; the body is the input text), and `next_fire_at` advanced by a CAS on
+  (schedule_revision, next_fire_at). A duplicate tick loses the CAS or the UNIQUE and creates nothing (AT-31).
+- **Misfire.** `coalesce` (default) runs only the latest due occurrence; `skip` runs those at most 5 minutes late.
+  The others are recorded `skipped` (the latest 50). A fired `once` has no next occurrence.
+- **Commands** (receipts as usual): `routine.create {botId, name, schedule, inputText, conversationId?, taskId?,
+misfire?}` (Conversation membership as for Subscriptions), `routine.update {routineId, expectedRevision, name?,
+schedule?, inputText?, misfire?}` (revision CAS; a new schedule bumps `schedule_revision` and restarts from now),
+  `routine.pause`, `routine.resume` (restarts from now, no catch-up) and `routine.run` (manual: an occurrence at now
+  through the same statements; the schedule is not advanced).
 
 ## Work
 
@@ -246,7 +303,9 @@ WebSocket Hibernation API. It holds connections only, never state (ADR-04); ever
 - `agent.message.sent`: one batch writes the consumer receipt, an `event_deliveries` row, links the existing
   inbox item to it and, for `wake`, inserts a `queued` Job with trigger key `inbox:<inboxItemId>`.
 - Any other event: Subscription routing (see Subscriptions above); no match writes only the consumer receipt.
-- Then due Inbox batches are sealed into one Job each; the response is `{processed, dead, sealed}`.
+- Then due Inbox batches are sealed into one Job each, due Routines fire, expired leases are recovered and Jobs of
+  offline devices are parked (see Recovery and Routines). The response is `{processed, dead, sealed, routineJobs,
+expired, parked}`; the last two count Workspaces.
 - Routing twice is a no-op (consumer receipt PK; UNIQUE trigger key as backstop). A failed row keeps its lease
   and is retried when it expires; after 5 attempts it is marked `dead`. Topics without a consumer yet
   (`run.finished`) are marked `sent`.
@@ -265,8 +324,7 @@ It runs from the `scheduled()` cron trigger (every minute) and from `POST /v1/ex
 - **Inbox `handled`.** The design's terminal inbox state `handled` (§7.1) is stored as the schema's `processed`;
   changing the CHECK values makes drizzle-kit rebuild `inbox_items`, which is left for the inbox state work.
 - **Executor.** No process supervisor (the fake adapter runs in-process), no R2 upload of transcripts or
-  artifacts, lease expiry is not recovered automatically (an expired `active` Job stays `active`), and there is no
-  scheduler / offer: executors poll `GET /v1/executor/jobs`. A page of that list is filtered after `LIMIT`, so it
+  artifacts, and there is no scheduler / offer or notification: executors poll `GET /v1/executor/jobs`. A page of that list is filtered after `LIMIT`, so it
   may hold fewer than `limit` eligible Jobs.
 - **Sync / realtime.** No scope revocation: no command removes a member, so nothing bumps `auth_epoch` or closes
   sockets whose scopes shrank (§12.4); add it with the member commands. Socket scopes are computed once at
@@ -284,6 +342,15 @@ It runs from the `scheduled()` cron trigger (every minute) and from `POST /v1/ex
   `destination.projectId / taskId` are stored only (Jobs carry no Task). `subscription.test` sees every event of
   the Workspace, including echoes that never route. No `append` mode. `data.keyword` is in the filter field list
   but no normalizer fills it yet, so a filter on it never matches.
+- **Recovery.** Every recovery is manual: `placement.recovery: "safe_auto"` is stored but treated as `manual`.
+  Expired leases are swept by the pump, so detection lags up to a minute plus the 90 s lease. A cancelled `queued`
+  Job leaves its trigger inbox item `pending`. A cancel request on an `active` Job whose lease then expires still
+  goes `recovery_required`. Parking applies only to Jobs that name devices: Jobs with an empty `allowedDeviceIds` are never parked, even with no device online.
+- **Routines.** No `bounded_catch_up`, concurrency, retry or approval settings; a tick enumerates at most 1440 missed
+  occurrences and records the latest 50 as `skipped` (a longer outage restarts from now). Bots cannot manage
+  Routines (user principal only); `routine.update` cannot change the Bot, Conversation or Task. A Task Routine's
+  Job carries the Task but does not move it to `in_progress` or check readiness like `job.start`. No sync change
+  row when only `next_fire_at` advances.
 - **Bot channel membership.** `agent.send` does not require the recipient Bot to be a member of the channel;
   `bot.create` adds no membership.
 

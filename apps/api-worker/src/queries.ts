@@ -39,18 +39,28 @@ export const getOperation = async (db: D1Database, userId: string, wsIds: string
   return { ...base, routingStatus: item.deliveryId ? "routed" : "pending", inboxItem, jobId };
 };
 
+/** The Job with its root Runs (oldest first): recovery needs every attempt's state and device (§22.2). */
 export const getJob = async (db: D1Database, wsIds: string[], id: string) => {
   if (wsIds.length === 0) throw notFound("job");
   const job = await db
     .prepare(
       `SELECT id, workspace_id AS workspaceId, bot_id AS botId, task_id AS taskId, state, revision,
-              trigger_key AS triggerKey, placement, created_at AS createdAt, updated_at AS updatedAt
+              trigger_key AS triggerKey, placement, cancel_requested_at AS cancelRequestedAt,
+              created_at AS createdAt, updated_at AS updatedAt
          FROM jobs WHERE id = ? AND workspace_id IN (${placeholders(wsIds)})`,
     )
     .bind(id, ...wsIds)
-    .first<{ placement: string }>();
+    .first<{ placement: string; workspaceId: string }>();
   if (!job) throw notFound("job");
-  return { ...job, placement: JSON.parse(job.placement) as unknown };
+  const { results: runs } = await db
+    .prepare(
+      `SELECT id, state, execution_generation AS generation, lease_expires_at AS leaseExpiresAt,
+              device_id AS deviceId, started_at AS startedAt, result_error AS error
+         FROM runs WHERE workspace_id = ? AND job_id = ? AND kind = 'root' ORDER BY execution_generation`,
+    )
+    .bind(job.workspaceId, id)
+    .all();
+  return { ...job, placement: JSON.parse(job.placement) as unknown, runs };
 };
 
 // ponytail: first 100 items, no cursor yet; add `limit / cursor` (§22.2) with the CLI.
@@ -111,15 +121,35 @@ export const listDevices = async (db: D1Database, workspaceId: string) => {
   return { devices: results };
 };
 
-/** Newest first. */
-export const listJobs = async (db: D1Database, workspaceId: string, limit: number) => {
+const jobStates = [
+  "queued",
+  "waiting_device",
+  "waiting_input",
+  "active",
+  "recovery_required",
+  "succeeded",
+  "failed",
+  "cancelled",
+];
+
+/** Newest first, optionally one `state`. */
+export const listJobs = async (
+  db: D1Database,
+  workspaceId: string,
+  limit: number,
+  state?: string,
+) => {
+  if (state !== undefined && !jobStates.includes(state)) {
+    throw new HttpError("INVALID_INPUT", `state must be one of ${jobStates.join(", ")}`);
+  }
   const { results } = await db
     .prepare(
       `SELECT id, bot_id AS botId, task_id AS taskId, state, revision, trigger_key AS triggerKey,
-              created_at AS createdAt, updated_at AS updatedAt
-         FROM jobs WHERE workspace_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`,
+              cancel_requested_at AS cancelRequestedAt, created_at AS createdAt, updated_at AS updatedAt
+         FROM jobs WHERE workspace_id = ? AND (? IS NULL OR state = ?)
+        ORDER BY created_at DESC, id DESC LIMIT ?`,
     )
-    .bind(workspaceId, limit)
+    .bind(workspaceId, state ?? null, state ?? null, limit)
     .all();
   return { jobs: results };
 };
@@ -306,4 +336,22 @@ export const listSubscriptions = async (db: D1Database, workspaceId: string) => 
     s.enabled = s.enabled === 1;
   }
   return { subscriptions: results };
+};
+
+/** Routines of the Workspace with their schedule parsed (max 500). */
+export const listRoutines = async (db: D1Database, workspaceId: string) => {
+  const { results } = await db
+    .prepare(
+      `SELECT id, bot_id AS botId, name, conversation_id AS conversationId, task_id AS taskId, input_text AS inputText,
+              schedule, schedule_revision AS scheduleRevision, misfire, next_fire_at AS nextFireAt, enabled, revision,
+              created_at AS createdAt, updated_at AS updatedAt
+         FROM routines WHERE workspace_id = ? ORDER BY created_at, id LIMIT 500`,
+    )
+    .bind(workspaceId)
+    .all<Record<string, unknown>>();
+  for (const r of results) {
+    r.schedule = JSON.parse(r.schedule as string);
+    r.enabled = r.enabled === 1;
+  }
+  return { routines: results };
 };

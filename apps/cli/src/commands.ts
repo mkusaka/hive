@@ -147,6 +147,55 @@ export const integrationCreate = (
   input: { kind: string; externalAccountId?: string },
 ) => c.command(e, { type: "integration.create", ...input });
 
+// ------------------------------------------------ Job control and Routines (§9.3, §10.4, §17.2)
+
+export const jobCancel = (c: Client, e: Envelope, jobId: string) =>
+  c.command(e, { type: "job.cancel", jobId });
+export const jobResolve = (
+  c: Client,
+  e: Envelope,
+  jobId: string,
+  action: "retry" | "cancel" | "mark_failed",
+) => c.command(e, { type: "job.resolve", jobId, action });
+
+/** The main Conversation of a Channel the user can see. */
+export const findConversation = async (c: Client, workspaceId: string, channelId: string) => {
+  const { channels } = (await listChannels(c, workspaceId)) as {
+    channels: { id: string; conversationId: string | null }[];
+  };
+  const conversationId = channels.find((ch) => ch.id === channelId)?.conversationId;
+  if (!conversationId) throw new CliError("NOT_FOUND", 7, `channel not found: ${channelId}`);
+  return conversationId;
+};
+
+export const routineCreate = (
+  c: Client,
+  e: Envelope,
+  input: {
+    botId: string;
+    name: string;
+    cron: string;
+    timezone: string;
+    inputText: string;
+    conversationId?: string;
+    misfire?: string;
+  },
+) =>
+  c.command(e, {
+    type: "routine.create",
+    botId: input.botId,
+    name: input.name,
+    schedule: { kind: "cron", expr: input.cron, timezone: input.timezone },
+    inputText: input.inputText,
+    conversationId: input.conversationId,
+    misfire: input.misfire,
+  });
+export const listRoutines = (c: Client, workspaceId: string) =>
+  c.get(inWorkspace("routines", workspaceId));
+/** `routine.run` / `routine.pause` / `routine.resume`. */
+export const routineAction = (c: Client, e: Envelope, type: string, routineId: string) =>
+  c.command(e, { type, routineId });
+
 /** `failed` / `cancelled` exit 5. `recovery_required` is not terminal here: it needs a human (§10). */
 export const terminalJobStates = ["succeeded", "failed", "cancelled"];
 

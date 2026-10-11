@@ -132,6 +132,7 @@ pre {
   background: #eee;
 }
 .badge.queued,
+.badge.waiting_device,
 .badge.pending {
   background: #fff4ce;
 }

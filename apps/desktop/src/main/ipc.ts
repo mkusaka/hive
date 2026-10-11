@@ -1,6 +1,6 @@
 // IPC argument validation and the HTTP calls behind it. No `electron` import, so it runs under vitest.
 import { CliError, type Client } from "@hive/cli/client";
-import { AgentSend, commandEnvelope, parse } from "@hive/contracts";
+import { AgentSend, commandEnvelope, JobCancel, parse } from "@hive/contracts";
 import * as v from "valibot";
 import type { ApiResult } from "../shared/api.ts";
 
@@ -15,7 +15,7 @@ export const ApiPath = v.pipe(
   v.check((path) => !path.includes(".."), "must not contain .."),
 );
 
-export const UiCommandSchema = commandEnvelope(AgentSend);
+export const UiCommandSchema = commandEnvelope(v.variant("type", [AgentSend, JobCancel]));
 
 const invalid = (issues: string[]): ApiResult => ({
   ok: false,

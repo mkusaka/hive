@@ -14,7 +14,15 @@ import {
   type RunObservation,
   type RunResultSubmit,
 } from "@hive/contracts";
-import { appendChange, claimJob, finishRun, insertMessage, renewLease } from "@hive/db";
+import {
+  appendChange,
+  claimJob,
+  confirmRunStopped,
+  finishRun,
+  insertMessage,
+  renewLease,
+  resumeWaitingJobs,
+} from "@hive/db";
 import type * as v from "valibot";
 import type { Principal } from "./auth/principal.ts";
 import { HttpError } from "./errors.ts";
@@ -109,6 +117,17 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
 const staleGeneration = () =>
   new HttpError("STALE_GENERATION", "run generation is not current", false, "stale_generation");
 
+/** Whether a user asked to cancel the Run's Job (job.cancel, §9.3). */
+const cancelRequested = async (db: D1Database, workspaceId: string, runId: string) =>
+  (await db
+    .prepare(
+      `SELECT 1 FROM runs r JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
+        WHERE r.id = ? AND r.workspace_id = ? AND j.cancel_requested_at IS NOT NULL`,
+    )
+    .bind(runId, workspaceId)
+    .first()) !== null;
+
+/** Renewal answers `cancelRequested`: the executor stops the agent and submits `failed` (§9.3). */
 const runLeaseRenew: Handler<v.InferOutput<typeof RunLeaseRenew>> = async (db, device, env) => {
   const result = await renewLease(db, {
     runId: env.command.runId,
@@ -117,13 +136,23 @@ const runLeaseRenew: Handler<v.InferOutput<typeof RunLeaseRenew>> = async (db, d
     leaseSeconds,
   });
   if (!result.ok) throw staleGeneration();
-  const response: LeaseRenewed = { leaseExpiresAt: result.leaseExpiresAt };
+  const response: LeaseRenewed = {
+    leaseExpiresAt: result.leaseExpiresAt,
+    cancelRequested: await cancelRequested(db, env.workspaceId, env.command.runId),
+  };
   return { status: 200, response };
 };
 
-/** Run completion plus the Inbox outcome of the Job's trigger item, in `finishRun`'s batch (§11.1). */
+/**
+ * Run completion plus the Inbox outcome of the Job's trigger item, in `finishRun`'s batch (§11.1). A `failed` Run of
+ * a Job with a cancel request finishes `cancelled` (Run and Job).
+ */
 const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (db, device, env) => {
   const { workspaceId, command } = env;
+  const state =
+    command.state === "failed" && (await cancelRequested(db, workspaceId, command.runId))
+      ? "cancelled"
+      : command.state;
   // The Job's input items: its trigger item, or every member of its sealed Inbox batch (one lane, so one
   // Conversation). The channel names their change scope; an item without a conversation is workspace-wide.
   const { results: items } = await db
@@ -161,6 +190,7 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
     );
   // A Task Job's Execution gets an immutable Task Result for its scope revision. Task status is not touched:
   // Run success is not Task completion (AT-16). The Execution still goes `finished` / `failed`, not `submitted`.
+  // A cancelled Run submits no Task Result.
   const execution = await db
     .prepare(
       "SELECT id FROM executions WHERE workspace_id = ? AND run_id = ? AND task_id IS NOT NULL",
@@ -168,22 +198,23 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
     .bind(workspaceId, command.runId)
     .first<{ id: string }>();
   const resultId = crypto.randomUUID();
-  const taskResult = execution
-    ? [
-        db
-          .prepare(
-            `INSERT INTO task_results (id, workspace_id, task_id, execution_id, run_id, scope_revision, state, summary)
+  const taskResult =
+    execution && state !== "cancelled"
+      ? [
+          db
+            .prepare(
+              `INSERT INTO task_results (id, workspace_id, task_id, execution_id, run_id, scope_revision, state, summary)
              SELECT ?, workspace_id, task_id, id, run_id, task_scope_revision, ?, ? FROM executions WHERE id = ?`,
-          )
-          .bind(resultId, command.state, command.summary, execution.id),
-        appendChange(db, {
-          workspaceId,
-          entityKind: "task_result",
-          entityId: resultId,
-          scope: `workspace:${workspaceId}`,
-        }),
-      ]
-    : [];
+            )
+            .bind(resultId, command.state, command.summary, execution.id),
+          appendChange(db, {
+            workspaceId,
+            entityKind: "task_result",
+            entityId: resultId,
+            scope: `workspace:${workspaceId}`,
+          }),
+        ]
+      : [];
   // The Run's capability decides where the Bot may reply: only in its trigger item's Conversation (§8.1).
   const { reply } = command;
   if (reply && (!item?.channel_id || item.conversation_id !== reply.conversationId)) {
@@ -213,7 +244,7 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
     runId: command.runId,
     deviceId: device.deviceId,
     executionGeneration: command.executionGeneration,
-    state: command.state,
+    state,
     summary: command.summary,
     error: command.error,
     operationId: env.idempotencyKey,
@@ -319,7 +350,8 @@ export const getRunContext = async (
     .prepare(
       `SELECT b.id AS bot_id, b.name, b.instructions, t.key, t.title, t.description, j.inbox_batch_id,
               i.id AS item_id, i.conversation_id, c.channel_id,
-              COALESCE(m.body, e.data) AS body
+              COALESCE(m.body, CASE e.source_kind WHEN 'routine' THEN json_extract(e.data, '$.inputText') END,
+                       e.data) AS body
          FROM jobs j
          JOIN bots b ON b.workspace_id = j.workspace_id AND b.id = j.bot_id
          LEFT JOIN tasks t ON t.workspace_id = j.workspace_id AND t.id = j.task_id
@@ -398,21 +430,43 @@ export const getRunContext = async (
   };
 };
 
-/** Executor observations (§9.2 step 7). Only `runtime.run.started` is stored, fenced like a renew. */
+/**
+ * Executor observations (§9.2 step 7), fenced like a renew. `runtime.run.started` stores the provider session and
+ * marks the launch confirmed; `runtime.run.stopped` confirms an `unknown` Run's stop (§10.4).
+ */
 export const recordObservation = async (db: D1Database, device: Device, input: RunObservation) => {
   const providerSessionId = input.payload?.providerSessionId;
+  if (input.kind === "runtime.run.stopped") {
+    if (input.payload?.confirmed !== true) {
+      throw new HttpError("INVALID_INPUT", "payload.confirmed must be true");
+    }
+    const result = await confirmRunStopped(db, {
+      runId: input.runId,
+      deviceId: device.deviceId,
+      executionGeneration: input.executionGeneration,
+      workspaceId: device.workspaceIds[0]!,
+    });
+    if (!result.ok && result.reason === "not_found")
+      throw new HttpError("NOT_FOUND", "run not found");
+    if (!result.ok) {
+      throw new HttpError("REVISION_CONFLICT", "run is still active", false, "not_unknown");
+    }
+    return { status: 200 as const, body: { ok: true } };
+  }
   if (input.kind !== "runtime.run.started") return { status: 202 as const, body: { ok: true } };
   if (typeof providerSessionId !== "string" || providerSessionId === "") {
     throw new HttpError("INVALID_INPUT", "payload.providerSessionId is required");
   }
   const { meta } = await db
     .prepare(
-      `UPDATE runs SET provider_session_id = ?, updated_at = ?
+      `UPDATE runs SET provider_session_id = ?, updated_at = ?, started_at = COALESCE(started_at, ?),
+              state = CASE state WHEN 'starting' THEN 'running' ELSE state END
         WHERE id = ? AND workspace_id = ? AND device_id = ? AND execution_generation = ?
           AND state IN ${activeRunStatesSql}`,
     )
     .bind(
       providerSessionId,
+      new Date().toISOString(),
       new Date().toISOString(),
       input.runId,
       device.workspaceIds[0],
@@ -424,11 +478,13 @@ export const recordObservation = async (db: D1Database, device: Device, input: R
   return { status: 200 as const, body: { ok: true } };
 };
 
+/** Also returns the device's `waiting_device` Jobs to `queued` (AT-12), before the executor lists them. */
 export const heartbeat = async (db: D1Database, device: Device) => {
   const now = new Date().toISOString();
   await db
     .prepare("UPDATE devices SET last_heartbeat_at = ?, updated_at = ? WHERE id = ?")
     .bind(now, now, device.deviceId)
     .run();
+  await resumeWaitingJobs(db, { workspaceId: device.workspaceIds[0]!, deviceId: device.deviceId });
   return { lastHeartbeatAt: now };
 };

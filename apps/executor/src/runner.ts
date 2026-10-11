@@ -53,8 +53,26 @@ const isStale = (error: unknown) =>
   error instanceof CloudError && error.code === "STALE_GENERATION";
 
 /**
+ * Confirms to the cloud that a Run's agent is not running (§10.4): an `unknown` Run becomes `interrupted` and frees
+ * its reservations, so a human may retry the Job. The adapter runs in-process, so once `waitForExit` resolved (or
+ * after a restart) nothing is left running. Best effort: false when the cloud could not be told.
+ */
+const confirmStopped = (
+  cloud: CloudClient,
+  fence: { runId: string; executionGeneration: number },
+) =>
+  cloud.observe({ ...fence, kind: "runtime.run.stopped", payload: { confirmed: true } }).then(
+    () => true,
+    (error: unknown) => {
+      console.error("stop confirmation failed", error);
+      return false;
+    },
+  );
+
+/**
  * Runs one claimed (or resumed) Run to its result. Records the launch intent before starting the agent and
- * renews the lease every quarter of its remaining time. A stale generation stops the agent and submits nothing.
+ * renews the lease every quarter of its remaining time. A stale generation stops the agent, submits nothing and
+ * confirms the stop. `cancelRequested` on renewal stops the agent and submits `failed` with error `cancelled`.
  */
 const execute = async (deps: RunnerDeps, claimed: ClaimedRun, leaseExpiresAt: string) => {
   const { cloud, journal } = deps;
@@ -68,18 +86,26 @@ const execute = async (deps: RunnerDeps, claimed: ClaimedRun, leaseExpiresAt: st
   const agent = await deps.adapter.start(ctx);
 
   let stale = false;
+  let cancelled = false;
   const renewEveryMs = Math.max(1, (Date.parse(leaseExpiresAt) - Date.now()) / 4);
   const timer = setInterval(() => {
-    cloud.renewLease(fence).catch(async (error: unknown) => {
-      if (!isStale(error)) return console.error("lease renewal failed", error);
-      stale = true;
-      clearInterval(timer);
-      await agent.requestStop("stale_generation");
-    });
+    cloud.renewLease(fence).then(
+      async (lease) => {
+        if (!lease.cancelRequested || cancelled) return;
+        cancelled = true;
+        await agent.requestStop("cancelled");
+      },
+      async (error: unknown) => {
+        if (!isStale(error)) return console.error("lease renewal failed", error);
+        stale = true;
+        clearInterval(timer);
+        await agent.requestStop("stale_generation");
+      },
+    );
   }, renewEveryMs);
   const exit = await agent.waitForExit().finally(() => clearInterval(timer));
 
-  const outcome = exit.code === 0 ? "succeeded" : "failed";
+  const outcome = exit.code === 0 && !cancelled ? "succeeded" : "failed";
   const conversation = ctx.context.conversation;
   if (!stale) {
     try {
@@ -87,7 +113,7 @@ const execute = async (deps: RunnerDeps, claimed: ClaimedRun, leaseExpiresAt: st
         ...fence,
         state: outcome,
         summary: exit.summary,
-        ...(outcome === "failed" ? { error: exit.reason } : {}),
+        ...(outcome === "failed" ? { error: cancelled ? "cancelled" : exit.reason } : {}),
         ...(exit.replyText && conversation
           ? { reply: { conversationId: conversation.id, text: exit.replyText } }
           : {}),
@@ -97,27 +123,46 @@ const execute = async (deps: RunnerDeps, claimed: ClaimedRun, leaseExpiresAt: st
       stale = true;
     }
   }
-  const state = stale ? "stale_generation" : outcome;
+  // The agent has exited: an `unknown` Run can be confirmed stopped right away.
+  const state = !stale
+    ? outcome
+    : (await confirmStopped(cloud, fence))
+      ? "stopped"
+      : "stale_generation";
   await journal.append({ kind: "result", runId: ctx.runId, state });
   return { runId: ctx.runId, jobId: ctx.jobId, state };
 };
 
 /**
- * Startup reconcile (§20.2): every journaled claim without a result is checked against the cloud. An active
- * Run of the same generation is resumed (the fake adapter is idempotent); anything else gets a result marker.
+ * Startup reconcile (§20.2): every journaled claim without a result, or whose last result is an unconfirmed
+ * `stale_generation`, is checked against the cloud. An active Run of the same generation without a result is resumed
+ * (the fake adapter is idempotent). An `unknown` Run is confirmed stopped: nothing survives a restart, because the
+ * adapter runs in-process. Anything else gets a result marker.
  */
 export const reconcile = async (deps: RunnerDeps) => {
   const entries = await deps.journal.readAll();
-  const done = new Set(entries.flatMap((e) => (e.kind === "result" ? [e.runId] : [])));
+  const last = new Map(entries.flatMap((e) => (e.kind === "result" ? [[e.runId, e.state]] : [])));
   const resumed = [];
   for (const entry of entries) {
-    if (entry.kind !== "claim" || done.has(entry.runId)) continue;
+    if (entry.kind !== "claim") continue;
+    const result = last.get(entry.runId);
+    if (result !== undefined && result !== "stale_generation") continue;
     const run = await deps.cloud.getRun(entry.runId).catch((error: unknown) => {
       if (error instanceof CloudError && error.code === "NOT_FOUND") return null;
       throw error;
     });
     const fence = { runId: entry.runId, executionGeneration: entry.executionGeneration };
-    if (run?.active && run.executionGeneration === entry.executionGeneration) {
+    if (run?.state === "unknown") {
+      if (await confirmStopped(deps.cloud, fence)) {
+        await deps.journal.append({ kind: "result", runId: entry.runId, state: "stopped" });
+      }
+      continue;
+    }
+    if (
+      result === undefined &&
+      run?.active &&
+      run.executionGeneration === entry.executionGeneration
+    ) {
       const lease = await deps.cloud.renewLease(fence).catch((error: unknown) => {
         if (isStale(error)) return null;
         throw error;
@@ -127,8 +172,9 @@ export const reconcile = async (deps: RunnerDeps) => {
         continue;
       }
     }
-    const state = run && !run.active ? run.state : "stale_generation";
-    await deps.journal.append({ kind: "result", runId: entry.runId, state });
+    // A Run the cloud no longer knows is `missing`, so a stale marker is not rechecked forever.
+    const state = run && !run.active ? run.state : run ? "stale_generation" : "missing";
+    if (state !== result) await deps.journal.append({ kind: "result", runId: entry.runId, state });
   }
   return resumed;
 };

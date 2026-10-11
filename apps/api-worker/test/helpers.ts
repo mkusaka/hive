@@ -116,3 +116,36 @@ export const setup = async () => {
     send,
   };
 };
+
+export const count = async (from: string, ...params: unknown[]) =>
+  (await env.DB.prepare(`SELECT COUNT(*) AS n FROM ${from}`)
+    .bind(...params)
+    .first<{ n: number }>())!.n;
+
+export const executor = (token: string, workspaceId: string) => {
+  const auth = { Authorization: `Bearer ${token}` };
+  return {
+    get: (path: string) => call(path, auth),
+    post: (path: string, body: unknown) => call(path, auth, body),
+    command: (command: unknown, idempotencyKey?: string) =>
+      call("/v1/executor/commands", auth, envelope(workspaceId, command, idempotencyKey)),
+  };
+};
+
+export type Claimed = { runId: string; executionGeneration: number; leaseExpiresAt: string };
+
+/** agent.send → pump → a queued Job for `botId` (default: the setup Bot). */
+export const queuedJob = async (s: Awaited<ReturnType<typeof setup>>, botId = s.botId) => {
+  const sent = s.send();
+  (sent.command as Json).recipientBotId = botId;
+  const { inboxItemId } = await (await s.user.command(sent)).json<{ inboxItemId: string }>();
+  await s.pump();
+  const op = await (await s.user.get(`/v1/operations/${sent.operationId}`)).json<Json>();
+  return { jobId: op.jobId as string, inboxItemId };
+};
+
+export const claim = (jobId: string, expectedRevision = 1) => ({
+  type: "job.claim",
+  jobId,
+  expectedRevision,
+});

@@ -10,14 +10,17 @@ import {
 import {
   acquireOutboxBatch,
   createDeliveryAndInbox,
+  expireLeases,
   markOutboxDead,
   markOutboxSent,
+  parkOfflineJobs,
   recordEventRouted,
   type Recipient,
   routeToRecipients,
   sealDueBatches,
 } from "@hive/db";
 import type { Notification } from "./realtime.ts";
+import { fireDueRoutines } from "./routines.ts";
 
 const maxAttempts = 5;
 const leaseSeconds = 60;
@@ -172,9 +175,11 @@ export const routeEvent = async (db: D1Database, eventId: string): Promise<Notif
 };
 
 /**
- * Acquires ready outbox rows and handles them. A failed row keeps its lease and is retried after it
- * expires; at `maxAttempts` it goes `dead`. Then due Inbox batches are sealed. Topics without a consumer yet (e.g. `run.finished`) are
- * marked sent so they do not cycle to dead. `notify` receives the realtime hint of each routed event.
+ * Acquires ready outbox rows and handles them. A failed row keeps its lease and is retried after it expires; at
+ * `maxAttempts` it goes `dead`. Topics without a consumer yet (e.g. `run.finished`) are marked sent so they do not
+ * cycle to dead. Then the time-driven work: due Inbox batches are sealed, due Routines fire, expired leases go
+ * `unknown` and Jobs whose devices are all offline go `waiting_device` (`expired` / `parked` count Workspaces).
+ * `notify` receives the realtime hints.
  */
 export const pump = async (
   db: D1Database,
@@ -208,9 +213,25 @@ export const pump = async (
   for (const { workspaceId } of sealed) {
     input.notify?.({ workspaceId, scopes: [`workspace:${workspaceId}`], jobAvailable: true });
   }
+  // Due Routine occurrences get their Inbox item + Job (§17.2).
+  const fired = await fireDueRoutines(db);
+  for (const { workspaceId, jobIds } of fired) {
+    if (jobIds.length > 0) {
+      input.notify?.({ workspaceId, scopes: [`workspace:${workspaceId}`], jobAvailable: true });
+    }
+  }
+  // Recovery (§10.4): expired leases → unknown / recovery_required; Jobs whose devices are all offline wait.
+  const expired = await expireLeases(db);
+  const parked = await parkOfflineJobs(db);
+  for (const workspaceId of new Set([...expired, ...parked])) {
+    input.notify?.({ workspaceId, scopes: [`workspace:${workspaceId}`] });
+  }
   return {
     processed: outcomes.filter((o) => o === "processed").length,
     dead: outcomes.filter((o) => o === "dead").length,
     sealed: sealed.length,
+    routineJobs: fired.reduce((n, f) => n + f.jobIds.length, 0),
+    expired: expired.length,
+    parked: parked.length,
   };
 };

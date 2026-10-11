@@ -1,6 +1,8 @@
 import * as v from "valibot";
+import { isTimeZone, nextCron, parseCron } from "./cron.ts";
 import { EventTypePattern, FilterExpression } from "./filter.ts";
 
+export * from "./cron.ts";
 export * from "./filter.ts";
 
 const id = <const Name extends string>(name: Name) =>
@@ -270,6 +272,95 @@ export const IntegrationCreate = v.strictObject({
   externalAccountId: v.optional(Name),
 });
 
+// ------------------------------------------------- Routines (§17.2)
+
+export const RoutineId = id("RoutineId");
+
+const isCron = (expr: string) => {
+  try {
+    parseCron(expr);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+export const RoutineSchedule = v.variant("kind", [
+  v.strictObject({
+    kind: v.literal("cron"),
+    expr: v.pipe(v.string(), v.maxLength(200), v.check(isCron, "invalid cron expression")),
+    timezone: v.pipe(v.string(), v.check(isTimeZone, "unknown IANA timezone")),
+  }),
+  v.strictObject({ kind: v.literal("once"), at: Timestamp }),
+]);
+export type RoutineSchedule = v.InferOutput<typeof RoutineSchedule>;
+
+/**
+ * `next_fire_at` when a schedule is set or resumed at `now` (ms): a `once` keeps its `at` even if past (it fires on the
+ * next tick, subject to misfire); a cron gets its first occurrence after `now`. Null when none is left.
+ */
+export const firstFireAt = (schedule: RoutineSchedule, now: number) => {
+  if (schedule.kind === "once") return new Date(schedule.at).toISOString();
+  const at = nextCron(parseCron(schedule.expr), schedule.timezone, now);
+  return at === null ? null : new Date(at).toISOString();
+};
+
+const RoutineSpec = {
+  name: Name,
+  schedule: RoutineSchedule,
+  inputText: v.pipe(v.string(), v.minLength(1), v.maxLength(64 * 1024)),
+  /** `skip` drops occurrences more than 5 minutes late; `coalesce` runs the latest missed one. */
+  misfire: v.optional(v.picklist(["skip", "coalesce"]), "coalesce"),
+};
+
+/** A Routine creates Inbox items and Jobs on its schedule; it never calls a model itself (§17.2). */
+export const RoutineCreate = v.strictObject({
+  type: v.literal("routine.create"),
+  botId: BotId,
+  ...RoutineSpec,
+  /** Inbox lane and reply target; without it the lane is `routine:<id>` and the Bot cannot reply. */
+  conversationId: v.optional(v.pipe(v.string(), v.minLength(1))),
+  taskId: v.optional(TaskId),
+});
+
+/** Replaces the given fields; a new `schedule` bumps `schedule_revision` and restarts from now. */
+export const RoutineUpdate = v.strictObject({
+  type: v.literal("routine.update"),
+  routineId: RoutineId,
+  expectedRevision: Revision,
+  name: v.optional(RoutineSpec.name),
+  schedule: v.optional(RoutineSchedule),
+  inputText: v.optional(RoutineSpec.inputText),
+  misfire: v.optional(v.picklist(["skip", "coalesce"])),
+});
+
+export const RoutinePause = v.strictObject({
+  type: v.literal("routine.pause"),
+  routineId: RoutineId,
+});
+/** Restarts from now: occurrences missed while paused are not created. */
+export const RoutineResume = v.strictObject({
+  type: v.literal("routine.resume"),
+  routineId: RoutineId,
+});
+/** Manual run: an occurrence at now through the same Inbox item + Job path; the schedule is not advanced. */
+export const RoutineRun = v.strictObject({ type: v.literal("routine.run"), routineId: RoutineId });
+
+// ------------------------------------------------- Job control (§9.3, §10.4)
+
+/** Queued / waiting Jobs are cancelled at once; an active Job is asked to stop (`cancelRequested` on renew). */
+export const JobCancel = v.strictObject({ type: v.literal("job.cancel"), jobId: JobId });
+
+/**
+ * A `recovery_required` Job (§10.4). `retry` needs the old Run's stop to be confirmed (`runtime.run.stopped`), else
+ * 409 RESOURCE_BUSY `unconfirmed_stop`; it queues the Job again and the next claim gets a new generation.
+ */
+export const JobResolve = v.strictObject({
+  type: v.literal("job.resolve"),
+  jobId: JobId,
+  action: v.picklist(["retry", "cancel", "mark_failed"]),
+});
+
 // UTF-8 size. No TextEncoder: contracts stay runtime-neutral (`types: []`). A lone surrogate counts 3,
 // as TextEncoder would encode it (U+FFFD).
 const utf8Bytes = (text: string) => {
@@ -369,7 +460,8 @@ export type ClaimFailureReason =
   | "resource_busy"
   | "already_claimed"
   | "not_eligible";
-export type LeaseRenewed = { leaseExpiresAt: string };
+/** `cancelRequested`: a user asked to cancel the Job; the executor stops the agent (§9.3). */
+export type LeaseRenewed = { leaseExpiresAt: string; cancelRequested: boolean };
 export type RunResultAccepted = { ok: true };
 
 /** `GET /v1/executor/jobs?state=queued` item. */
@@ -399,8 +491,9 @@ export type RunContext = {
 };
 
 /**
- * `POST /v1/executor/observations` (§9.2 step 7). Only `runtime.run.started` with
- * `payload.providerSessionId` is stored; other kinds are accepted (202) and dropped.
+ * `POST /v1/executor/observations` (§9.2 step 7). Stored kinds: `runtime.run.started` with
+ * `payload.providerSessionId` (Run `running`, `started_at`), and `runtime.run.stopped` with `payload.confirmed: true`
+ * (an `unknown` Run becomes `interrupted` and releases its reservations). Other kinds are accepted (202) and dropped.
  */
 export const RunObservation = v.strictObject({
   runId: RunId,

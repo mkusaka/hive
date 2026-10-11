@@ -5,8 +5,13 @@ import { type JournalEntry, runOnce } from "@hive/executor/runner";
 import { describe, expect, it } from "vitest";
 import {
   call,
+  claim,
+  type Claimed,
+  count,
   envelope,
+  executor,
   type Json,
+  queuedJob,
   register,
   request as fetchApp,
   setup,
@@ -14,38 +19,6 @@ import {
 } from "./helpers.ts";
 
 const db = env.DB;
-const count = async (from: string, ...params: unknown[]) =>
-  (await db
-    .prepare(`SELECT COUNT(*) AS n FROM ${from}`)
-    .bind(...params)
-    .first<{ n: number }>())!.n;
-
-const executor = (token: string, workspaceId: string) => {
-  const auth = { Authorization: `Bearer ${token}` };
-  return {
-    get: (path: string) => call(path, auth),
-    command: (command: unknown, idempotencyKey?: string) =>
-      call("/v1/executor/commands", auth, envelope(workspaceId, command, idempotencyKey)),
-  };
-};
-
-type Claimed = { runId: string; executionGeneration: number; leaseExpiresAt: string };
-
-/** agent.send → pump → a queued Job for `botId` (default: the setup Bot). */
-const queuedJob = async (s: Awaited<ReturnType<typeof setup>>, botId = s.botId) => {
-  const request = s.send();
-  (request.command as Json).recipientBotId = botId;
-  const { inboxItemId } = await (await s.user.command(request)).json<{ inboxItemId: string }>();
-  await s.pump();
-  const op = await (await s.user.get(`/v1/operations/${request.operationId}`)).json<Json>();
-  return { jobId: op.jobId as string, inboxItemId };
-};
-
-const claim = (jobId: string, expectedRevision = 1) => ({
-  type: "job.claim",
-  jobId,
-  expectedRevision,
-});
 
 describe("executor job.claim", () => {
   it("claims a queued Job: Run, generation and lease; the Job goes active", async () => {
@@ -112,8 +85,19 @@ describe("executor job.claim", () => {
     expect(res.status).toBe(403);
     expect(await res.json()).toMatchObject({ code: "FORBIDDEN", reason: "not_eligible" });
     expect(await (await device.get("/v1/executor/jobs?state=queued")).json()).toEqual({ jobs: [] });
+    // The pinned device never heartbeated, so the pump parked the Job (`waiting_device`); its heartbeat requeues it.
     const pinned = executor(other.deviceToken as string, s.workspaceId);
-    expect((await pinned.command(claim(jobId))).status).toBe(200);
+    expect(await (await s.user.get(`/v1/jobs/${jobId}`)).json()).toMatchObject({
+      state: "waiting_device",
+    });
+    await call("/v1/executor/heartbeat", { Authorization: `Bearer ${other.deviceToken}` }, {});
+    const { jobs } = await (
+      await pinned.get("/v1/executor/jobs?state=queued")
+    ).json<{
+      jobs: { id: string; revision: number }[];
+    }>();
+    expect(jobs).toEqual([expect.objectContaining({ id: jobId, revision: 3 })]);
+    expect((await pinned.command(claim(jobId, 3))).status).toBe(200);
   });
 
   it("hides a Job from a device of another Workspace (404)", async () => {
@@ -143,16 +127,16 @@ describe("executor job.claim", () => {
   });
 });
 
-describe("executor lease and result", () => {
-  const claimed = async () => {
-    const s = await setup();
-    const job = await queuedJob(s);
-    const device = executor(s.deviceToken, s.workspaceId);
-    const run = await (await device.command(claim(job.jobId))).json<Claimed>();
-    const fence = { runId: run.runId, executionGeneration: run.executionGeneration };
-    return { s, device, fence, ...job };
-  };
+const claimed = async () => {
+  const s = await setup();
+  const job = await queuedJob(s);
+  const device = executor(s.deviceToken, s.workspaceId);
+  const run = await (await device.command(claim(job.jobId))).json<Claimed>();
+  const fence = { runId: run.runId, executionGeneration: run.executionGeneration };
+  return { s, device, fence, ...job };
+};
 
+describe("executor lease and result", () => {
   it("renews the current generation and rejects a stale one (AT-15)", async () => {
     const { device, fence } = await claimed();
     const ok = await device.command({ type: "run.lease.renew", ...fence });

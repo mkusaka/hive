@@ -610,6 +610,77 @@ export const subscriptionRevisions = sqliteTable(
   (t) => [primaryKey({ columns: [t.subscriptionId, t.revision] })],
 );
 
+// ---------------------------------------------------------------- Routines
+
+const misfirePolicies = ["skip", "coalesce"] as const;
+
+/**
+ * current state (docs/architecture.md §17.2). `schedule` is `{kind: "cron", expr, timezone}` or `{kind: "once", at}`;
+ * `schedule_revision` bumps when it changes and is part of the occurrence identity. `next_fire_at` is the next UTC
+ * occurrence, null when none is left (a fired `once`). `revision` bumps on every edit.
+ */
+export const routines = sqliteTable(
+  "routines",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    botId: text("bot_id").notNull(),
+    name: text("name").notNull(),
+    conversationId: text("conversation_id"),
+    taskId: text("task_id"),
+    inputText: text("input_text").notNull(),
+    schedule: text("schedule", { mode: "json" }).notNull(),
+    scheduleRevision: integer("schedule_revision").notNull().default(1),
+    misfire: text("misfire", { enum: misfirePolicies }).notNull().default("coalesce"),
+    nextFireAt: text("next_fire_at"),
+    enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+    revision: integer("revision").notNull().default(1),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    scoped(t),
+    index("routines_due").on(t.enabled, t.nextFireAt),
+    oneOf("routines_misfire", t.misfire, misfirePolicies),
+    foreignKey({ columns: [t.workspaceId, t.botId], foreignColumns: [bots.workspaceId, bots.id] }),
+    foreignKey({
+      columns: [t.workspaceId, t.conversationId],
+      foreignColumns: [conversations.workspaceId, conversations.id],
+    }),
+    foreignKey({
+      columns: [t.workspaceId, t.taskId],
+      foreignColumns: [tasks.workspaceId, tasks.id],
+    }),
+  ],
+);
+
+const occurrenceStates = ["created", "skipped"] as const;
+
+/** immutable history. One row per UTC occurrence (AT-31); `created` ones carry their Job. */
+export const routineOccurrences = sqliteTable(
+  "routine_occurrences",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    routineId: text("routine_id").notNull(),
+    scheduleRevision: integer("schedule_revision").notNull(),
+    scheduledAt: text("scheduled_at").notNull(),
+    state: text("state", { enum: occurrenceStates }).notNull(),
+    jobId: text("job_id"),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    unique().on(t.routineId, t.scheduleRevision, t.scheduledAt),
+    oneOf("routine_occurrences_state", t.state, occurrenceStates),
+    check("routine_occurrences_job", sql`(${t.state} = 'created') = (${t.jobId} IS NOT NULL)`),
+    foreignKey({
+      columns: [t.workspaceId, t.routineId],
+      foreignColumns: [routines.workspaceId, routines.id],
+    }),
+    foreignKey({ columns: [t.workspaceId, t.jobId], foreignColumns: [jobs.workspaceId, jobs.id] }),
+  ],
+);
+
 // --------------------------------------------------------------- Execution
 
 const jobStates = [
@@ -638,6 +709,8 @@ export const jobs = sqliteTable(
     // Explicit Task Jobs (job.start). Added by ALTER TABLE, which can only add a single-column FK: a composite
     // (workspace_id, task_id) FK would rebuild `jobs`, and dropping it fails on the `runs` rows that reference it.
     taskId: text("task_id").references((): AnySQLiteColumn => tasks.id),
+    // job.cancel (§9.3): a request, not a stop. An active Job stays active until its Run stops.
+    cancelRequestedAt: text("cancel_requested_at"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -681,6 +754,8 @@ export const runs = sqliteTable(
     resultError: text("result_error"),
     // From the executor's `runtime.run.started` observation (§9.2 step 7); e.g. the Claude session id.
     providerSessionId: text("provider_session_id"),
+    // Set by the same observation; null means the launch was never confirmed (§10.4 "unknown after launch intent").
+    startedAt: text("started_at"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },

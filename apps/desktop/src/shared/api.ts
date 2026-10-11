@@ -1,5 +1,5 @@
 // The typed surface the preload exposes as `window.hive` (docs/architecture.md §20.1, §21). Types only.
-import type { AgentSend, commandEnvelope } from "@hive/contracts";
+import type { AgentSend, commandEnvelope, JobCancel } from "@hive/contracts";
 import type * as v from "valibot";
 
 /** IPC never throws: an error thrown in `ipcMain.handle` reaches the renderer with its message only. */
@@ -7,8 +7,12 @@ export type ApiResult =
   | { ok: true; value: Record<string, unknown> }
   | { ok: false; error: { code: string; message: string; body?: unknown } };
 
-/** The only command the UI sends today. */
-export type UiCommand = v.InferInput<ReturnType<typeof commandEnvelope<typeof AgentSend>>>;
+/** The commands the UI sends today: agent.send and job.cancel. */
+export type UiCommand = v.InferInput<
+  ReturnType<
+    typeof commandEnvelope<v.VariantSchema<"type", [typeof AgentSend, typeof JobCancel], undefined>>
+  >
+>;
 
 export type RealtimeEvent =
   | { type: "connection"; state: "connected" | "reconnecting" }

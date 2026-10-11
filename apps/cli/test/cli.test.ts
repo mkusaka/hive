@@ -170,6 +170,55 @@ describe("argv → request", () => {
     ]);
   });
 
+  it("routine and job control commands", async () => {
+    const h = harness((call) =>
+      call.path.startsWith("/v1/channels")
+        ? Response.json({ channels: [{ id: "ch-1", conversationId: "conv-1" }] })
+        : Response.json({ ok: true }),
+    );
+    const command = (i: number) => (h.calls[i]!.body as { command: unknown }).command;
+    expect(
+      await h.hive(
+        "routine",
+        "create",
+        "--bot",
+        "bot-1",
+        "--name",
+        "standup",
+        "--cron",
+        "0 9 * * 1-5",
+        "--tz",
+        "Asia/Tokyo",
+        "--input",
+        "Summarize",
+        "--channel",
+        "ch-1",
+      ),
+    ).toBe(0);
+    expect(command(1)).toEqual({
+      type: "routine.create",
+      botId: "bot-1",
+      name: "standup",
+      schedule: { kind: "cron", expr: "0 9 * * 1-5", timezone: "Asia/Tokyo" },
+      inputText: "Summarize",
+      conversationId: "conv-1",
+    });
+    expect(await h.hive("routine", "list")).toBe(0);
+    expect(h.calls[2]!.path).toBe("/v1/routines?workspaceId=ws-1");
+    expect(await h.hive("routine", "run", "r-1")).toBe(0);
+    expect(await h.hive("routine", "pause", "r-1")).toBe(0);
+    expect(command(3)).toEqual({ type: "routine.run", routineId: "r-1" });
+    expect(command(4)).toEqual({ type: "routine.pause", routineId: "r-1" });
+
+    expect(await h.hive("job", "cancel", "job-1")).toBe(0);
+    expect(command(5)).toEqual({ type: "job.cancel", jobId: "job-1" });
+    expect(await h.hive("job", "resolve", "job-1", "--mark-failed")).toBe(0);
+    expect(command(6)).toEqual({ type: "job.resolve", jobId: "job-1", action: "mark_failed" });
+    expect(await h.hive("job", "resolve", "job-1")).toBe(2);
+    expect(await h.hive("job", "resolve", "job-1", "--retry", "--cancel")).toBe(2);
+    expect(h.calls).toHaveLength(7);
+  });
+
   it("rejects invalid input locally with exit 2 and sends nothing", async () => {
     const h = harness(undefined, { stdin: "not json" });
     expect(await h.hive("event", "emit", "custom.x", "--data-file", "-")).toBe(2);

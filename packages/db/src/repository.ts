@@ -151,8 +151,9 @@ export const claimJob = async (db: D1Database, input: ClaimInput): Promise<Claim
       statements: [
         db
           .prepare(
+            // A `waiting_device` Job is claimable too: the claiming (eligible) device is evidently online.
             `UPDATE jobs SET state = 'active', revision = revision + 1, updated_at = ?
-              WHERE workspace_id = ? AND id = ? AND state = 'queued' AND revision = ?`,
+              WHERE workspace_id = ? AND id = ? AND state IN ('queued', 'waiting_device') AND revision = ?`,
           )
           .bind(iso(now), workspaceId, jobId, input.expectedRevision),
         setGuard,
@@ -213,7 +214,9 @@ const diagnoseClaimFailure = async (
     .bind(input.workspaceId, input.jobId)
     .first<{ state: string; revision: number }>();
   if (!job) return null;
-  if (job.state !== "queued") return { ok: false, reason: "already_claimed", jobState: job.state };
+  if (job.state !== "queued" && job.state !== "waiting_device") {
+    return { ok: false, reason: "already_claimed", jobState: job.state };
+  }
   if (job.revision !== input.expectedRevision) return { ok: false, reason: "stale_revision" };
   if (input.resourceKeys.length === 0) return null;
   const busy = await db
@@ -252,12 +255,15 @@ export const renewLease = async (
 /**
  * Run completion (§11.1): fenced terminal Run with its result, Execution, released reservations, Job state,
  * outbox, change rows, the caller's extra `statements` (e.g. the Inbox outcome) and receipt. A replay with the same
- * operationId returns the stored `{ ok: true }`.
+ * operationId returns the stored `{ ok: true }`. `cancelled` (a stop after job.cancel) leaves the Execution
+ * `interrupted`.
  */
+const executionOutcome = { succeeded: "finished", failed: "failed", cancelled: "interrupted" };
+
 export const finishRun = async (
   db: D1Database,
   input: Fence & {
-    state: "succeeded" | "failed";
+    state: "succeeded" | "failed" | "cancelled";
     operationId: string;
     summary?: string;
     error?: string;
@@ -307,7 +313,7 @@ export const finishRun = async (
           .prepare(
             "UPDATE executions SET state = ?, updated_at = ? WHERE run_id = ? AND state = 'active'",
           )
-          .bind(input.state === "succeeded" ? "finished" : "failed", now, input.runId),
+          .bind(executionOutcome[input.state], now, input.runId),
         db
           .prepare(
             "UPDATE resource_reservations SET released_at = ? WHERE run_id = ? AND released_at IS NULL",
@@ -353,6 +359,191 @@ export const finishRun = async (
     if (!fenced) return { ok: false, reason: "stale_generation" };
     throw error;
   }
+};
+
+// --------------------------------------------------- Recovery (§10.3, §10.4)
+// Lease expiry is not proof of a stop: a Run whose lease expired goes `unknown`, keeps its reservations and its Job
+// waits for a human (`recovery_required`). Only a confirmed stop (`confirmRunStopped`) releases them. There is no
+// automatic re-run (`recovery: safe_auto` is not implemented).
+
+/**
+ * Moves active Runs whose lease expired to `unknown` and their Jobs to `recovery_required`, one guarded batch per Run
+ * (a Run renewed meanwhile is skipped). `result_error` records whether the launch was ever confirmed
+ * (`runtime.run.started`). Returns the touched Workspaces.
+ */
+export const expireLeases = async (db: D1Database, limit = 50) => {
+  const now = iso();
+  const { results } = await db
+    .prepare(
+      `SELECT id, workspace_id, job_id, started_at FROM runs
+        WHERE state IN ${activeRunStates} AND lease_expires_at < ? ORDER BY lease_expires_at LIMIT ?`,
+    )
+    .bind(now, limit)
+    .all<{ id: string; workspace_id: string; job_id: string; started_at: string | null }>();
+  const expired = await Promise.all(
+    results.map(async (run) => {
+      const [setGuard, clearGuard] = guard(db);
+      const scope = `workspace:${run.workspace_id}`;
+      try {
+        await db.batch([
+          db
+            .prepare(
+              `UPDATE runs SET state = 'unknown', result_error = ?, updated_at = ?
+                WHERE id = ? AND state IN ${activeRunStates} AND lease_expires_at < ?`,
+            )
+            .bind(
+              run.started_at ? "lease_expired" : "lease_expired_before_start",
+              now,
+              run.id,
+              now,
+            ),
+          setGuard,
+          clearGuard,
+          db
+            .prepare(
+              `UPDATE jobs SET state = 'recovery_required', revision = revision + 1, updated_at = ?
+                WHERE workspace_id = ? AND id = ? AND state = 'active'`,
+            )
+            .bind(now, run.workspace_id, run.job_id),
+          appendChange(db, {
+            workspaceId: run.workspace_id,
+            entityKind: "run",
+            entityId: run.id,
+            scope,
+          }),
+          appendChange(db, {
+            workspaceId: run.workspace_id,
+            entityKind: "job",
+            entityId: run.job_id,
+            scope,
+          }),
+        ]);
+        return run.workspace_id;
+      } catch (error) {
+        const row = await db
+          .prepare(
+            `SELECT 1 FROM runs WHERE id = ? AND state IN ${activeRunStates} AND lease_expires_at < ?`,
+          )
+          .bind(run.id, now)
+          .first();
+        if (!row) return null;
+        throw error;
+      }
+    }),
+  );
+  return [...new Set(expired.filter((w) => w !== null))];
+};
+
+/**
+ * `runtime.run.stopped` (confirmed): an `unknown` Run becomes `interrupted`, its Execution too, and its reservations
+ * are released, fenced like a renew. Already terminal → `{ ok: true }` (idempotent); still active → `not_unknown`.
+ */
+export const confirmRunStopped = async (
+  db: D1Database,
+  input: Fence & { workspaceId: string },
+): Promise<{ ok: true } | { ok: false; reason: "not_found" | "not_unknown" }> => {
+  const now = iso();
+  const fence = [input.runId, input.workspaceId, input.deviceId, input.executionGeneration];
+  const [setGuard, clearGuard] = guard(db);
+  try {
+    await db.batch([
+      db
+        .prepare(
+          `UPDATE runs SET state = 'interrupted', lease_expires_at = NULL, updated_at = ?
+            WHERE id = ? AND workspace_id = ? AND device_id = ? AND execution_generation = ? AND state = 'unknown'`,
+        )
+        .bind(now, ...fence),
+      setGuard,
+      clearGuard,
+      db
+        .prepare(
+          "UPDATE executions SET state = 'interrupted', updated_at = ? WHERE run_id = ? AND state = 'active'",
+        )
+        .bind(now, input.runId),
+      db
+        .prepare(
+          "UPDATE resource_reservations SET released_at = ? WHERE run_id = ? AND released_at IS NULL",
+        )
+        .bind(now, input.runId),
+      appendChange(db, {
+        workspaceId: input.workspaceId,
+        entityKind: "run",
+        entityId: input.runId,
+        scope: `workspace:${input.workspaceId}`,
+      }),
+    ]);
+    return { ok: true };
+  } catch (error) {
+    const run = await db
+      .prepare(
+        `SELECT state FROM runs
+          WHERE id = ? AND workspace_id = ? AND device_id = ? AND execution_generation = ?`,
+      )
+      .bind(...fence)
+      .first<{ state: string }>();
+    if (!run) return { ok: false, reason: "not_found" };
+    if (["succeeded", "failed", "interrupted", "cancelled"].includes(run.state))
+      return { ok: true };
+    if (run.state !== "unknown") return { ok: false, reason: "not_unknown" };
+    throw error;
+  }
+};
+
+// A device is online when it heartbeated within this window: 3 × the 15 s heartbeat (docs/roadmap.md §1).
+const onlineSeconds = 45;
+// `placement` names devices; an empty `allowedDeviceIds` (any device) never waits here.
+const allOfflineSql = `json_array_length(placement, '$.allowedDeviceIds') > 0
+  AND NOT EXISTS (SELECT 1 FROM devices d, json_each(jobs.placement, '$.allowedDeviceIds') a
+                   WHERE d.workspace_id = jobs.workspace_id AND d.id = a.value AND d.revoked_at IS NULL
+                     AND d.last_heartbeat_at >= ?)`;
+
+/**
+ * Queued Jobs whose allowed devices are all offline go `waiting_device` (§10.4, AT-30), with their change rows in the
+ * same batch. A heartbeat flips them back (`resumeWaitingJobs`).
+ */
+export const parkOfflineJobs = async (db: D1Database) => {
+  const now = iso();
+  const since = iso(Date.now() - onlineSeconds * 1000);
+  const parked = await db.batch<{ workspace_id: string }>([
+    db
+      .prepare(
+        `INSERT INTO change_log (workspace_id, entity_kind, entity_id, op, revision, scope)
+         SELECT workspace_id, 'job', id, 'upsert', revision + 1, 'workspace:' || workspace_id FROM jobs
+          WHERE state = 'queued' AND ${allOfflineSql}
+         RETURNING workspace_id`,
+      )
+      .bind(since),
+    db
+      .prepare(
+        `UPDATE jobs SET state = 'waiting_device', revision = revision + 1, updated_at = ?
+          WHERE state = 'queued' AND ${allOfflineSql}`,
+      )
+      .bind(now, since),
+  ]);
+  return [...new Set(parked[0]!.results.map((r) => r.workspace_id))];
+};
+
+/** Heartbeat side (AT-12): `waiting_device` Jobs this device may run go back to `queued`. Returns how many. */
+export const resumeWaitingJobs = async (
+  db: D1Database,
+  input: { workspaceId: string; deviceId: string },
+) => {
+  const mine = `workspace_id = ? AND state = 'waiting_device'
+    AND EXISTS (SELECT 1 FROM json_each(jobs.placement, '$.allowedDeviceIds') WHERE value = ?)`;
+  const [changes] = await db.batch([
+    db
+      .prepare(
+        `INSERT INTO change_log (workspace_id, entity_kind, entity_id, op, revision, scope)
+         SELECT workspace_id, 'job', id, 'upsert', revision + 1, 'workspace:' || workspace_id FROM jobs WHERE ${mine}`,
+      )
+      .bind(input.workspaceId, input.deviceId),
+    db
+      .prepare(
+        `UPDATE jobs SET state = 'queued', revision = revision + 1, updated_at = ? WHERE ${mine}`,
+      )
+      .bind(iso(), input.workspaceId, input.deviceId),
+  ]);
+  return changes!.meta.changes;
 };
 
 // -------------------------------------------------------------- Change log

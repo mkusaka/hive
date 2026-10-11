@@ -76,6 +76,13 @@ describe("IPC handlers", () => {
     expect(requests).toEqual([]);
   });
 
+  it("posts a job.cancel envelope", async () => {
+    const { h, requests } = setup();
+    const cancel = { ...envelope, command: { type: "job.cancel", jobId: "job-1" } };
+    expect((await h.command(cancel)).ok).toBe(true);
+    expect(requests[0]).toMatchObject({ path: "/v1/commands", body: cancel });
+  });
+
   it("posts a valid agent.send envelope", async () => {
     const { h, requests } = setup();
     expect((await h.command(envelope)).ok).toBe(true);

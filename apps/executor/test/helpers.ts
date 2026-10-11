@@ -52,7 +52,7 @@ export const fakeCloud = (overrides: Partial<CloudClient> = {}) => {
     },
     renewLease: async () => {
       calls.push("renew");
-      return { leaseExpiresAt: lease() };
+      return { leaseExpiresAt: lease(), cancelRequested: false };
     },
     submitResult: async (input) => {
       calls.push("submit");

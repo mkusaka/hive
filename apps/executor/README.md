@@ -12,8 +12,12 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK) and `fake
 - `src/runner.ts`: `reconcile` (startup), `runOnce` (heartbeat → list queued → claim → journal the claim → fetch the
   run context → journal the launch intent → start the adapter → renew the lease every quarter of its remaining
   time → submit the result, with `reply` when the adapter returns `replyText` and the Job has a Conversation) and
-  `runLoop`. The adapter gets the context and an `observe(kind, payload)` callback for fenced observations. A `STALE_GENERATION` on renew stops the agent and submits nothing. Web-standard APIs only, so it also
-  runs inside workerd tests.
+  `runLoop`. The adapter gets the context and an `observe(kind, payload)` callback for fenced observations. A
+  `STALE_GENERATION` on renew stops the agent, submits nothing and, once the agent exited, sends
+  `runtime.run.stopped {confirmed: true}` (journal result `stopped`, or `stale_generation` if the cloud could not be
+  told). `cancelRequested` on a renewal (`job.cancel`) stops the agent with reason `cancelled` and submits `failed`
+  with error `cancelled`; the cloud finishes the Job `cancelled`. Web-standard APIs only, so it also runs inside
+  workerd tests.
 - `src/journal.ts`: the Local Journal file, `<state-dir>/journal.jsonl`, one fsynced JSON line per entry
   (`claim`, `intent`, `result`). The intent is written before the adapter starts (§20.2).
 - `src/adapters/fake.ts`: exits after `FAKE_DELAY_MS` (default 50) with code 0 and summary
@@ -43,9 +47,13 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK) and `fake
   `ANTHROPIC_API_KEY` in the environment would be used by the SDK, so keep it unset for subscription use. The
   SDK runs its bundled Claude Code (2.1.289 with SDK 0.3.289), not the installed `claude`.
 
-**Reconcile.** For each journaled claim without a result, `GET /v1/executor/runs/:id` decides: an active Run with
-the same generation is resumed (lease renewed, adapter started again); a terminal or unknown Run gets a result
-marker in the journal. Only then does the loop claim new Jobs.
+**Reconcile.** For each journaled claim without a result, or whose last result is an unconfirmed
+`stale_generation`, `GET /v1/executor/runs/:id` decides: a Run the cloud reports `unknown` (its lease expired) is
+confirmed stopped with `runtime.run.stopped {confirmed: true}` and journaled `stopped`, because nothing survives a
+restart (the adapter runs in-process); it is never restarted (AT-14). An active Run with the same generation and no
+result is resumed (lease renewed, adapter started again); a terminal Run gets its state as the result marker and a
+Run the cloud does not know gets `missing`. A failed confirmation is retried on the next start. Only then does the
+loop claim new Jobs.
 
 ## Running against `wrangler dev`
 
@@ -84,7 +92,9 @@ loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (
 - No R2 upload of transcripts or artifacts (the JSONL transcript stays local); no SessionStore adapter (G-07), so
   no cross-device resume.
 - No tools / permission broker: the Claude provider answers without tools. No Codex adapter.
-- Only `runtime.run.started` is observed; no usage / cost or other runtime events are sent to the cloud.
-- `runtime.run.started` stores the provider session id but does not move the Run from `starting` to `running`.
-- Lease expiry recovery is not automated; a Run whose lease expired stays active in the cloud.
+- Only `runtime.run.started` and `runtime.run.stopped` are observed; no usage / cost or other runtime events are
+  sent to the cloud. The fake adapter sends no `runtime.run.started`, so its Runs stay `starting`.
+- Stop confirmation trusts the in-process adapter: with a real process supervisor it must check the process (PID +
+  start identity) before confirming. A long-running loop confirms a stale Run only when its own renewal hits
+  `STALE_GENERATION`; a Run journaled by an earlier process is confirmed at the next start.
 - No scheduler / offers or WebSocket: the executor polls. Capacity is one Run at a time.

@@ -37,6 +37,17 @@ export const App = () => {
   const [botId, setBotId] = useState("");
   const [jobDetail, setJobDetail] = useState<Record<string, unknown> | null>(null);
 
+  /** job.cancel (§9.3): an active Job keeps running until its executor stops it; sync shows the outcome. */
+  const cancelJob = async (workspaceId: string, jobId: string) => {
+    const result = await window.hive.api.command({
+      operationId: crypto.randomUUID(),
+      idempotencyKey: crypto.randomUUID(),
+      workspaceId,
+      command: { type: "job.cancel", jobId },
+    });
+    if (!result.ok) setError(`${result.error.code}: ${result.error.message}`);
+  };
+
   // Refetches run from sync callbacks, so they read the current selection through refs.
   const selection = useRef({ channelId, botId });
   selection.current = { channelId, botId };
@@ -201,7 +212,12 @@ export const App = () => {
                       }
                     >
                       <Badge state={j.state} /> <span className="mono">{j.id}</span>
+                      {j.cancelRequestedAt ? " (cancel requested)" : ""}
                     </button>
+                    {["queued", "waiting_device", "active"].includes(String(j.state)) &&
+                      !j.cancelRequestedAt && (
+                        <button onClick={() => void cancelJob(ws, j.id)}>Cancel</button>
+                      )}
                   </li>
                 ))}
               </ul>

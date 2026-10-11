@@ -29,6 +29,7 @@ import {
   listJobs,
   listMessages,
   listProjects,
+  listRoutines,
   listSubscriptions,
   listTasks,
 } from "./queries.ts";
@@ -214,7 +215,9 @@ export const createApp = ({
   app.get("/v1/bots", async (c) => c.json(await listBots(c.env.DB, workspaceParam(c))));
   app.get("/v1/devices", async (c) => c.json(await listDevices(c.env.DB, workspaceParam(c))));
   app.get("/v1/jobs", async (c) =>
-    c.json(await listJobs(c.env.DB, workspaceParam(c), limitParam(c, 50, 200))),
+    c.json(
+      await listJobs(c.env.DB, workspaceParam(c), limitParam(c, 50, 200), c.req.query("state")),
+    ),
   );
 
   app.get("/v1/projects", async (c) => c.json(await listProjects(c.env.DB, workspaceParam(c))));
@@ -230,6 +233,7 @@ export const createApp = ({
     c.json(await getTask(c.env.DB, user(c).workspaceIds, c.req.param("id"))),
   );
 
+  app.get("/v1/routines", async (c) => c.json(await listRoutines(c.env.DB, workspaceParam(c))));
   app.get("/v1/subscriptions", async (c) =>
     c.json(await listSubscriptions(c.env.DB, workspaceParam(c))),
   );

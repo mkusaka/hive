@@ -9,10 +9,19 @@ import {
   DeviceRevoke,
   EventEmit,
   type EventEmitAccepted,
+  firstFireAt,
   IntegrationCreate,
+  JobCancel,
+  JobResolve,
   JobStart,
   type PlacementPolicy,
   ProjectCreate,
+  RoutineCreate,
+  RoutinePause,
+  RoutineResume,
+  RoutineRun,
+  type RoutineSchedule,
+  RoutineUpdate,
   SubscriptionCreate,
   SubscriptionDelete,
   SubscriptionPause,
@@ -45,6 +54,7 @@ import { hashSecret, newDeviceSecret } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
 import { HttpError } from "./errors.ts";
 import { eventColumns, type EventRow, type SubscriptionRow, subscriptionMatches } from "./pump.ts";
+import { occurrenceStatements, routineColumns, routineFrom, type RoutineRow } from "./routines.ts";
 
 export const CommandEnvelope = commandEnvelope(
   v.variant("type", [
@@ -62,12 +72,19 @@ export const CommandEnvelope = commandEnvelope(
     TaskComplete,
     TaskCancel,
     JobStart,
+    JobCancel,
+    JobResolve,
     SubscriptionCreate,
     SubscriptionUpdate,
     SubscriptionPause,
     SubscriptionDelete,
     SubscriptionTest,
     IntegrationCreate,
+    RoutineCreate,
+    RoutineUpdate,
+    RoutinePause,
+    RoutineResume,
+    RoutineRun,
   ]),
 );
 type Envelope = v.InferOutput<typeof CommandEnvelope>;
@@ -1215,6 +1232,338 @@ const integrationCreate: Handler<v.InferOutput<typeof IntegrationCreate>> = asyn
   );
 };
 
+// ------------------------------------------------- Job control (§9.3, §10.4)
+
+const terminalRunStates = "('succeeded', 'failed', 'interrupted', 'cancelled')";
+
+const loadJob = async (db: D1Database, workspaceId: string, jobId: string) => {
+  const job = await db
+    .prepare("SELECT state, revision FROM jobs WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, jobId)
+    .first<{ state: string; revision: number }>();
+  if (!job) throw new HttpError("NOT_FOUND", "job not found");
+  return job;
+};
+
+const jobChanged = (state: string) =>
+  new HttpError("REVISION_CONFLICT", `job is ${state}`, false, `job_${state}`);
+
+/**
+ * A request, not a stop (§9.3): a `queued` / `waiting_device` Job is `cancelled` at once; an `active` one keeps running
+ * until its executor sees `cancelRequested` on lease renewal and submits. A `recovery_required` Job uses job.resolve.
+ */
+const jobCancel: Handler<v.InferOutput<typeof JobCancel>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const job = await loadJob(db, workspaceId, command.jobId);
+  const waiting = job.state === "queued" || job.state === "waiting_device";
+  if (!waiting && job.state !== "active") throw jobChanged(job.state);
+  const now = new Date().toISOString();
+  const [setGuard, clearGuard] = guard(db);
+  const run = receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE jobs SET state = ?, cancel_requested_at = COALESCE(cancel_requested_at, ?),
+             revision = revision + 1, updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND state = ? AND revision = ?`,
+        )
+        .bind(
+          waiting ? "cancelled" : "active",
+          now,
+          now,
+          workspaceId,
+          command.jobId,
+          job.state,
+          job.revision,
+        ),
+      setGuard,
+      clearGuard,
+    ],
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      jobId: command.jobId,
+      state: waiting ? "cancelled" : "active",
+      cancelRequested: true,
+    },
+    [
+      {
+        entityKind: "job",
+        entityId: command.jobId,
+        revision: job.revision + 1,
+        scope: `workspace:${workspaceId}`,
+      },
+    ],
+  );
+  return explainFailure(run, async () => {
+    const current = await loadJob(db, workspaceId, command.jobId);
+    return new HttpError(
+      "REVISION_CONFLICT",
+      `job is ${current.state}; retry`,
+      true,
+      "job_changed",
+    );
+  });
+};
+
+/**
+ * Human resolution of a `recovery_required` Job (§10.4, AT-13). `retry` queues it again only once the old Run's stop
+ * is confirmed (it is terminal, so the one-active-root index lets a new claim in, with generation + 1).
+ */
+const jobResolve: Handler<v.InferOutput<typeof JobResolve>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const job = await loadJob(db, workspaceId, command.jobId);
+  if (job.state !== "recovery_required") throw jobChanged(job.state);
+  const unconfirmed = `EXISTS (SELECT 1 FROM runs WHERE workspace_id = jobs.workspace_id AND job_id = jobs.id
+    AND kind = 'root' AND state NOT IN ${terminalRunStates})`;
+  if (command.action === "retry") {
+    const busy = await db
+      .prepare(`SELECT ${unconfirmed} AS busy FROM jobs WHERE workspace_id = ? AND id = ?`)
+      .bind(workspaceId, command.jobId)
+      .first<{ busy: number }>();
+    if (busy?.busy) {
+      throw new HttpError(
+        "RESOURCE_BUSY",
+        "the previous run's stop is not confirmed",
+        true,
+        "unconfirmed_stop",
+      );
+    }
+  }
+  const state = { retry: "queued", cancel: "cancelled", mark_failed: "failed" }[command.action];
+  const now = new Date().toISOString();
+  const [setGuard, clearGuard] = guard(db);
+  const run = receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE jobs SET state = ?, revision = revision + 1, updated_at = ?,
+             cancel_requested_at = CASE ? WHEN 'cancelled' THEN COALESCE(cancel_requested_at, ?)
+               WHEN 'queued' THEN NULL ELSE cancel_requested_at END
+            WHERE workspace_id = ? AND id = ? AND state = 'recovery_required' AND revision = ?
+              ${command.action === "retry" ? `AND NOT ${unconfirmed}` : ""}`,
+        )
+        .bind(state, now, state, now, workspaceId, command.jobId, job.revision),
+      setGuard,
+      clearGuard,
+    ],
+    { operationId: env.operationId, status: "accepted", jobId: command.jobId, state },
+    [
+      {
+        entityKind: "job",
+        entityId: command.jobId,
+        revision: job.revision + 1,
+        scope: `workspace:${workspaceId}`,
+      },
+    ],
+  );
+  return explainFailure(run, async () => {
+    const current = await loadJob(db, workspaceId, command.jobId);
+    return current.state === "recovery_required" && current.revision === job.revision
+      ? new HttpError(
+          "RESOURCE_BUSY",
+          "the previous run's stop is not confirmed",
+          true,
+          "unconfirmed_stop",
+        )
+      : jobChanged(current.state);
+  });
+};
+
+// ------------------------------------------------ Routines (docs/architecture.md §17.2)
+
+const loadRoutine = async (db: D1Database, workspaceId: string, id: string) => {
+  const row = await db
+    .prepare(`SELECT ${routineColumns} FROM ${routineFrom} WHERE r.workspace_id = ? AND r.id = ?`)
+    .bind(workspaceId, id)
+    .first<RoutineRow>();
+  if (!row) throw new HttpError("NOT_FOUND", "routine not found");
+  return row;
+};
+
+const routineChange = (workspaceId: string, id: string, revision?: number): Change => ({
+  entityKind: "routine",
+  entityId: id,
+  ...(revision === undefined ? {} : { revision }),
+  scope: `workspace:${workspaceId}`,
+});
+
+/** The Conversation (if any) must be one whose Channel the caller is a member of; a Task must exist. */
+const routineCreate: Handler<v.InferOutput<typeof RoutineCreate>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const bot = await db
+    .prepare("SELECT 1 FROM bots WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, command.botId)
+    .first();
+  if (!bot) throw new HttpError("NOT_FOUND", "bot not found");
+  if (command.conversationId) {
+    await checkDestination(db, workspaceId, user.userId, {
+      conversationId: command.conversationId,
+      ...(command.taskId ? { taskId: command.taskId } : {}),
+    });
+  } else if (command.taskId) {
+    await loadTask(db, workspaceId, command.taskId);
+  }
+  const routineId = crypto.randomUUID();
+  const nextFireAt = firstFireAt(command.schedule, Date.now());
+  return receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          `INSERT INTO routines (id, workspace_id, bot_id, name, conversation_id, task_id, input_text, schedule, misfire,
+             next_fire_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          routineId,
+          workspaceId,
+          command.botId,
+          command.name,
+          command.conversationId ?? null,
+          command.taskId ?? null,
+          command.inputText,
+          JSON.stringify(command.schedule),
+          command.misfire,
+          nextFireAt,
+        ),
+    ],
+    { operationId: env.operationId, status: "accepted", routineId, revision: 1, nextFireAt },
+    [routineChange(workspaceId, routineId, 1)],
+  );
+};
+
+const staleRoutine = (revision: number) =>
+  new HttpError(
+    "REVISION_CONFLICT",
+    `routine revision is ${revision}; refetch and retry`,
+    false,
+    "stale_revision",
+  );
+
+/** Revision CAS. A new schedule bumps `schedule_revision` and restarts `next_fire_at` from now. */
+const routineUpdate: Handler<v.InferOutput<typeof RoutineUpdate>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const current = await loadRoutine(db, workspaceId, command.routineId);
+  const schedule = command.schedule;
+  const nextFireAt = schedule ? firstFireAt(schedule, Date.now()) : current.next_fire_at;
+  const [setGuard, clearGuard] = guard(db);
+  const run = receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE routines SET name = COALESCE(?, name), input_text = COALESCE(?, input_text),
+             misfire = COALESCE(?, misfire), schedule = COALESCE(?, schedule),
+             schedule_revision = schedule_revision + ?, next_fire_at = ?, revision = revision + 1, updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND revision = ?`,
+        )
+        .bind(
+          command.name ?? null,
+          command.inputText ?? null,
+          command.misfire ?? null,
+          schedule ? JSON.stringify(schedule) : null,
+          schedule ? 1 : 0,
+          nextFireAt,
+          new Date().toISOString(),
+          workspaceId,
+          command.routineId,
+          command.expectedRevision,
+        ),
+      setGuard,
+      clearGuard,
+    ],
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      routineId: command.routineId,
+      revision: command.expectedRevision + 1,
+      nextFireAt,
+    },
+    [routineChange(workspaceId, command.routineId, command.expectedRevision + 1)],
+  );
+  return explainFailure(run, async () => {
+    const row = await loadRoutine(db, workspaceId, command.routineId);
+    return row.revision === command.expectedRevision ? null : staleRoutine(row.revision);
+  });
+};
+
+/** Stops new occurrences. Pausing a paused Routine changes nothing. */
+const routinePause: Handler<v.InferOutput<typeof RoutinePause>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  await loadRoutine(db, workspaceId, command.routineId);
+  return receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE routines SET enabled = 0, revision = revision + 1, updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND enabled = 1`,
+        )
+        .bind(new Date().toISOString(), workspaceId, command.routineId),
+    ],
+    { operationId: env.operationId, status: "accepted", routineId: command.routineId },
+    [routineChange(workspaceId, command.routineId)],
+  );
+};
+
+/** Restarts from now, so occurrences missed while paused are never created. */
+const routineResume: Handler<v.InferOutput<typeof RoutineResume>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const current = await loadRoutine(db, workspaceId, command.routineId);
+  const nextFireAt = firstFireAt(JSON.parse(current.schedule) as RoutineSchedule, Date.now());
+  return receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE routines SET enabled = 1, next_fire_at = ?, revision = revision + 1, updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND enabled = 0`,
+        )
+        .bind(nextFireAt, new Date().toISOString(), workspaceId, command.routineId),
+    ],
+    { operationId: env.operationId, status: "accepted", routineId: command.routineId, nextFireAt },
+    [routineChange(workspaceId, command.routineId)],
+  );
+};
+
+/** Manual run: an occurrence at now through the same Inbox item + Job path as a tick (§17.2). */
+const routineRun: Handler<v.InferOutput<typeof RoutineRun>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const routine = await loadRoutine(db, workspaceId, command.routineId);
+  const scheduledAt = new Date().toISOString();
+  const occurrence = occurrenceStatements(db, routine, scheduledAt);
+  return receipt(
+    db,
+    user,
+    env,
+    occurrence.statements,
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      routineId: routine.id,
+      occurrenceId: occurrence.occurrenceId,
+      jobId: occurrence.jobId,
+      scheduledAt,
+    },
+    occurrence.changes,
+  );
+};
+
 const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>> } = {
   "workspace.create": workspaceCreate,
   "device.register": deviceRegister,
@@ -1236,6 +1585,13 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "subscription.delete": subscriptionDelete,
   "subscription.test": subscriptionTest,
   "integration.create": integrationCreate,
+  "job.cancel": jobCancel,
+  "job.resolve": jobResolve,
+  "routine.create": routineCreate,
+  "routine.update": routineUpdate,
+  "routine.pause": routinePause,
+  "routine.resume": routineResume,
+  "routine.run": routineRun,
 };
 
 export const runCommand = (db: D1Database, principal: Principal, envelope: Envelope) => {

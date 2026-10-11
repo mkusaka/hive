@@ -47,8 +47,8 @@ describe("runOnce", () => {
     expect(submitted).toEqual([expect.objectContaining({ state: "failed", error: "FAKE_FAIL" })]);
   });
 
-  it("stops the agent on a stale generation and submits nothing", async () => {
-    const { cloud, calls } = fakeCloud({
+  it("stops the agent on a stale generation, submits nothing and confirms the stop", async () => {
+    const { cloud, calls, observed } = fakeCloud({
       renewLease: async () => {
         throw stale();
       },
@@ -56,14 +56,44 @@ describe("runOnce", () => {
     const journal = memoryJournal();
     const started = Date.now();
     const result = await runOnce({ cloud, journal, adapter: fakeAdapter({ delayMs: 5_000 }) });
-    expect(result?.state).toBe("stale_generation");
+    expect(result?.state).toBe("stopped");
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(calls).not.toContain("submit");
-    expect(journal.entries.at(-1)).toEqual({
-      kind: "result",
-      runId: "run-1",
-      state: "stale_generation",
+    expect(observed).toEqual([
+      {
+        runId: "run-1",
+        executionGeneration: 1,
+        kind: "runtime.run.stopped",
+        payload: { confirmed: true },
+      },
+    ]);
+    expect(journal.entries.at(-1)).toEqual({ kind: "result", runId: "run-1", state: "stopped" });
+  });
+
+  it("stops the agent when renewal reports cancelRequested and submits failed / cancelled", async () => {
+    const stops: string[] = [];
+    const { cloud, submitted } = fakeCloud({
+      renewLease: async () => ({
+        leaseExpiresAt: new Date(Date.now() + 40).toISOString(),
+        cancelRequested: true,
+      }),
     });
+    const inner = fakeAdapter({ delayMs: 5_000 });
+    const adapter: AgentAdapter = {
+      start: async (ctx) => {
+        const agent = await inner.start(ctx);
+        return {
+          ...agent,
+          requestStop: async (reason) => (stops.push(reason), agent.requestStop(reason)),
+        };
+      },
+    };
+    const started = Date.now();
+    const result = await runOnce({ cloud, journal: memoryJournal(), adapter });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(stops).toEqual(["cancelled"]);
+    expect(result?.state).toBe("failed");
+    expect(submitted).toEqual([expect.objectContaining({ state: "failed", error: "cancelled" })]);
   });
 });
 
@@ -101,6 +131,62 @@ describe("reconcile", () => {
     expect(await reconcile({ cloud, journal, adapter: fakeAdapter() })).toEqual([]);
     expect(calls).toEqual([]);
     expect(journal.entries.at(-1)).toEqual({ kind: "result", runId: "run-1", state: "succeeded" });
+  });
+});
+
+const unknownRun = async (id: string) => ({
+  id,
+  jobId: "job-1",
+  state: "unknown",
+  executionGeneration: 1,
+  active: false,
+});
+
+describe("reconcile of unknown Runs", () => {
+  const claimed: JournalEntry = {
+    kind: "claim",
+    runId: "run-1",
+    jobId: "job-1",
+    executionGeneration: 1,
+    inboxItemId: "inbox-1",
+  };
+
+  it.each([
+    ["a claim without a result", [claimed, { kind: "intent", runId: "run-1" }] as JournalEntry[]],
+    [
+      "an unconfirmed stale result",
+      [claimed, { kind: "result", runId: "run-1", state: "stale_generation" }] as JournalEntry[],
+    ],
+  ])("confirms the stop of %s, never restarting the agent", async (_, entries) => {
+    const { cloud, calls, observed } = fakeCloud({ getRun: unknownRun });
+    const journal = memoryJournal(entries);
+    expect(await reconcile({ cloud, journal, adapter: fakeAdapter() })).toEqual([]);
+    expect(calls).toEqual(["observe"]);
+    expect(observed).toEqual([
+      {
+        runId: "run-1",
+        executionGeneration: 1,
+        kind: "runtime.run.stopped",
+        payload: { confirmed: true },
+      },
+    ]);
+    expect(journal.entries.at(-1)).toEqual({ kind: "result", runId: "run-1", state: "stopped" });
+    // Settled: a second reconcile asks nothing.
+    calls.length = 0;
+    expect(await reconcile({ cloud, journal, adapter: fakeAdapter() })).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  it("retries the confirmation on the next start when the cloud could not be told", async () => {
+    const { cloud } = fakeCloud({
+      getRun: unknownRun,
+      observe: async () => {
+        throw new Error("offline");
+      },
+    });
+    const journal = memoryJournal([claimed]);
+    await reconcile({ cloud, journal, adapter: fakeAdapter() });
+    expect(journal.entries).toEqual([claimed]);
   });
 });
 
