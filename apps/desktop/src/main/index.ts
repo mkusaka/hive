@@ -1,15 +1,18 @@
 // Electron main: owns the Access assertion, all HTTP and the Realtime WebSocket (docs/architecture.md §20.1).
-// The renderer gets only the typed IPC surface in src/shared/api.ts.
+// The renderer gets only the typed IPC surface in src/shared/api.ts. It also owns the executor launchd service, whose
+// program is this app started with `--executor` (headless executor mode, see README "Executor service").
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { accessTokens, login, systemBrowser } from "@hive/cli/accessLogin";
-import type { Credentials } from "@hive/cli/cli";
+import { type Credentials, run } from "@hive/cli/cli";
 import { CliError, createClient } from "@hive/cli/client";
+import { deps } from "@hive/cli/deps";
+import * as service from "@hive/cli/service";
 import { app, BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
 import { channels, type HiveConfig, type RealtimeEvent } from "../shared/api.ts";
-import { handlers } from "./ipc.ts";
+import { executorHandlers, handlers } from "./ipc.ts";
 
 // Same file and env override as the CLI (apps/cli/src/main.ts): one credential store, so a login or refresh by
 // either client is seen by the other.
@@ -165,6 +168,10 @@ const createWindow = async () => {
   );
   ipcMain.handle(channels.get, guard(h.get));
   ipcMain.handle(channels.command, guard(h.command));
+  const e = executorHandlers(servicedProgram(), async () => registered(await loadCredentials()));
+  ipcMain.handle(channels.executorStatus, guard(e.status));
+  ipcMain.handle(channels.executorStart, guard(e.start));
+  ipcMain.handle(channels.executorStop, guard(e.stop));
 
   win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   win.webContents.on("will-navigate", (event, url) => {
@@ -200,6 +207,45 @@ const createWindow = async () => {
   await win.loadURL(rendererUrl);
 };
 
-app.on("window-all-closed", () => app.quit());
+/** What the launchd service runs: this Electron build in headless executor mode; `--provider` etc. are appended. */
+const servicedProgram = () => [process.execPath, app.getAppPath(), "--executor"];
+const registered = (creds: Credentials) => Boolean(creds.deviceToken && creds.apiUrl);
+
+/**
+ * On every window-mode start: (re)install the service when it is missing, stopped or runs another program, keeping
+ * the installed provider / concurrency (default claude, 1). Quitting the app leaves the service running (§20.1).
+ */
+const reconcileService = async () => {
+  if (process.platform !== "darwin") return;
+  if (!registered(await loadCredentials()))
+    return console.log("executor service: device not registered, not installed");
+  const current = await service.status();
+  const result = await service.ensure({
+    program: servicedProgram(),
+    provider: current.provider ?? "claude",
+    concurrency: current.concurrency ?? 1,
+  });
+  console.log(
+    `executor service ${result.label}: ${result.changed ? "installed" : "unchanged"}, ` +
+      `provider ${result.provider}, concurrency ${result.concurrency}, pid ${result.pid ?? "none"}`,
+  );
+};
+
 // Not a top-level await: Electron emits `ready` only after the ESM main module has finished evaluating.
-void app.whenReady().then(createWindow);
+if (app.commandLine.hasSwitch("executor")) {
+  // Headless executor mode (the launchd service): the CLI's `executor run`, then exit with the loop.
+  void app.whenReady().then(async () => {
+    app.dock?.hide();
+    const options = process.argv.slice(process.argv.indexOf("--executor") + 1);
+    app.exit(await run(["executor", "run", ...options], deps));
+  });
+} else {
+  app.on("window-all-closed", () => app.quit());
+  void app.whenReady().then(() => {
+    // Independent of the window: a failed page load must not skip the reconcile.
+    void reconcileService().catch((error: unknown) =>
+      console.error(`executor service: ${String(error)}`),
+    );
+    return createWindow();
+  });
+}

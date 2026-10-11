@@ -75,22 +75,54 @@ img-src 'self'`. `'unsafe-inline'` styles are for Vite's dev-time `<style>` inje
 
 ## IPC surface (`src/shared/api.ts`)
 
-| `window.hive`      | Channel            | Validation / behavior                                                                                                                                   |
-| ------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `api.get(path)`    | `hive:api.get`     | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, the query also allows URLSearchParams' `+` and `*`, no `..` anywhere                            |
-| `api.command(env)` | `hive:api.command` | `commandEnvelope(variant [AgentSend, JobCancel, ApprovalResolve, MemoryWrite])`: only `agent.send`, `job.cancel`, `approval.resolve` and `memory.write` |
-| `getConfig()`      | `hive:config`      | `{apiUrl, workspaceId, problem, connection}`; no secrets                                                                                                |
-| `onRealtime(cb)`   | `hive:realtime`    | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                                                             |
+| `window.hive`       | Channel                | Validation / behavior                                                                                                                                   |
+| ------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `api.get(path)`     | `hive:api.get`         | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, the query also allows URLSearchParams' `+` and `*`, no `..` anywhere                            |
+| `api.command(env)`  | `hive:api.command`     | `commandEnvelope(variant [AgentSend, JobCancel, ApprovalResolve, MemoryWrite])`: only `agent.send`, `job.cancel`, `approval.resolve` and `memory.write` |
+| `getConfig()`       | `hive:config`          | `{apiUrl, workspaceId, problem, connection}`; no secrets                                                                                                |
+| `onRealtime(cb)`    | `hive:realtime`        | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                                                             |
+| `executor.status()` | `hive:executor.status` | launchd state, pid, last exit code, installed provider / concurrency / argv, plist and log paths, `registered`; never the plist's env values            |
+| `executor.start(o)` | `hive:executor.start`  | `{provider: fake\|claude\|codex, concurrency: 1..64}` (strict); installs or replaces the service; `UNAUTHENTICATED` without a device token              |
+| `executor.stop()`   | `hive:executor.stop`   | `launchctl bootout` only; the plist stays                                                                                                               |
 
 `api.*` never rejects: it resolves to `{ok: true, value}` or `{ok: false, error: {code, message, body?}}`, where
 `code` is the `ApiError` code (e.g. `CURSOR_EXPIRED`), `INVALID_ARGS` for rejected arguments, or a CLI client code
 (`NETWORK`, `UNAUTHENTICATED`). An error thrown across `ipcMain.handle` would keep only its message.
 
+## Executor service
+
+The app owns the Local Executor's launchd user agent `com.hive.executor` (docs/architecture.md §20.1); its program is
+this app in headless executor mode, so the service always runs the installed Electron build.
+
+- **Headless mode.** `<Electron> <app path> --executor --provider P --concurrency N` opens no window, hides the Dock
+  icon and runs the CLI's `executor run` (`run()` from `@hive/cli/cli` with `deps` from `@hive/cli/deps`, the same
+  code path as `hive executor run`), then exits with the loop. SIGTERM stops it within 10 s as in the CLI.
+- **Reconcile on every start.** In window mode on macOS, when the credentials file has `deviceToken` and `apiUrl`,
+  main renders the plist for this build (`[process.execPath, app.getAppPath(), "--executor"]` plus the installed
+  provider / concurrency, default `claude`, 1) and reinstalls it unless the file on disk is byte-identical and the
+  agent runs with a pid (`ensure` in `apps/cli/src/service.ts`). It logs the result (names, no values). Without a
+  device token nothing is installed and the Devices view says to run `hive device register`.
+- **Closing the window or quitting the app leaves the service running.**
+- **Devices view, Executor section.** State (not installed / loaded + pid / stopped + last exit code), the installed
+  provider and concurrency, the program's first path (to see drift), log paths, a provider select, a concurrency
+  input, Start and Stop; polled every 10 s while the view is open. Start installs the service with the chosen
+  options. Stop only unloads it (`launchctl bootout`): the plist stays and the next app start brings it back.
+  Permanent removal is `hive executor uninstall`.
+- **Program path.** In dev, `process.execPath` is the Electron binary under `node_modules` and `app.getAppPath()` is
+  `apps/desktop` (its `package.json` `main` is `out/main/index.js`), so the service runs the last `build` / `dev`
+  output. A packaged app would give the `.app` binary and its `app.asar`; packaging is not done yet.
+- **Bundling.** main bundles `@hive/cli`, `@hive/contracts` and `@hive/executor` (TypeScript sources); the Claude
+  Agent SDK and `zod` are app dependencies and stay external, so the SDK resolves its own files at runtime.
+- **Environment.** The plist captures main's environment like `hive executor install` (`PATH`, `HOME`, and
+  `XDG_CONFIG_HOME` / `CLAUDE_CONFIG_DIR` / `CLAUDE_CODE_OAUTH_TOKEN` when set). A start with a different set of
+  these (another shell, Finder) reinstalls the service with that set.
+
 ## Tests
 
 `bun run test` from the repo root (Node environment, Electron is never launched): `test/sync.test.ts` (bootstrap,
-refetch sets by scope, paging, 410 re-bootstrap, failed pull) and `test/ipc.test.ts` (path and envelope
-rejection, ApiError mapping, Access header injection).
+refetch sets by scope, paging, 410 re-bootstrap, failed pull), `test/ipc.test.ts` (path and envelope
+rejection, ApiError mapping, Access header injection) and `test/executor.test.ts` (executor IPC argument rejection,
+unregistered device, error mapping; the service module is mocked).
 
 ## Known gaps
 
@@ -106,6 +138,10 @@ rejection, ApiError mapping, Access header injection).
 - Inbox state and Job ids are not linked in the UI; accepted / delivered / started / completed are shown only as
   the raw states of the operation, inbox item and Job.
 - No packaging or installer (electron-builder).
+- Executor service: macOS only; no device registration in the app; a Claude Run under launchd was verified only with
+  `CLAUDE_CONFIG_DIR` captured from the starting shell (keychain login); launched from Finder, main has
+  launchd's minimal `PATH`, which the service then inherits. The Executor section is hidden while the window shows
+  the Login button or a credentials problem.
 - Search / Memory: one page of hits (no cursor paging), no kind filter, no memory delete or supersede; the Memory
   view refetches only on its own changes (memory change rows do not refresh it).
 - Approvals: the Bash command summary is shown as text without a diff view or the full input (it never leaves the

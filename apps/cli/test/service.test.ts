@@ -1,5 +1,43 @@
-import { describe, expect, it } from "vitest";
-import { captureEnv, parseLaunchctlPrint, renderPlist } from "../src/service.ts";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  captureEnv,
+  ensure,
+  parseLaunchctlPrint,
+  parsePlist,
+  renderPlist,
+  status,
+} from "../src/service.ts";
+
+// launchctl and the plist file, faked: `loaded` answers `launchctl print`, `files` is the disk.
+const fake = vi.hoisted(() => ({
+  files: new Map<string, string>(),
+  loaded: "" as string | null,
+  calls: [] as string[],
+}));
+vi.mock("node:fs/promises", () => ({
+  mkdir: async () => undefined,
+  chmod: async () => undefined,
+  rm: async (path: string) => void fake.files.delete(path),
+  writeFile: async (path: string, data: string) => void fake.files.set(path, data),
+  readFile: async (path: string) => {
+    const data = fake.files.get(path);
+    if (data === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    return data;
+  },
+}));
+vi.mock("node:child_process", () => ({
+  execFile: (
+    _: string,
+    args: string[],
+    __: unknown,
+    cb: (error: unknown, out?: { stdout: string }) => void,
+  ) => {
+    fake.calls.push(args[0]!);
+    if (args[0] === "print" && fake.loaded === null)
+      return cb(Object.assign(new Error("x"), { stderr: "Could not find service" }));
+    cb(null, { stdout: args[0] === "print" ? (fake.loaded ?? "") : "" });
+  },
+}));
 
 describe("captureEnv", () => {
   it("keeps only the executor's variables, and the optional ones only when set", () => {
@@ -105,5 +143,73 @@ describe("parseLaunchctlPrint", () => {
       pid: null,
       lastExitCode: "0",
     });
+  });
+});
+
+const input = {
+  program: ["/app/Electron", "/app", "--executor"],
+  provider: "fake",
+  concurrency: 2,
+};
+
+describe("parsePlist", () => {
+  it("reads provider, concurrency and argv from ProgramArguments only", () => {
+    const xml = renderPlist({
+      args: [...input.program, "--provider", "claude", "--concurrency", "3"],
+      env: { CLAUDE_CODE_OAUTH_TOKEN: "secret-token", PATH: "/a&b" },
+      workingDirectory: "/w",
+      logs: { stdout: "/o", stderr: "/e" },
+    });
+    const parsed = parsePlist(xml);
+    expect(parsed).toEqual({
+      provider: "claude",
+      concurrency: 3,
+      program: [...input.program, "--provider", "claude", "--concurrency", "3"],
+    });
+    expect(JSON.stringify(parsed)).not.toContain("secret-token");
+  });
+});
+
+describe("ensure", () => {
+  beforeEach(() => {
+    // CI runs on Linux; the module is macOS-only.
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    fake.files.clear();
+    fake.calls.length = 0;
+    fake.loaded = null;
+  });
+  // Installs once for real (through the fakes) so the plist on disk is the rendered one.
+  const installed = async () => {
+    await ensure(input);
+    fake.calls.length = 0;
+  };
+
+  it("leaves an identical plist that is loaded with a pid alone", async () => {
+    await installed();
+    fake.loaded = printed;
+    expect(await ensure(input)).toMatchObject({ changed: false, pid: 4242, provider: "fake" });
+    expect(fake.calls).not.toContain("bootstrap");
+  });
+
+  it("reinstalls when the plist differs", async () => {
+    await installed();
+    fake.loaded = printed;
+    const result = await ensure({ ...input, provider: "claude" });
+    expect(result).toMatchObject({ changed: true, provider: "claude", concurrency: 2 });
+    expect(fake.calls).toEqual(["print", "bootout", "bootstrap", "print"]);
+  });
+
+  it("reinstalls an identical plist that is not loaded, or loaded without a pid", async () => {
+    await installed();
+    expect(await ensure(input)).toMatchObject({ changed: true });
+    expect(fake.calls).toContain("bootstrap");
+    fake.loaded = printed.replace("\tpid = 4242\n", "");
+    fake.calls.length = 0;
+    expect(await ensure(input)).toMatchObject({ changed: true });
+    expect(fake.calls).toContain("bootstrap");
+  });
+
+  it("reports a missing plist as not installed", async () => {
+    expect(await status()).toMatchObject({ loaded: false, installed: false });
   });
 });

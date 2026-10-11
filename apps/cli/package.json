@@ -10,7 +10,9 @@
     "./client": "./src/client.ts",
     "./commands": "./src/commands.ts",
     "./cli": "./src/cli.ts",
-    "./accessLogin": "./src/accessLogin.ts"
+    "./accessLogin": "./src/accessLogin.ts",
+    "./deps": "./src/deps.ts",
+    "./service": "./src/service.ts"
   },
   "dependencies": {
     "@hive/contracts": "workspace:*",

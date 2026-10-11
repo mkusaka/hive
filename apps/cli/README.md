@@ -127,7 +127,7 @@ a fresh UUID per invocation).
 
 ```sh
 hive executor install --provider claude [--concurrency N]   # writes and loads the launchd agent, prints captured env names
-hive executor status                                        # loaded, state, pid, last exit code, plist and log paths
+hive executor status                                        # loaded, state, pid, last exit code, installed, provider, concurrency, program, plist and log paths
 hive executor uninstall                                     # bootout + removes the plist; logs and credentials stay
 ```
 
@@ -144,6 +144,11 @@ hive executor uninstall                                     # bootout + removes 
   running agents (their Runs get no result, so the restarted executor resumes them through reconcile) and exits
   within 10 s. `KeepAlive` restarts it after any
   exit except `uninstall`.
+- `status` also reads the plist's `ProgramArguments` (never its environment values): `installed`, `provider`,
+  `concurrency` and the full `program` argv.
+- The desktop app owns the same agent and reinstalls it with its own program (Electron in headless executor mode)
+  on every start; after `hive executor install` the next app start replaces the CLI program, keeping provider and
+  concurrency (`apps/desktop/README.md`, Executor service).
 - Other platforms: the three commands exit 2 with "not supported yet".
 
 ## Credentials
@@ -209,7 +214,7 @@ hive executor uninstall                                     # bootout + removes 
   `apps/api-worker/test/cli.test.ts` runs them in workerd.
 - `src/accessLogin.ts`: Managed OAuth login, refresh and the browser opener (Node only; reused by
   `apps/desktop`).
-- `src/cli.ts`: `node:util` `parseArgs` dispatcher; I/O is injected. `src/main.ts`: real files, stdin, executor.
+- `src/cli.ts`: `node:util` `parseArgs` dispatcher; I/O is injected. `src/main.ts`: the entrypoint; `src/deps.ts`: real files, stdin, executor (also used by the desktop app's headless executor mode).
 
 ## Tests
 

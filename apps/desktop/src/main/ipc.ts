@@ -1,5 +1,6 @@
 // IPC argument validation and the HTTP calls behind it. No `electron` import, so it runs under vitest.
 import { CliError, type Client } from "@hive/cli/client";
+import * as service from "@hive/cli/service";
 import {
   AgentSend,
   ApprovalResolve,
@@ -59,4 +60,32 @@ export const handlers = (client: Client) => ({
     const { command, ...rest } = parsed.value;
     return toResult(() => client.command(rest, command));
   },
+});
+
+/** `executor.start` input: the CLI's `--provider` and `--concurrency` (1..64). */
+export const ExecutorStart = v.strictObject({
+  provider: v.picklist(["fake", "claude", "codex"]),
+  concurrency: v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(64)),
+});
+
+const notRegistered = "this device is not registered: run `hive device register`";
+
+/**
+ * The executor launchd service (README "Executor service"). `program` is the headless Electron argv prefix; the plist's
+ * environment values never leave main (status returns names and argv only).
+ */
+export const executorHandlers = (program: string[], registered: () => Promise<boolean>) => ({
+  status: () =>
+    toResult(async () => ({ ...(await service.status()), registered: await registered() })),
+  /** Installs (or replaces) the service with this provider / concurrency. */
+  start: (input: unknown) => {
+    const parsed = parse(ExecutorStart, input);
+    if (!parsed.ok) return Promise.resolve(invalid(parsed.issues));
+    return toResult(async () => {
+      if (!(await registered())) throw new CliError("UNAUTHENTICATED", 3, notRegistered);
+      return service.install({ program, ...parsed.value });
+    });
+  },
+  /** `launchctl bootout` only: the plist stays, so the next app start brings the service back. */
+  stop: () => toResult(service.stop),
 });

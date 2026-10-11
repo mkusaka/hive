@@ -1,5 +1,6 @@
 // `hive` argv dispatcher (docs/architecture.md §23). I/O, credentials and the executor journal are injected
 // by main.ts, so tests drive `run` with fakes.
+import { fileURLToPath } from "node:url";
 import { type ParseArgsOptionsConfig, parseArgs } from "node:util";
 import { parseConcurrency } from "@hive/executor/capabilities";
 import {
@@ -862,7 +863,14 @@ const specs: Record<string, Spec> = {
         throw new CliError("UNAUTHENTICATED", 3, "no deviceToken: run `hive device register`");
       if (!c.creds.apiUrl) throw invalid("no apiUrl in the credentials file");
       const service = await import("./service.ts");
-      c.print(await service.install(provider, concurrency));
+      const main = fileURLToPath(new URL("main.ts", import.meta.url));
+      c.print(
+        await service.install({
+          program: [process.execPath, main, "executor", "run"],
+          provider,
+          concurrency,
+        }),
+      );
     },
   },
   "executor uninstall": {

@@ -7,6 +7,11 @@ const hive: HiveApi = {
     get: (path) => ipcRenderer.invoke(channels.get, path),
     command: (envelope) => ipcRenderer.invoke(channels.command, envelope),
   },
+  executor: {
+    status: () => ipcRenderer.invoke(channels.executorStatus),
+    start: (input) => ipcRenderer.invoke(channels.executorStart, input),
+    stop: () => ipcRenderer.invoke(channels.executorStop),
+  },
   onRealtime: (cb) => {
     const listener = (_: unknown, event: RealtimeEvent) => cb(event);
     ipcRenderer.on(channels.realtime, listener);

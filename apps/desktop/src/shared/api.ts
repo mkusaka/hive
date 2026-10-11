@@ -43,8 +43,16 @@ export type HiveConfig = {
   connection: "connected" | "reconnecting";
 };
 
+export type ExecutorProvider = "fake" | "claude" | "codex";
+
 export type HiveApi = {
   api: { get(path: string): Promise<ApiResult>; command(envelope: UiCommand): Promise<ApiResult> };
+  /** The executor launchd service: status (with `registered`), start (= install with these options), stop. */
+  executor: {
+    status(): Promise<ApiResult>;
+    start(input: { provider: ExecutorProvider; concurrency: number }): Promise<ApiResult>;
+    stop(): Promise<ApiResult>;
+  };
   onRealtime(cb: (event: RealtimeEvent) => void): () => void;
   getConfig(): Promise<HiveConfig>;
   login(): Promise<{ ok: true } | { ok: false; message: string }>;
@@ -56,4 +64,7 @@ export const channels = {
   config: "hive:config",
   login: "hive:login",
   realtime: "hive:realtime",
+  executorStatus: "hive:executor.status",
+  executorStart: "hive:executor.start",
+  executorStop: "hive:executor.stop",
 } as const;

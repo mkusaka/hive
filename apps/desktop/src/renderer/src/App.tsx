@@ -2,7 +2,7 @@
 // and a status bar (docs/architecture.md §21).
 /* oxlint-disable no-await-in-loop */
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { HiveConfig } from "../../shared/api.ts";
+import type { ExecutorProvider, HiveConfig } from "../../shared/api.ts";
 import { createSync, type ListKey, type SyncStatus } from "./sync.ts";
 
 type Row = Record<string, unknown> & { id: string };
@@ -343,6 +343,7 @@ export const App = () => {
           />
         )}
         {view === "memory" && <MemoryView ws={ws} channels={channels} bots={bots} />}
+        {view === "devices" && <ExecutorPanel />}
         {view === "devices" && (
           <section>
             <h2>Devices</h2>
@@ -391,6 +392,117 @@ export const App = () => {
         {sync.error && <span className="error">{sync.error}</span>}
       </footer>
     </div>
+  );
+};
+
+/**
+ * This PC's executor launchd service (README "Executor service"), polled every 10 s while shown. Stop only unloads it;
+ * the next app start brings it back (permanent removal: `hive executor uninstall`).
+ */
+const ExecutorPanel = () => {
+  const [status, setStatus] = useState<Record<string, unknown> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [provider, setProvider] = useState<ExecutorProvider>("claude");
+  const [concurrency, setConcurrency] = useState(1);
+  const [busy, setBusy] = useState(false);
+  const show = (result: Awaited<ReturnType<typeof window.hive.executor.status>>) => {
+    if (result.ok) {
+      setStatus(result.value);
+      setError(null);
+    } else setError(`${result.error.code}: ${result.error.message}`);
+  };
+  const refresh = useCallback(async () => show(await window.hive.executor.status()), []);
+  useEffect(() => {
+    void window.hive.executor.status().then((result) => {
+      show(result);
+      // The form starts from what is installed.
+      if (!result.ok) return;
+      if (typeof result.value.provider === "string")
+        setProvider(result.value.provider as ExecutorProvider);
+      if (typeof result.value.concurrency === "number") setConcurrency(result.value.concurrency);
+    });
+    const timer = setInterval(() => void refresh(), 10_000);
+    return () => clearInterval(timer);
+  }, [refresh]);
+  const act = async (call: () => ReturnType<typeof window.hive.executor.stop>) => {
+    setBusy(true);
+    const result = await call();
+    setBusy(false);
+    if (!result.ok) return setError(`${result.error.code}: ${result.error.message}`);
+    await refresh();
+  };
+  const logs = status?.logs as { stdout?: string; stderr?: string } | undefined;
+  const state = !status
+    ? "—"
+    : !status.installed
+      ? "not installed"
+      : status.pid
+        ? `loaded, pid ${text(status.pid)}`
+        : `stopped, last exit code ${text(status.lastExitCode)}`;
+  return (
+    <section>
+      <h2>Executor</h2>
+      {status?.registered === false && (
+        <p className="warn">this device is not registered: run `hive device register`</p>
+      )}
+      {error && <p className="error">{error}</p>}
+      <table>
+        <tbody>
+          <tr>
+            <th>State</th>
+            <td className={status?.pid ? "ok" : "warn"}>{state}</td>
+          </tr>
+          <tr>
+            <th>Installed</th>
+            <td>
+              {text(status?.provider)}, concurrency {text(status?.concurrency)}
+            </td>
+          </tr>
+          <tr>
+            <th>Program</th>
+            <td className="mono">
+              {Array.isArray(status?.program) ? text(status.program[0]) : "—"}
+            </td>
+          </tr>
+          <tr>
+            <th>Logs</th>
+            <td className="mono">
+              {text(logs?.stdout)}
+              <br />
+              {text(logs?.stderr)}
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        <select
+          value={provider}
+          onChange={(e) => setProvider(e.target.value as ExecutorProvider)}
+          aria-label="Provider"
+        >
+          {(["fake", "claude", "codex"] as const).map((p) => (
+            <option key={p}>{p}</option>
+          ))}
+        </select>{" "}
+        <input
+          type="number"
+          min={1}
+          max={64}
+          value={concurrency}
+          onChange={(e) => setConcurrency(Number(e.target.value))}
+          aria-label="Concurrency"
+        />{" "}
+        <button
+          disabled={busy}
+          onClick={() => void act(() => window.hive.executor.start({ provider, concurrency }))}
+        >
+          Start
+        </button>{" "}
+        <button disabled={busy} onClick={() => void act(window.hive.executor.stop)}>
+          Stop
+        </button>
+      </p>
+    </section>
   );
 };
 

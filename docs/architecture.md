@@ -1055,6 +1055,10 @@ invalid delegations, expired approvals and stale-generation writes are rejected.
   ContextBuilder, ProviderAdapter, ToolBroker, Collector.
 - macOS is the first real target. Linux / Windows get adapters, each verified for process-tree stop, credential
   storage and path isolation. Android never runs the agent runtime.
+- Implemented as (macOS, DESKTOP-SVC-01): a launchd user agent whose program is the Electron app itself started
+  with `--executor` (headless, running the CLI's `executor run` code). Electron main reconciles the agent on every
+  start (reinstalls unless the plist is identical and running), so the service never runs another build; closing
+  or quitting the app leaves it running, Stop only unloads it. See `apps/desktop/README.md`, Executor service.
 
 ### 20.2 Startup and crashes (§23.2)
 

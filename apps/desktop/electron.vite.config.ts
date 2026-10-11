@@ -1,7 +1,10 @@
 import { defineConfig } from "electron-vite";
 
-// Workspace packages ship TypeScript sources, so main bundles them instead of requiring them at runtime.
-const bundleWorkspace = { externalizeDeps: { exclude: ["@hive/cli", "@hive/contracts"] } };
+// Workspace packages ship TypeScript sources, so main bundles them instead of requiring them at runtime. Other
+// dependencies stay external: the Claude Agent SDK finds its CLI next to its own files (headless executor mode).
+const bundleWorkspace = {
+  externalizeDeps: { exclude: ["@hive/cli", "@hive/contracts", "@hive/executor"] },
+};
 
 export default defineConfig({
   main: { build: bundleWorkspace },

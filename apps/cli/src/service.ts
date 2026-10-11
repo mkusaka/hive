@@ -1,15 +1,15 @@
 // `hive executor install | uninstall | status` (docs/architecture.md §20.1): the executor loop as a launchd user
-// agent, so it keeps running after the UI or terminal closes and starts again at login. macOS only for now.
+// agent, so it keeps running after the UI or terminal closes and starts again at login. The program is the CLI
+// (`bun main.ts executor run`) or the desktop app in its headless executor mode. macOS only for now.
 import { execFile } from "node:child_process";
-import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { CliError, invalid } from "./client.ts";
 
-const label = "com.hive.executor";
-// Same as main.ts.
+export const label = "com.hive.executor";
+// Same as deps.ts.
 const configDir = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "hive");
 const logDir = join(configDir, "executor", "logs");
 const plistFile = join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
@@ -32,6 +32,8 @@ export const captureEnv = (env: Record<string, string | undefined>) =>
 
 const esc = (value: string) =>
   value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+const unesc = (value: string) =>
+  value.replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&");
 const str = (value: string) => `<string>${esc(value)}</string>`;
 
 export const renderPlist = (input: {
@@ -64,6 +66,25 @@ export const renderPlist = (input: {
     ``,
   ].join("\n");
 
+/**
+ * The provider, concurrency and full argv of a plist written by `renderPlist`. Reads only `ProgramArguments`: the
+ * `EnvironmentVariables` values may be tokens.
+ */
+export const parsePlist = (xml: string) => {
+  const array = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(xml)?.[1] ?? "";
+  const program = [...array.matchAll(/<string>([^<]*)<\/string>/g)].map((m) => unesc(m[1]!));
+  const after = (flag: string) => {
+    const i = program.indexOf(flag);
+    return i < 0 ? null : (program[i + 1] ?? null);
+  };
+  const concurrency = Number(after("--concurrency"));
+  return {
+    provider: after("--provider"),
+    concurrency: Number.isInteger(concurrency) && concurrency > 0 ? concurrency : null,
+    program,
+  };
+};
+
 /** Top-level `state` / `pid` / `last exit code` of `launchctl print gui/<uid>/<label>` (nested blocks ignored). */
 export const parseLaunchctlPrint = (output: string) => {
   const field = (name: string) =>
@@ -91,25 +112,28 @@ const macOnly = () => {
   return `gui/${process.getuid!()}`;
 };
 
-export const install = async (provider: string, concurrency: number) => {
-  const domain = macOnly();
+/** `program` is the argv prefix (executable first); `--provider P --concurrency N` are appended. */
+export type ServiceInput = { program: string[]; provider: string; concurrency: number };
+
+const render = (input: ServiceInput) => {
   const env = captureEnv(process.env);
   const args = [
-    process.execPath,
-    fileURLToPath(new URL("main.ts", import.meta.url)),
-    "executor",
-    "run",
+    ...input.program,
     "--provider",
-    provider,
+    input.provider,
     "--concurrency",
-    String(concurrency),
+    String(input.concurrency),
   ];
+  return { env, xml: renderPlist({ args, env, workingDirectory: configDir, logs }) };
+};
+
+export const install = async (input: ServiceInput) => {
+  const domain = macOnly();
+  const { env, xml } = render(input);
   await mkdir(logDir, { recursive: true, mode: 0o700 });
   await mkdir(join(plistFile, ".."), { recursive: true });
   // May hold CLAUDE_CODE_OAUTH_TOKEN: owner-only, also when the file already existed.
-  await writeFile(plistFile, renderPlist({ args, env, workingDirectory: configDir, logs }), {
-    mode: 0o600,
-  });
+  await writeFile(plistFile, xml, { mode: 0o600 });
   await chmod(plistFile, 0o600);
   // Idempotent: unload a previous version first (fails harmlessly when none is loaded).
   await launchctl("bootout", `${domain}/${label}`);
@@ -135,14 +159,34 @@ export const uninstall = async () => {
   return { uninstalled: label, plist: plistFile, wasLoaded: out.ok };
 };
 
+const readPlist = () => readFile(plistFile, "utf8").catch(() => null);
+
+/** Unloads the agent and keeps the plist, so `install` / the desktop app's start brings it back. */
+export const stop = async () => {
+  const domain = macOnly();
+  const out = await launchctl("bootout", `${domain}/${label}`);
+  return { stopped: label, wasLoaded: out.ok };
+};
+
 export const status = async () => {
   const domain = macOnly();
-  const out = await launchctl("print", `${domain}/${label}`);
+  const [out, xml] = await Promise.all([launchctl("print", `${domain}/${label}`), readPlist()]);
   return {
     label,
     loaded: out.ok,
     ...(out.ok ? parseLaunchctlPrint(out.stdout) : {}),
+    installed: xml !== null,
+    ...(xml === null ? {} : parsePlist(xml)),
     plist: plistFile,
     logs,
   };
+};
+
+/** Installs unless the plist on disk is byte-identical to `input`'s and the agent is running. */
+export const ensure = async (input: ServiceInput) => {
+  const current = await status();
+  if ((await readPlist()) === render(input).xml && current.pid)
+    return { changed: false, ...current };
+  await install(input);
+  return { changed: true, ...(await status()) };
 };
