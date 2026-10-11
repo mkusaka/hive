@@ -351,7 +351,7 @@ export const getTask = async (db: D1Database, wsIds: string[], id: string) => {
     .first<TaskRow & { workspaceId: string }>();
   if (!task) throw notFound("task");
   const { workspaceId } = task;
-  const [prerequisites, dependents, results, jobs] = await Promise.all([
+  const [prerequisites, dependents, results, jobs, git] = await Promise.all([
     prerequisitesOf(db, workspaceId, id),
     db
       .prepare(
@@ -377,12 +377,30 @@ export const getTask = async (db: D1Database, wsIds: string[], id: string) => {
       )
       .bind(workspaceId, id)
       .all(),
+    db
+      .prepare(
+        `SELECT repository, commits, prs FROM run_git
+          WHERE workspace_id = ? AND run_id IN (SELECT run_id FROM executions WHERE workspace_id = ? AND task_id = ?)
+          ORDER BY created_at, run_id`,
+      )
+      .bind(workspaceId, workspaceId, id)
+      .all<{ repository: string; commits: string; prs: string }>(),
   ]);
+  // GIT-01 rollup over the Task's Runs: distinct commits, PRs unique by URL, repositories.
+  const shas = new Set<string>();
+  const prs = new Map<string, unknown>();
+  const repositories = new Set<string>();
+  for (const g of git.results) {
+    for (const c of JSON.parse(g.commits) as { sha: string }[]) shas.add(c.sha);
+    for (const pr of JSON.parse(g.prs) as { url: string }[]) prs.set(pr.url, pr);
+    if (g.repository) repositories.add(g.repository);
+  }
   return {
     ...toTask(task, prerequisites),
     dependents: dependents.results,
     results: results.results,
     jobs: jobs.results,
+    git: { commits: shas.size, prs: [...prs.values()], repositories: [...repositories] },
   };
 };
 

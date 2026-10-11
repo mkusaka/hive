@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { call, envelope, type Json, setup } from "./helpers.ts";
+import { call, count, envelope, type Json, login, setup } from "./helpers.ts";
 
 const db = env.DB;
 type Task = Json & { id: string; key: string; revision: number; status: string; display: string };
@@ -284,5 +284,59 @@ describe("job.start and completion", () => {
     const outside = await w.command({ ...start, botId, deviceId: other.deviceId });
     expect(await errorOf(outside)).toMatchObject({ status: 422, reason: "not_eligible" });
     expect((await w.command({ ...start, deviceId: "nope" })).status).toBe(404);
+  });
+});
+
+describe("git provenance (GIT-01)", () => {
+  it("stores git.collected once, fenced, and exposes it on the Run and the Task rollup", async () => {
+    const w = await work();
+    const { taskId } = await w.create("t");
+    const run = await w.startAndClaim(taskId);
+    const fence = { runId: run.runId, executionGeneration: run.executionGeneration };
+    const observe = (payload: Json, extra: Json = {}) =>
+      call(
+        "/v1/executor/observations",
+        { Authorization: `Bearer ${w.deviceToken}` },
+        { ...fence, kind: "git.collected", payload, ...extra },
+      );
+    const pr = { number: 7, url: "https://github.com/o/r/pull/7", state: "OPEN", title: "fix" };
+    const git = {
+      repository: "github.com/o/r",
+      branch: "fix",
+      before: "a".repeat(40),
+      after: "b".repeat(40),
+      commits: [
+        { sha: "b".repeat(40), subject: "fix it", authoredAt: "2026-10-11T00:00:00+09:00" },
+      ],
+      partial: false,
+      prs: [pr],
+    };
+    expect((await observe(git)).status).toBe(200);
+    // A repeat changes nothing: the first stored wins.
+    expect((await observe({ ...git, branch: "other", prs: [] })).status).toBe(200);
+    expect(await count("run_git WHERE run_id = ?", run.runId)).toBe(1);
+    expect((await observe({ ...git, commits: "x" })).status).toBe(422);
+    expect((await observe(git, { executionGeneration: 2 })).status).toBe(409);
+
+    const runGit = await (await w.user.get(`/v1/runs/${run.runId}`)).json<Json>();
+    expect(runGit.git).toEqual({ ...git, prError: null });
+    expect((await w.task(taskId)).git).toEqual({
+      commits: 1,
+      prs: [pr],
+      repositories: ["github.com/o/r"],
+    });
+
+    // Another Workspace's user sees neither.
+    const other = await login();
+    expect((await other.get(`/v1/runs/${run.runId}`)).status).toBe(404);
+    expect((await other.get(`/v1/tasks/${taskId}`)).status).toBe(404);
+  });
+
+  it("rolls up an empty git summary for a Task without collected Runs", async () => {
+    const w = await work();
+    const { taskId } = await w.create("t");
+    const run = await w.startAndClaim(taskId);
+    expect((await (await w.user.get(`/v1/runs/${run.runId}`)).json<Json>()).git).toBeNull();
+    expect((await w.task(taskId)).git).toEqual({ commits: 0, prs: [], repositories: [] });
   });
 });

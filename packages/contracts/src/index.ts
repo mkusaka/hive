@@ -853,8 +853,9 @@ export type RunContext = {
 
 /**
  * `POST /v1/executor/observations` (§9.2 step 7). Stored kinds: `runtime.run.started` with
- * `payload.providerSessionId` (Run `running`, `started_at`), and `runtime.run.stopped` with `payload.confirmed: true`
- * (an `unknown` Run becomes `interrupted` and releases its reservations). Other kinds are accepted (202) and dropped.
+ * `payload.providerSessionId` (Run `running`, `started_at`), `runtime.run.stopped` with `payload.confirmed: true`
+ * (an `unknown` Run becomes `interrupted` and releases its reservations), and `git.collected` (`GitCollected`, stored in
+ * `run_git`). Other kinds are accepted (202) and dropped.
  */
 export const RunObservation = v.strictObject({
   runId: RunId,
@@ -863,6 +864,37 @@ export const RunObservation = v.strictObject({
   payload: v.optional(v.record(v.string(), v.unknown()), {}),
 });
 export type RunObservation = v.InferInput<typeof RunObservation>;
+
+const Str = (max: number) => v.pipe(v.string(), v.maxLength(max));
+/**
+ * Payload of the `git.collected` observation (GIT-01): what Git produced in a Run's environment checkout. One per Run;
+ * the first stored wins. `repository` is `host/owner/repo` ('' without a remote); never a local path.
+ */
+export const GitCollected = v.strictObject({
+  repository: Str(300),
+  branch: Str(300),
+  before: Str(64),
+  after: Str(64),
+  commits: v.pipe(
+    v.array(v.strictObject({ sha: Str(64), subject: Str(1000), authoredAt: Str(64) })),
+    v.maxLength(200),
+  ),
+  /** `before` was not an ancestor of HEAD (branch switch, rewrite): commits are those since the Run started. */
+  partial: v.boolean(),
+  prs: v.pipe(
+    v.array(
+      v.strictObject({
+        number: v.pipe(v.number(), v.integer()),
+        url: Str(2000),
+        state: Str(50),
+        title: Str(1000),
+      }),
+    ),
+    v.maxLength(20),
+  ),
+  prError: v.optional(Str(500)),
+});
+export type GitCollected = v.InferOutput<typeof GitCollected>;
 
 export type ExecutorRun = {
   id: string;

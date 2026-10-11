@@ -7,6 +7,7 @@ import { codexAdapter } from "./adapters/codex.ts";
 import { fakeAdapter } from "./adapters/fake.ts";
 import { executorHeartbeat, parseConcurrency } from "./capabilities.ts";
 import { createCloudClient } from "./cloudClient.ts";
+import { withGitCollector } from "./gitCollector.ts";
 import { fileJournal, transcriptReader } from "./journal.ts";
 import { runLoop } from "./runner.ts";
 import { sessionJournals, sessionStore } from "./sessionStore.ts";
@@ -61,7 +62,7 @@ const result = await runLoop(
       sessions: sessionJournals(stateDir),
       provider: values.provider,
     }),
-    adapter:
+    adapter: withGitCollector(
       values.provider === "claude"
         ? claudeAdapter({ stateDir, sessionStore: sessionStore({ stateDir, cloud }) })
         : values.provider === "codex"
@@ -70,6 +71,8 @@ const result = await runLoop(
               delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
               fail: process.env.FAKE_FAIL === "1",
             }),
+      { stateDir },
+    ),
   },
   // docs/roadmap.md §1: executor Job reconcile every 30 s (no WebSocket yet).
   { once: values.once, pollMs: 30_000, concurrency },

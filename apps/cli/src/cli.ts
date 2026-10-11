@@ -610,6 +610,14 @@ const specs: Record<string, Spec> = {
         }),
       ),
   },
+  "task get": {
+    usage: "<task>",
+    args: 1,
+    run: async (c) => {
+      const task = await cmd.findTask(c.client(), c.workspace(), c.args[0]!);
+      c.print(await cmd.getTask(c.client(), task.id));
+    },
+  },
   "task plan": {
     usage: "<task> --after <task>...",
     args: 1,

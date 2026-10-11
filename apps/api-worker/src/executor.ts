@@ -3,10 +3,12 @@ import {
   commandEnvelope,
   ExecutorCommand,
   type ExecutorHeartbeat,
+  GitCollected,
   type ExecutorRun,
   type JobClaimed,
   type JobClaim,
   type LeaseRenewed,
+  parse,
   type PlacementPolicy,
   type QueuedJob,
   type RunLeaseRenew,
@@ -730,7 +732,8 @@ export const getRunContext = async (
 
 /**
  * Executor observations (§9.2 step 7), fenced like a renew. `runtime.run.started` stores the provider session and
- * marks the launch confirmed; `runtime.run.stopped` confirms an `unknown` Run's stop (§10.4).
+ * marks the launch confirmed; `runtime.run.stopped` confirms an `unknown` Run's stop (§10.4); `git.collected` stores the
+ * Run's commits and PRs once (GIT-01).
  */
 export const recordObservation = async (db: D1Database, device: Device, input: RunObservation) => {
   const providerSessionId = input.payload?.providerSessionId;
@@ -749,6 +752,32 @@ export const recordObservation = async (db: D1Database, device: Device, input: R
     if (!result.ok) {
       throw new HttpError("REVISION_CONFLICT", "run is still active", false, "not_unknown");
     }
+    return { status: 200 as const, body: { ok: true } };
+  }
+  if (input.kind === "git.collected") {
+    const git = parse(GitCollected, input.payload);
+    if (!git.ok) throw new HttpError("INVALID_INPUT", git.issues.join("; "));
+    await fencedRun(db, device, input);
+    const g = git.value;
+    // The first stored wins: a repeat (retry, resumed attempt) changes nothing.
+    await db
+      .prepare(
+        `INSERT INTO run_git (run_id, workspace_id, repository, branch, before, after, commits, partial, prs, pr_error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (run_id) DO NOTHING`,
+      )
+      .bind(
+        input.runId,
+        device.workspaceIds[0],
+        g.repository,
+        g.branch,
+        g.before,
+        g.after,
+        JSON.stringify(g.commits),
+        g.partial ? 1 : 0,
+        JSON.stringify(g.prs),
+        g.prError ?? null,
+      )
+      .run();
     return { status: 200 as const, body: { ok: true } };
   }
   if (input.kind !== "runtime.run.started") return { status: 202 as const, body: { ok: true } };

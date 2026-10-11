@@ -37,7 +37,7 @@ hive memory delete <memory-id> [--revision <n>]        # tombstone; a live memor
 hive agent send <bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]
 hive event emit <type> [--data-file <path|->] [--subject <kind:id>]
 hive op get <operation-id>
-hive run get <run-id>                                  # state, persistence (pending|complete), transcript parts
+hive run get <run-id>                                  # state, persistence (pending|complete), transcript parts, git
 hive run transcript <run-id> [--raw]                   # normalized, redacted entries; --raw: owner-only JSONL
 hive job get <job-id>
 hive job watch <job-id> [--timeout <s>]                # polls GET /v1/jobs/:id every 2 s
@@ -50,6 +50,7 @@ hive executor run [--once] [--provider fake|claude|codex] [--concurrency N]  # L
 hive project create --key <KEY> --name <name>
 hive task create (--project <KEY> | --parent <task>) --title <title> [--priority <n>]
 hive task list [--project <KEY>] [--status <status>]
+hive task get <task>                                   # Task, results, Jobs, git rollup (commits, PRs, repositories)
 hive task plan <task> --after <task>...                # adds prerequisites
 hive task assign <task> (--bot <bot-id> | --user <user-id> | --none)
 hive task complete <task>

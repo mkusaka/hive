@@ -144,6 +144,7 @@ const path = (prefix: string, id: string) => `${prefix}/${encodeURIComponent(id)
 export const getOperation = (c: Client, id: string) => c.get(path("/v1/operations", id));
 export const getJob = (c: Client, id: string) => c.get(path("/v1/jobs", id));
 export const getRun = (c: Client, id: string) => c.get(path("/v1/runs", id));
+export const getTask = (c: Client, id: string) => c.get(path("/v1/tasks", id));
 /** Every confirmed part of the normalized transcript, one page (part) per request. */
 export const runTranscript = async (c: Client, id: string) => {
   const entries: Json[] = [];

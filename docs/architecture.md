@@ -1113,6 +1113,10 @@ child IDs from observations is the adapter's job; an LLM claiming an execution i
 - Task rollups show Run time, tool count, usage, commits, PRs, failures, artifacts. Tokens of a Run touching several
   Tasks are never charged in full to each without basis; unallocatable usage stays unattributed.
 
+Implemented as (GIT-01): commits and PRs only, for executor-launched Runs in an environment checkout. The executor's
+`git.collected` observation is stored per Run in `run_git` and rolled up on `GET /v1/tasks/:id`; the external CLI hooks
+path, usage / failure / artifact rollups and token attribution are not built.
+
 ## 21. UI views (§24)
 
 | View            | Shows / does                                                                           |

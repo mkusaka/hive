@@ -875,6 +875,31 @@ export const executions = sqliteTable(
 );
 
 /**
+ * immutable history (GIT-01): what Git produced in a Run's environment checkout, from the executor's `git.collected`
+ * observation. One row per Run; the first stored wins. `commits` / `prs` are JSON arrays (@hive/contracts
+ * `GitCollected`); `repository` is `host/owner/repo`, never a local path.
+ */
+export const runGit = sqliteTable(
+  "run_git",
+  {
+    runId: text("run_id").primaryKey(),
+    workspaceId: workspaceId(),
+    repository: text("repository").notNull(),
+    branch: text("branch").notNull(),
+    before: text("before").notNull(),
+    after: text("after").notNull(),
+    commits: text("commits", { mode: "json" }).notNull(),
+    partial: integer("partial", { mode: "boolean" }).notNull(),
+    prs: text("prs", { mode: "json" }).notNull(),
+    prError: text("pr_error"),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    foreignKey({ columns: [t.workspaceId, t.runId], foreignColumns: [runs.workspaceId, runs.id] }),
+  ],
+);
+
+/**
  * current state (docs/architecture.md §18.2). A Run's capability: what its Bot may do through `/v1/run/*`, valid while
  * the Run is active at this generation and until `expires_at` (lease expiry + 5 min, extended on renew). Only
  * SHA-256 of the secret is stored. Revoked when the Run submits its result.

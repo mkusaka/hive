@@ -327,8 +327,12 @@ export const getRun = async (db: D1Database, user: User, id: string) => {
       `SELECT r.id, r.job_id, r.workspace_id, r.state, r.execution_generation, r.device_id, r.persistence,
               r.started_at, r.finished_at, r.created_at, r.result_summary, r.result_error,
               r.provider_session_id IS NOT NULL AS has_session, s.confirmed_through_seq,
-              (SELECT COUNT(*) FROM transcript_parts p WHERE p.stream_id = s.id) AS parts
+              (SELECT COUNT(*) FROM transcript_parts p WHERE p.stream_id = s.id) AS parts,
+              g.run_id AS git_run_id, g.repository AS git_repository, g.branch AS git_branch,
+              g.before AS git_before, g.after AS git_after, g.commits AS git_commits, g.partial AS git_partial,
+              g.prs AS git_prs, g.pr_error AS git_pr_error
          FROM runs r LEFT JOIN transcript_streams s ON s.run_id = r.id AND s.kind = 'run'
+         LEFT JOIN run_git g ON g.workspace_id = r.workspace_id AND g.run_id = r.id
         WHERE r.id = ? AND r.workspace_id IN (${placeholders(user.workspaceIds)})`,
     )
     .bind(id, ...user.workspaceIds)
@@ -350,6 +354,19 @@ export const getRun = async (db: D1Database, user: User, id: string) => {
     resultError: row.result_error,
     hasProviderSession: row.has_session === 1,
     transcript: { parts: row.parts ?? 0, confirmedThroughSeq: row.confirmed_through_seq },
+    // GIT-01: null when the Run reported no `git.collected` (scratch cwd, not finished, older executor).
+    git: row.git_run_id
+      ? {
+          repository: row.git_repository,
+          branch: row.git_branch,
+          before: row.git_before,
+          after: row.git_after,
+          commits: JSON.parse(row.git_commits as string) as unknown[],
+          partial: row.git_partial === 1,
+          prs: JSON.parse(row.git_prs as string) as unknown[],
+          prError: row.git_pr_error,
+        }
+      : null,
   };
 };
 

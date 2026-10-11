@@ -9,6 +9,7 @@ import { codexAdapter } from "@hive/executor/adapters/codex";
 import { executorHeartbeat } from "@hive/executor/capabilities";
 import { saveEnvironment } from "@hive/executor/environments";
 import { fakeAdapter } from "@hive/executor/adapters/fake";
+import { withGitCollector } from "@hive/executor/gitCollector";
 import { fileJournal, transcriptReader } from "@hive/executor/journal";
 import { runLoop } from "@hive/executor/runner";
 import { sessionJournals, sessionStore } from "@hive/executor/sessionStore";
@@ -82,7 +83,7 @@ process.exitCode = await run(process.argv.slice(2), {
           sessions: sessionJournals(executorDir),
           provider,
         }),
-        adapter:
+        adapter: withGitCollector(
           provider === "claude"
             ? claudeAdapter({
                 stateDir: executorDir,
@@ -94,6 +95,8 @@ process.exitCode = await run(process.argv.slice(2), {
                   delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
                   fail: process.env.FAKE_FAIL === "1",
                 }),
+          { stateDir: executorDir },
+        ),
       },
       // docs/roadmap.md §1: executor Job reconcile every 30 s (no WebSocket yet).
       { once, pollMs: 30_000, concurrency },

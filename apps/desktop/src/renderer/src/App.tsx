@@ -277,9 +277,19 @@ export const App = () => {
                   <li key={j.id}>
                     <button
                       onClick={() =>
-                        void get(`/v1/jobs/${encodeURIComponent(j.id)}`).then(setJobDetail, (e) =>
-                          setError(String(e)),
-                        )
+                        void get(`/v1/jobs/${encodeURIComponent(j.id)}`)
+                          // A Task's Job also shows the Task's git rollup (GIT-01).
+                          .then(async (job) =>
+                            job.taskId
+                              ? {
+                                  ...job,
+                                  task: await get(
+                                    `/v1/tasks/${encodeURIComponent(String(job.taskId))}`,
+                                  ),
+                                }
+                              : job,
+                          )
+                          .then(setJobDetail, (e) => setError(String(e)))
                       }
                     >
                       <Badge state={j.state} /> <span className="mono">{j.id}</span>
@@ -294,6 +304,9 @@ export const App = () => {
               </ul>
             </div>
             <div>
+              {jobDetail?.task ? (
+                <TaskGit task={jobDetail.task as Record<string, unknown>} />
+              ) : null}
               <pre>{jobDetail ? JSON.stringify(jobDetail, null, 2) : "Select a Job"}</pre>
               {Array.isArray(jobDetail?.runs) && (
                 <ul className="list">
@@ -410,6 +423,61 @@ const inspect = async (id: string): Promise<Inspected> => {
   }
 };
 
+type Pr = { number: number; url: string; state: string; title: string };
+type GitDetail = {
+  repository: string;
+  branch: string;
+  partial: boolean;
+  commits: { sha: string; subject: string; authoredAt: string }[];
+  prs: Pr[];
+  prError: string | null;
+};
+
+// PR links are plain text: the window denies opening links.
+const PrList = ({ prs }: { prs: Pr[] }) => (
+  <ul>
+    {prs.map((pr) => (
+      <li key={pr.url}>
+        #{pr.number} <Badge state={pr.state} /> {pr.title} <span className="mono">{pr.url}</span>
+      </li>
+    ))}
+  </ul>
+);
+
+/** The Run's commits and PRs from `git.collected` (GIT-01). */
+const RunGit = ({ git }: { git: GitDetail }) => (
+  <>
+    <h4>
+      Git <span className="mono">{git.repository || "(no remote)"}</span> ·{" "}
+      <span className="mono">{git.branch}</span>
+      {git.partial ? " · partial (commits since the Run started)" : ""}
+    </h4>
+    <ul>
+      {git.commits.map((c) => (
+        <li key={c.sha}>
+          <span className="mono">{c.sha.slice(0, 12)}</span> {c.subject}
+        </li>
+      ))}
+    </ul>
+    <PrList prs={git.prs} />
+    {git.prError ? <p className="error">PRs: {git.prError}</p> : null}
+  </>
+);
+
+/** A Task's git rollup over its Runs (GIT-01). */
+const TaskGit = ({ task }: { task: Record<string, unknown> }) => {
+  const git = task.git as { commits: number; prs: Pr[]; repositories: string[] };
+  return (
+    <section>
+      <h4>
+        Task {text(task.key)}: {git.commits} commits · {git.prs.length} PRs ·{" "}
+        <span className="mono">{git.repositories.join(", ") || "—"}</span>
+      </h4>
+      <PrList prs={git.prs} />
+    </section>
+  );
+};
+
 /** Run Inspector (§21): state, transcript persistence, provider session presence and the normalized transcript. */
 const RunInspector = ({ run }: { run: Inspected }) => {
   const d = run.detail;
@@ -462,6 +530,7 @@ const RunInspector = ({ run }: { run: Inspected }) => {
           </table>
         </>
       )}
+      {d.git ? <RunGit git={d.git as GitDetail} /> : null}
       {run.entries === null ? (
         <p className="error">Transcript unavailable: {run.error}</p>
       ) : (
