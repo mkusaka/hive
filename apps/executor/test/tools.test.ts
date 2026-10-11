@@ -112,6 +112,91 @@ describe("hive tools", () => {
   });
 });
 
+describe("skills and management tools", () => {
+  const skills = [
+    {
+      name: "release-notes",
+      description: "Prepare concise release notes.",
+      instructions: "Group changes by user impact.",
+    },
+  ];
+  const managed: RunContext = {
+    ...context,
+    bot: {
+      ...context.bot,
+      skills,
+      toolPolicy: {
+        ...context.bot.toolPolicy,
+        manage: { subscriptions: true, routines: true, channels: true, bots: true },
+      },
+    },
+  };
+
+  it("loads configured skill instructions and reports an unknown name as a tool error", async () => {
+    const tools = hiveTools(managed, fakeRunApi().api);
+    const loaded = await handler(tools, "hive_skill_use")({ name: "release-notes" });
+    expect(textOf(loaded)).toContain("Group changes by user impact.");
+    const missing = await handler(tools, "hive_skill_use")({ name: "missing" });
+    expect(missing).toMatchObject({ isError: true });
+    expect(textOf(missing)).toBe("hive error: unknown skill missing");
+  });
+
+  it("offers management tools only by policy and applies current Bot and conversation defaults", async () => {
+    const { api, calls } = fakeRunApi();
+    const tools = hiveTools(managed, api);
+    expect(tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining([
+        "hive_subscription_create",
+        "hive_subscription_update",
+        "hive_subscription_delete",
+        "hive_routine_create",
+        "hive_routine_update",
+        "hive_routine_pause",
+        "hive_routine_resume",
+        "hive_routine_delete",
+        "hive_channel_create",
+        "hive_bot_create",
+      ]),
+    );
+    await handler(tools, "hive_subscription_create")({ eventTypes: ["github.pull_request"] });
+    await handler(
+      tools,
+      "hive_routine_create",
+    )({
+      botId: "bot-child",
+      name: "daily digest",
+      schedule: { kind: "cron", expr: "0 9 * * 1-5", timezone: "UTC" },
+      inputText: "Summarize #dev.",
+    });
+    expect(calls).toEqual([
+      {
+        type: "subscription.create",
+        botId: "bot-1",
+        eventTypes: ["github.pull_request"],
+        destination: { conversationId: "conv-1" },
+      },
+      {
+        type: "routine.create",
+        botId: "bot-child",
+        name: "daily digest",
+        schedule: { kind: "cron", expr: "0 9 * * 1-5", timezone: "UTC" },
+        inputText: "Summarize #dev.",
+        conversationId: "conv-1",
+      },
+    ]);
+  });
+
+  it("surfaces cloud management denial as a tool error", async () => {
+    const tools = hiveTools(
+      managed,
+      fakeRunApi(new CloudError(403, "FORBIDDEN", "channels are not permitted")).api,
+    );
+    const denied = await handler(tools, "hive_channel_create")({ name: "ops" });
+    expect(denied).toMatchObject({ isError: true });
+    expect(textOf(denied)).toBe("hive error: FORBIDDEN: channels are not permitted");
+  });
+});
+
 describe("hive_task_delegate", () => {
   it("is offered for a Task, validates its input and delegates this run's Task", async () => {
     const withTask = {

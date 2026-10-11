@@ -101,17 +101,35 @@ describe("argv → request", () => {
     ]);
   });
 
-  it("dm open, message post --conversation and channel join send their commands", async () => {
+  it("dm open, message post --conversation and channel member commands send their commands", async () => {
     const h = harness(() => Response.json({ ok: true }));
     expect(await h.hive("dm", "open", "b-1")).toBe(0);
     expect(await h.hive("message", "post", "--conversation", "dm-1", "--text", "hi")).toBe(0);
-    expect(await h.hive("channel", "join", "ch-1", "--bot", "b-1")).toBe(0);
+    expect(await h.hive("channel", "member", "add", "ch-1", "--bot", "b-1")).toBe(0);
+    expect(
+      await h.hive("channel", "member", "update", "ch-1", "--user", "u-1", "--role", "viewer"),
+    ).toBe(0);
+    expect(await h.hive("channel", "member", "remove", "ch-1", "--bot", "b-1")).toBe(0);
     expect(await h.hive("message", "post", "--text", "hi")).not.toBe(0);
     expect(h.calls.map((c) => (c.body as { command: unknown }).command)).toEqual([
       { type: "dm.open", botId: "b-1" },
       { type: "message.post", conversationId: "dm-1", text: "hi" },
-      { type: "channel.join", channelId: "ch-1", botId: "b-1" },
+      { type: "channel.member.add", channelId: "ch-1", botId: "b-1", role: "member" },
+      { type: "channel.member.update", channelId: "ch-1", userId: "u-1", role: "viewer" },
+      { type: "channel.member.remove", channelId: "ch-1", botId: "b-1" },
     ]);
+  });
+
+  it("requires one channel member target and a valid role", async () => {
+    const h = harness();
+    expect(await h.hive("channel", "member", "add", "ch-1", "--user", "u-1", "--bot", "b-1")).toBe(
+      2,
+    );
+    expect(await h.hive("channel", "member", "update", "ch-1", "--user", "u-1")).toBe(2);
+    expect(
+      await h.hive("channel", "member", "add", "ch-1", "--user", "u-1", "--role", "editor"),
+    ).toBe(2);
+    expect(h.calls).toEqual([]);
   });
 
   it("message post --thread-of replies in a thread; thread list reads the user's threads", async () => {
@@ -568,7 +586,7 @@ describe("output and credentials", () => {
 const commandOf = (call: Call) => (call.body as { command: Record<string, unknown> }).command;
 
 describe("tools and approvals", () => {
-  it("bot create --tools / --environment and bot update at the current revision", async () => {
+  it("bot update preserves policy fields and uses the Bot's current revision", async () => {
     const h = harness((call) =>
       call.method === "GET"
         ? Response.json({
@@ -576,7 +594,12 @@ describe("tools and approvals", () => {
               {
                 id: "bot-1",
                 revision: 3,
-                toolPolicy: { tools: { Read: "allow" }, cwdMode: "environment" },
+                toolPolicy: {
+                  tools: { Read: "allow" },
+                  cwdMode: "environment",
+                  effects: { "slack.post": "allow" },
+                  manage: { subscriptions: false, routines: true, channels: false, bots: false },
+                },
               },
             ],
           })
@@ -608,7 +631,26 @@ describe("tools and approvals", () => {
       type: "bot.update",
       botId: "bot-1",
       expectedRevision: 3,
-      toolPolicy: { tools: { Bash: "ask" }, cwdMode: "environment" },
+      toolPolicy: {
+        tools: { Bash: "ask" },
+        cwdMode: "environment",
+        effects: { "slack.post": "allow" },
+        manage: { subscriptions: false, routines: true, channels: false, bots: false },
+      },
+    });
+    expect(
+      await h.hive("bot", "update", "bot-1", "--manage", "subscriptions=true,channels=true"),
+    ).toBe(0);
+    expect(commandOf(h.calls.at(-1)!)).toEqual({
+      type: "bot.update",
+      botId: "bot-1",
+      expectedRevision: 3,
+      toolPolicy: {
+        tools: { Read: "allow" },
+        cwdMode: "environment",
+        effects: { "slack.post": "allow" },
+        manage: { subscriptions: true, routines: true, channels: true, bots: false },
+      },
     });
     expect(await h.hive("bot", "update", "bot-1", "--instructions", "Be brief.")).toBe(0);
     expect(commandOf(h.calls.at(-1)!)).toEqual({
@@ -618,7 +660,87 @@ describe("tools and approvals", () => {
       instructions: "Be brief.",
     });
     expect(await h.hive("bot", "update", "bot-1")).toBe(2);
+    expect(await h.hive("bot", "update", "bot-1", "--manage", "routines=yes")).toBe(2);
     expect(await h.hive("bot", "create", "--name", "b", "--tools", "Bash")).toBe(2);
+  });
+
+  it("bot skill add and remove preserve skills with the fetched revision", async () => {
+    const skills = [
+      { name: "release-notes", description: "Draft notes", instructions: "Summarize changes." },
+    ];
+    const h = harness(
+      (call) =>
+        call.method === "GET"
+          ? Response.json({ bots: [{ id: "bot-1", revision: 4, skills }] })
+          : Response.json({ ok: true }),
+      { stdin: "Read this file." },
+    );
+    expect(
+      await h.hive(
+        "bot",
+        "skill",
+        "add",
+        "bot-1",
+        "--name",
+        "triage",
+        "--description",
+        "Classify issues",
+        "--instructions",
+        "Report the priority.",
+      ),
+    ).toBe(0);
+    expect(commandOf(h.calls.at(-1)!)).toEqual({
+      type: "bot.update",
+      botId: "bot-1",
+      expectedRevision: 4,
+      skills: [
+        ...skills,
+        { name: "triage", description: "Classify issues", instructions: "Report the priority." },
+      ],
+    });
+    expect(
+      await h.hive(
+        "bot",
+        "skill",
+        "add",
+        "bot-1",
+        "--name",
+        "from-file",
+        "--description",
+        "Read a file",
+        "--instructions-file",
+        "-",
+      ),
+    ).toBe(0);
+    expect(commandOf(h.calls.at(-1)!)).toEqual({
+      type: "bot.update",
+      botId: "bot-1",
+      expectedRevision: 4,
+      skills: [
+        ...skills,
+        { name: "from-file", description: "Read a file", instructions: "Read this file." },
+      ],
+    });
+    expect(await h.hive("bot", "skill", "remove", "bot-1", "--name", "release-notes")).toBe(0);
+    expect(commandOf(h.calls.at(-1)!)).toEqual({
+      type: "bot.update",
+      botId: "bot-1",
+      expectedRevision: 4,
+      skills: [],
+    });
+    expect(await h.hive("bot", "skill", "remove", "bot-1", "--name", "missing")).toBe(2);
+    expect(
+      await h.hive(
+        "bot",
+        "skill",
+        "add",
+        "bot-1",
+        "--name",
+        "triage",
+        "--description",
+        "Classify issues",
+      ),
+    ).toBe(2);
   });
 
   it("bot create / update placement flags; update merges over the Bot's current placement", async () => {

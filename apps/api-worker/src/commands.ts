@@ -9,8 +9,9 @@ import {
   BotCreate,
   BotUpdate,
   ChannelCreate,
-  ChannelJoin,
-  ChannelLeave,
+  ChannelMemberAdd,
+  ChannelMemberRemove,
+  ChannelMemberUpdate,
   ChannelUpdate,
   commandEnvelope,
   DeviceEnvironmentRegister,
@@ -93,8 +94,9 @@ export const CommandEnvelope = commandEnvelope(
     DeviceEnvironmentRegister,
     ChannelCreate,
     ChannelUpdate,
-    ChannelJoin,
-    ChannelLeave,
+    ChannelMemberAdd,
+    ChannelMemberUpdate,
+    ChannelMemberRemove,
     DmOpen,
     BotCreate,
     BotUpdate,
@@ -359,20 +361,27 @@ const channelCreate: Handler<v.InferOutput<typeof ChannelCreate>> = async (db, u
   return uniqueName(db, "channels", workspaceId, command.name, run);
 };
 
-/** Sets or clears (empty string) the topic. Only a member of the Channel may; a missing Channel is a 404. */
+/** Sets or clears (empty string) the topic. Viewers are read-only; a missing Channel is a 404. */
 const channelUpdate: Handler<v.InferOutput<typeof ChannelUpdate>> = async (db, user, env) => {
   const { workspaceId, command } = env;
   const row = await db
     .prepare(
-      `SELECT EXISTS (SELECT 1 FROM channel_members m JOIN actors a
-                ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-             WHERE m.workspace_id = ch.workspace_id AND m.channel_id = ch.id AND a.user_id = ?) AS member
-         FROM channels ch WHERE ch.workspace_id = ? AND ch.id = ?`,
+      `SELECT m.role FROM channels ch
+         JOIN channel_members m ON m.workspace_id = ch.workspace_id AND m.channel_id = ch.id
+         JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+        WHERE ch.workspace_id = ? AND ch.id = ? AND a.user_id = ?`,
     )
-    .bind(user.userId, workspaceId, command.channelId)
-    .first<{ member: number }>();
-  if (!row) throw new HttpError("NOT_FOUND", "channel not found");
-  if (!row.member) throw new HttpError("FORBIDDEN", "not a member of this channel");
+    .bind(workspaceId, command.channelId, user.userId)
+    .first<{ role: string }>();
+  if (!row) {
+    const exists = await db
+      .prepare("SELECT 1 FROM channels WHERE workspace_id = ? AND id = ?")
+      .bind(workspaceId, command.channelId)
+      .first();
+    if (!exists) throw new HttpError("NOT_FOUND", "channel not found");
+    throw new HttpError("FORBIDDEN", "not a member of this channel");
+  }
+  if (row.role === "viewer") throw new HttpError("FORBIDDEN", "channel viewers are read-only");
   const topic = command.topic.trim() || null;
   return receipt(
     db,
@@ -384,13 +393,7 @@ const channelUpdate: Handler<v.InferOutput<typeof ChannelUpdate>> = async (db, u
         .bind(topic, new Date().toISOString(), workspaceId, command.channelId),
     ],
     { operationId: env.operationId, status: "accepted", channelId: command.channelId, topic },
-    [
-      {
-        entityKind: "channel",
-        entityId: command.channelId,
-        scope: `channel:${command.channelId}`,
-      },
-    ],
+    [{ entityKind: "channel", entityId: command.channelId, scope: `channel:${command.channelId}` }],
   );
 };
 
@@ -404,36 +407,117 @@ const botActorId = async (db: D1Database, workspaceId: string, botId: string) =>
   return bot.actor_id;
 };
 
-/** channel.join / channel.leave: a member adds or removes a Bot. Joining twice or leaving as a non-member is a no-op. */
+/** Resolves the user or Bot target to its Workspace actor. */
+const channelMemberTarget = async (
+  db: D1Database,
+  workspaceId: string,
+  command: { userId?: string; botId?: string },
+) => {
+  if (command.botId)
+    return { actorId: await botActorId(db, workspaceId, command.botId), botId: command.botId };
+  const member = await db
+    .prepare(
+      `SELECT a.id FROM actors a JOIN workspace_members w
+         ON w.workspace_id = a.workspace_id AND w.user_id = a.user_id
+       WHERE a.workspace_id = ? AND a.user_id = ?`,
+    )
+    .bind(workspaceId, command.userId)
+    .first<{ id: string }>();
+  if (!member) throw new HttpError("NOT_FOUND", "workspace user not found");
+  return { actorId: member.id, userId: command.userId! };
+};
+
+/** Whether the user is a Workspace owner. */
+const workspaceOwner = async (db: D1Database, workspaceId: string, userId: string) =>
+  (await db
+    .prepare(
+      "SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role = 'owner'",
+    )
+    .bind(workspaceId, userId)
+    .first()) !== null;
+
+/** Channel or Workspace owners may change Channel membership. */
+const requireChannelManager = async (
+  db: D1Database,
+  workspaceId: string,
+  channelId: string,
+  userId: string,
+) => {
+  const channel = await db
+    .prepare(
+      `SELECT EXISTS (SELECT 1 FROM workspace_members w
+                        WHERE w.workspace_id = ch.workspace_id AND w.user_id = ? AND w.role = 'owner')
+                    OR EXISTS (SELECT 1 FROM channel_members m JOIN actors a
+                        ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+                       WHERE m.workspace_id = ch.workspace_id AND m.channel_id = ch.id
+                         AND a.user_id = ? AND m.role = 'owner') AS can_manage
+         FROM channels ch WHERE ch.workspace_id = ? AND ch.id = ?`,
+    )
+    .bind(userId, userId, workspaceId, channelId)
+    .first<{ can_manage: number }>();
+  if (!channel) throw new HttpError("NOT_FOUND", "channel not found");
+  if (!channel.can_manage) throw new HttpError("FORBIDDEN", "channel owner required");
+};
+
+/**
+ * Membership changes have the last-owner predicate inside the batch. `changes()` then makes a concurrent demotion /
+ * removal of the last owner roll back with the receipt and change row.
+ */
 const channelMembership =
-  (join: boolean): Handler<v.InferOutput<typeof ChannelJoin | typeof ChannelLeave>> =>
+  (
+    action: "add" | "update" | "remove",
+  ): Handler<
+    v.InferOutput<typeof ChannelMemberAdd | typeof ChannelMemberUpdate | typeof ChannelMemberRemove>
+  > =>
   async (db, user, env) => {
     const { workspaceId, command } = env;
-    await channelMember(db, workspaceId, command.channelId, user.userId);
-    const actorId = await botActorId(db, workspaceId, command.botId);
+    await requireChannelManager(db, workspaceId, command.channelId, user.userId);
+    const target = await channelMemberTarget(db, workspaceId, command);
+    const role = "role" in command ? command.role : null;
+    const [setGuard, clearGuard] = guard(db);
+    const ownerMayChange = `(role <> 'owner' OR (SELECT COUNT(*) FROM channel_members owners
+    WHERE owners.workspace_id = channel_members.workspace_id AND owners.channel_id = channel_members.channel_id
+      AND owners.role = 'owner') > 1)`;
+    const statement =
+      action === "add"
+        ? db
+            .prepare(
+              `INSERT INTO channel_members (workspace_id, channel_id, actor_id, role) VALUES (?, ?, ?, ?)
+             ON CONFLICT (workspace_id, channel_id, actor_id) DO UPDATE SET role = excluded.role
+             WHERE ${ownerMayChange} OR excluded.role = 'owner'`,
+            )
+            .bind(workspaceId, command.channelId, target.actorId, role)
+        : action === "update"
+          ? db
+              .prepare(
+                `UPDATE channel_members SET role = ? WHERE workspace_id = ? AND channel_id = ? AND actor_id = ?
+                 AND (${ownerMayChange} OR ? = 'owner')`,
+              )
+              .bind(role, workspaceId, command.channelId, target.actorId, role)
+          : db
+              .prepare(
+                `DELETE FROM channel_members WHERE workspace_id = ? AND channel_id = ? AND actor_id = ?
+                 AND ${ownerMayChange}`,
+              )
+              .bind(workspaceId, command.channelId, target.actorId);
     return receipt(
       db,
       user.userId,
       env,
       [
-        join
-          ? db
-              .prepare(
-                `INSERT INTO channel_members (workspace_id, channel_id, actor_id, role) VALUES (?, ?, ?, 'member')
-                 ON CONFLICT DO NOTHING`,
-              )
-              .bind(workspaceId, command.channelId, actorId)
-          : db
-              .prepare(
-                "DELETE FROM channel_members WHERE workspace_id = ? AND channel_id = ? AND actor_id = ?",
-              )
-              .bind(workspaceId, command.channelId, actorId),
+        statement,
+        setGuard,
+        clearGuard,
+        db
+          .prepare("UPDATE workspaces SET auth_epoch = auth_epoch + 1, updated_at = ? WHERE id = ?")
+          .bind(new Date().toISOString(), workspaceId),
       ],
       {
         operationId: env.operationId,
         status: "accepted",
         channelId: command.channelId,
-        botId: command.botId,
+        ...target,
+        ...(role ? { role } : {}),
       },
       [
         {
@@ -442,7 +526,22 @@ const channelMembership =
           scope: `channel:${command.channelId}`,
         },
       ],
-    );
+    ).catch(async (error: unknown) => {
+      if (error instanceof IdempotencyConflict) throw error;
+      const current = await db
+        .prepare(
+          "SELECT role FROM channel_members WHERE workspace_id = ? AND channel_id = ? AND actor_id = ?",
+        )
+        .bind(workspaceId, command.channelId, target.actorId)
+        .first<{ role: string }>();
+      if (!current) {
+        throw new HttpError("NOT_FOUND", "channel member not found");
+      }
+      if (current.role === "owner") {
+        throw new HttpError("INVALID_INPUT", "the last channel owner cannot be removed or demoted");
+      }
+      throw error;
+    });
   };
 
 /** A DM and its member-less backing Channel share this id (schema.ts); deterministic, so concurrent opens agree. */
@@ -474,9 +573,51 @@ const dmOpen: Handler<v.InferOutput<typeof DmOpen>> = async (db, user, env) => {
     [{ entityKind: "dm", entityId: conversationId, scope: `workspace:${workspaceId}` }],
   );
 };
+const permissionLevel: Record<"deny" | "ask" | "allow", number> = { deny: 0, ask: 1, allow: 2 };
+
+/** `candidate` may only reduce the tool capabilities of `ceiling`. */
+const policyIsSubset = (candidate: ToolPolicy, ceiling: ToolPolicy) => {
+  const permitted = candidate.tools ?? {};
+  const allowed = ceiling.tools ?? {};
+  for (const [name, mode] of Object.entries(permitted)) {
+    if (
+      permissionLevel[mode as "deny" | "ask" | "allow"] >
+      permissionLevel[allowed[name as keyof typeof allowed] ?? "deny"]
+    ) {
+      return false;
+    }
+  }
+  const requestedEffects = candidate.effects ?? {};
+  const allowedEffects = ceiling.effects ?? {};
+  for (const [kind, mode] of Object.entries(requestedEffects)) {
+    if (
+      permissionLevel[mode as "deny" | "ask" | "allow"] >
+      permissionLevel[allowedEffects[kind as keyof typeof allowedEffects] ?? "deny"]
+    ) {
+      return false;
+    }
+  }
+  if (candidate.cwdMode === "environment" && ceiling.cwdMode !== "environment") return false;
+  for (const flag of ["subscriptions", "routines", "channels", "bots"] as const) {
+    if (candidate.manage?.[flag] && !ceiling.manage?.[flag]) return false;
+  }
+  return true;
+};
+
+const validateSkills = (skills: { name: string; tools?: ToolPolicy }[], policy: ToolPolicy) => {
+  const names = new Set<string>();
+  for (const skill of skills) {
+    if (names.has(skill.name)) throw new HttpError("INVALID_INPUT", "skill names must be unique");
+    names.add(skill.name);
+    if (skill.tools && !policyIsSubset(skill.tools, policy)) {
+      throw new HttpError("INVALID_INPUT", "skill tools exceed the bot tool policy");
+    }
+  }
+};
 
 const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env) => {
   const { workspaceId, command } = env;
+  validateSkills(command.skills, command.toolPolicy);
   const actorId = crypto.randomUUID();
   const botId = crypto.randomUUID();
   const run = receipt(
@@ -491,8 +632,8 @@ const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env
         .bind(actorId, workspaceId, command.name),
       db
         .prepare(
-          `INSERT INTO bots (id, workspace_id, actor_id, name, placement_policy, instructions, tool_policy)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO bots (id, workspace_id, actor_id, name, placement_policy, instructions, tool_policy, skills)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .bind(
           botId,
@@ -502,6 +643,7 @@ const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env
           JSON.stringify(command.placementPolicy),
           command.instructions,
           JSON.stringify(command.toolPolicy),
+          JSON.stringify(command.skills),
         ),
     ],
     { operationId: env.operationId, status: "accepted", botId },
@@ -516,15 +658,24 @@ const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env
  */
 const botUpdate: Handler<v.InferOutput<typeof BotUpdate>> = async (db, user, env) => {
   const { workspaceId, command } = env;
-  const revision = async () => {
-    const row = await db
-      .prepare("SELECT config_revision AS revision FROM bots WHERE workspace_id = ? AND id = ?")
-      .bind(workspaceId, command.botId)
-      .first<{ revision: number }>();
-    if (!row) throw new HttpError("NOT_FOUND", "bot not found");
-    return row.revision;
-  };
-  await revision();
+  const current = await db
+    .prepare(
+      "SELECT config_revision AS revision, tool_policy, skills FROM bots WHERE workspace_id = ? AND id = ?",
+    )
+    .bind(workspaceId, command.botId)
+    .first<{ revision: number; tool_policy: string; skills: string }>();
+  if (!current) throw new HttpError("NOT_FOUND", "bot not found");
+  if (
+    command.toolPolicy?.manage !== undefined &&
+    !(await workspaceOwner(db, workspaceId, user.userId))
+  ) {
+    throw new HttpError("FORBIDDEN", "workspace owner required to manage bot permissions");
+  }
+  const policy = command.toolPolicy ?? (JSON.parse(current.tool_policy) as ToolPolicy);
+  validateSkills(
+    command.skills ?? (JSON.parse(current.skills) as { name: string; tools?: ToolPolicy }[]),
+    policy,
+  );
   const [setGuard, clearGuard] = guard(db);
   const next = command.expectedRevision + 1;
   const run = receipt(
@@ -535,13 +686,15 @@ const botUpdate: Handler<v.InferOutput<typeof BotUpdate>> = async (db, user, env
       db
         .prepare(
           `UPDATE bots SET instructions = COALESCE(?, instructions), tool_policy = COALESCE(?, tool_policy),
-             placement_policy = COALESCE(?, placement_policy), config_revision = config_revision + 1, updated_at = ?
+             placement_policy = COALESCE(?, placement_policy), skills = COALESCE(?, skills),
+             config_revision = config_revision + 1, updated_at = ?
             WHERE workspace_id = ? AND id = ? AND config_revision = ?`,
         )
         .bind(
           command.instructions ?? null,
           command.toolPolicy ? JSON.stringify(command.toolPolicy) : null,
           command.placementPolicy ? JSON.stringify(command.placementPolicy) : null,
+          command.skills ? JSON.stringify(command.skills) : null,
           new Date().toISOString(),
           workspaceId,
           command.botId,
@@ -561,15 +714,18 @@ const botUpdate: Handler<v.InferOutput<typeof BotUpdate>> = async (db, user, env
     ],
   );
   return explainFailure(run, async () => {
-    const current = await revision();
-    return current === command.expectedRevision
-      ? null
-      : new HttpError(
+    const row = await db
+      .prepare("SELECT config_revision AS revision FROM bots WHERE workspace_id = ? AND id = ?")
+      .bind(workspaceId, command.botId)
+      .first<{ revision: number }>();
+    return row && row.revision !== command.expectedRevision
+      ? new HttpError(
           "REVISION_CONFLICT",
-          `bot revision is ${current}; refetch and retry`,
+          `bot revision is ${row.revision}; refetch and retry`,
           false,
           "stale_revision",
-        );
+        )
+      : null;
   });
 };
 
@@ -620,7 +776,7 @@ const deviceEnvironmentRegister: Handler<v.InferOutput<typeof DeviceEnvironmentR
   );
 };
 
-/** The caller's actor in the Channel and its Conversation; 403 when not a member. */
+/** The caller's actor, role and main conversation in the Channel; 403 when not a member. */
 const channelMember = async (
   db: D1Database,
   workspaceId: string,
@@ -629,16 +785,40 @@ const channelMember = async (
 ) => {
   const member = await db
     .prepare(
-      `SELECT c.id AS conversation_id, a.id AS actor_id
+      `SELECT c.id AS conversation_id, a.id AS actor_id, m.role
          FROM conversations c
          JOIN channel_members m ON m.workspace_id = c.workspace_id AND m.channel_id = c.channel_id
          JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
         WHERE c.workspace_id = ? AND c.channel_id = ? AND c.kind = 'channel' AND a.user_id = ?`,
     )
     .bind(workspaceId, channelId, userId)
-    .first<{ conversation_id: string; actor_id: string }>();
+    .first<{ conversation_id: string; actor_id: string; role: string }>();
   if (!member) throw new HttpError("FORBIDDEN", "not a member of this channel");
   return member;
+};
+
+const requireChannelPost = (member: { role: string }) => {
+  if (member.role === "viewer") throw new HttpError("FORBIDDEN", "channel viewers cannot post");
+};
+
+/** A Bot may only be woken in a Channel when it is a non-viewer member. */
+const requireWakeableBot = async (
+  db: D1Database,
+  workspaceId: string,
+  channelId: string,
+  botId: string,
+) => {
+  const row = await db
+    .prepare(
+      `SELECT m.role FROM bots b LEFT JOIN channel_members m
+         ON m.workspace_id = b.workspace_id AND m.channel_id = ? AND m.actor_id = b.actor_id
+       WHERE b.workspace_id = ? AND b.id = ?`,
+    )
+    .bind(channelId, workspaceId, botId)
+    .first<{ role: string | null }>();
+  if (!row) throw new HttpError("NOT_FOUND", "bot not found");
+  if (row.role === null) throw new HttpError("FORBIDDEN", "bot is not a channel member");
+  if (row.role === "viewer") throw new HttpError("FORBIDDEN", "viewer bots cannot be woken");
 };
 
 /** Event, Inbox item and outbox row delivering a user's channel message to one Bot; routing creates the Job later. */
@@ -702,12 +882,8 @@ const deliveryStatements = (
 const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env) => {
   const { workspaceId, command } = env;
   const member = await channelMember(db, workspaceId, command.channelId, user.userId);
-  const bot = await db
-    .prepare("SELECT 1 FROM bots WHERE workspace_id = ? AND id = ?")
-    .bind(workspaceId, command.recipientBotId)
-    .first();
-  if (!bot) throw new HttpError("NOT_FOUND", "bot not found");
-
+  requireChannelPost(member);
+  await requireWakeableBot(db, workspaceId, command.channelId, command.recipientBotId);
   const receivedAt = new Date().toISOString();
   const messageId = crypto.randomUUID();
   const inboxItemId = crypto.randomUUID();
@@ -777,22 +953,19 @@ const dmParticipant = async (
 const threadId = (rootMessageId: string) => `thread-${rootMessageId}`;
 
 /**
- * One message. In a Channel, each Bot mentioned by a `<@bot:ID>` token gets the delivery of a waking `agent.send`
- * request and joins the Channel when it is not a member. In a DM the DM's Bot is the one recipient; a mention of
- * another Bot is 422. A token naming no Bot of the Workspace, or `mentions` differing from the tokens, is 422.
- * With `threadOf` the message goes to the root message's thread (created here on the first reply, same batch); in a
- * Channel thread the Bots that took part in it (posted there, the root included, or were delivered a message there)
- * are woken as well.
+ * One message. In a Channel, a mentioned non-viewer member Bot gets one waking delivery. In a DM the DM's Bot is
+ * the one recipient; a mention of another Bot is 422. A token naming no Bot of the Workspace, or `mentions`
+ * differing from the tokens, is 422. Thread participants are woken only while they remain non-viewer members.
  */
 const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user, env) => {
   const { workspaceId, command } = env;
+  const channelMemberRow = command.channelId
+    ? await channelMember(db, workspaceId, command.channelId, user.userId)
+    : null;
+  if (channelMemberRow) requireChannelPost(channelMemberRow);
   const parent = command.conversationId
     ? await dmParticipant(db, workspaceId, command.conversationId, user.userId)
-    : {
-        ...(await channelMember(db, workspaceId, command.channelId!, user.userId)),
-        channel_id: command.channelId!,
-        dm_bot_id: null,
-      };
+    : { ...channelMemberRow!, channel_id: command.channelId!, dm_bot_id: null };
   const botIds = mentionedBotIds(command.text);
   if (
     command.mentions &&
@@ -812,7 +985,6 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
     : null;
   if (command.threadOf && !root) throw new HttpError("NOT_FOUND", "thread root message not found");
   const conversationId = root ? threadId(root.id) : parent.conversation_id;
-  let joining: string[] = [];
   let recipients = botIds;
   if (parent.dm_bot_id) {
     if (botIds.some((id) => id !== parent.dm_bot_id)) {
@@ -823,31 +995,32 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
     if (botIds.length > 0) {
       const { results } = await db
         .prepare(
-          `SELECT b.id, b.actor_id, EXISTS (SELECT 1 FROM channel_members m WHERE m.workspace_id = b.workspace_id
-                    AND m.channel_id = ? AND m.actor_id = b.actor_id) AS member
-             FROM bots b WHERE b.workspace_id = ? AND b.id IN (${botIds.map(() => "?").join(", ")})`,
+          `SELECT b.id, m.role FROM bots b LEFT JOIN channel_members m
+             ON m.workspace_id = b.workspace_id AND m.channel_id = ? AND m.actor_id = b.actor_id
+           WHERE b.workspace_id = ? AND b.id IN (${botIds.map(() => "?").join(", ")})`,
         )
         .bind(parent.channel_id, workspaceId, ...botIds)
-        .all<{ id: string; actor_id: string; member: number }>();
+        .all<{ id: string; role: string | null }>();
       const unknown = botIds.filter((id) => !results.some((r) => r.id === id));
       if (unknown.length > 0) {
         throw new HttpError("INVALID_INPUT", `unknown bot in mention: ${unknown.join(", ")}`);
       }
-      joining = results.filter((r) => !r.member).map((r) => r.actor_id);
+      recipients = results.filter((r) => r.role !== null && r.role !== "viewer").map((r) => r.id);
     }
     if (root) {
       const { results } = await db
         .prepare(
-          `SELECT b.id FROM bots b
-            WHERE b.workspace_id = ?1
-              AND (b.actor_id IN (SELECT actor_id FROM messages
-                                   WHERE workspace_id = ?1 AND (conversation_id = ?2 OR id = ?3))
-                   OR b.id IN (SELECT bot_id FROM inbox_items WHERE workspace_id = ?1 AND conversation_id = ?2))
-            ORDER BY b.name`,
+          `SELECT b.id FROM bots b JOIN channel_members cm
+             ON cm.workspace_id = b.workspace_id AND cm.actor_id = b.actor_id AND cm.channel_id = ?4
+           WHERE b.workspace_id = ?1 AND cm.role <> 'viewer'
+             AND (b.actor_id IN (SELECT actor_id FROM messages
+                                  WHERE workspace_id = ?1 AND (conversation_id = ?2 OR id = ?3))
+                  OR b.id IN (SELECT bot_id FROM inbox_items WHERE workspace_id = ?1 AND conversation_id = ?2))
+           ORDER BY b.name`,
         )
-        .bind(workspaceId, conversationId, root.id)
+        .bind(workspaceId, conversationId, root.id, parent.channel_id)
         .all<{ id: string }>();
-      recipients = [...new Set([...botIds, ...results.map((r) => r.id)])];
+      recipients = [...new Set([...recipients, ...results.map((r) => r.id)])];
     }
   }
 
@@ -905,25 +1078,12 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
           receivedAt,
         }),
       ),
-      ...(joining.length > 0
-        ? [
-            db
-              .prepare(
-                `INSERT INTO channel_members (workspace_id, channel_id, actor_id, role)
-                 SELECT ?, ?, value, 'member' FROM json_each(?) WHERE true ON CONFLICT DO NOTHING`,
-              )
-              .bind(workspaceId, parent.channel_id, JSON.stringify(joining)),
-          ]
-        : []),
       indexLater(db, workspaceId, "message", messageId),
     ],
     response,
     [
       { entityKind: "message", entityId: messageId, scope },
       ...deliveries.map((d) => ({ entityKind: "inbox_item", entityId: d.inboxItemId, scope })),
-      ...(joining.length > 0
-        ? [{ entityKind: "channel", entityId: parent.channel_id, scope }]
-        : []),
     ],
   );
 };
@@ -1755,6 +1915,11 @@ const subscriptionCreate: Handler<SubscriptionCommand> = async (db, user, env) =
     if (!integration) throw new HttpError("NOT_FOUND", "integration not found");
   }
   await checkDestination(db, workspaceId, user.userId, command.destination);
+  const destination = await db
+    .prepare("SELECT channel_id FROM conversations WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, command.destination.conversationId)
+    .first<{ channel_id: string }>();
+  if (destination) await requireWakeableBot(db, workspaceId, destination.channel_id, command.botId);
   const subscriptionId = crypto.randomUUID();
   return receipt(
     db,
@@ -2135,6 +2300,12 @@ const routineCreate: Handler<v.InferOutput<typeof RoutineCreate>> = async (db, u
       conversationId: command.conversationId,
       ...(command.taskId ? { taskId: command.taskId } : {}),
     });
+    const destination = await db
+      .prepare("SELECT channel_id FROM conversations WHERE workspace_id = ? AND id = ?")
+      .bind(workspaceId, command.conversationId)
+      .first<{ channel_id: string }>();
+    if (destination)
+      await requireWakeableBot(db, workspaceId, destination.channel_id, command.botId);
   } else if (command.taskId) {
     await loadTask(db, workspaceId, command.taskId);
   }
@@ -2772,8 +2943,9 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "device.revoke": deviceRevoke,
   "channel.create": channelCreate,
   "channel.update": channelUpdate,
-  "channel.join": channelMembership(true),
-  "channel.leave": channelMembership(false),
+  "channel.member.add": channelMembership("add"),
+  "channel.member.update": channelMembership("update"),
+  "channel.member.remove": channelMembership("remove"),
   "dm.open": dmOpen,
   "bot.create": botCreate,
   "bot.update": botUpdate,
@@ -3366,18 +3538,20 @@ const runTaskCommand = async (
     command: Extract<Command, { type: keyof typeof taskHandlers }>;
   };
   let projectId: string | null = null;
-  if (command.type !== "task.create") {
+  if (command.type === "task.create") {
+    if (command.projectKey) {
+      projectId =
+        (
+          await db
+            .prepare("SELECT id FROM projects WHERE workspace_id = ? AND key = ?")
+            .bind(workspaceId, command.projectKey)
+            .first<{ id: string }>()
+        )?.id ?? null;
+    } else if (command.parentTaskId) {
+      projectId = (await loadTask(db, workspaceId, command.parentTaskId)).project_id;
+    }
+  } else {
     projectId = (await loadTask(db, workspaceId, command.taskId)).project_id;
-  } else if (command.projectKey) {
-    projectId =
-      (
-        await db
-          .prepare("SELECT id FROM projects WHERE workspace_id = ? AND key = ?")
-          .bind(workspaceId, command.projectKey)
-          .first<{ id: string }>()
-      )?.id ?? null;
-  } else if (command.parentTaskId) {
-    projectId = (await loadTask(db, workspaceId, command.parentTaskId)).project_id;
   }
   if (!run.taskProjectId || projectId !== run.taskProjectId) {
     throw new HttpError("FORBIDDEN", "a run may only write tasks of its own task's project");
@@ -3389,11 +3563,361 @@ const runTaskCommand = async (
   );
 };
 
+const requireManage = async (
+  db: D1Database,
+  run: Run,
+  kind: "subscriptions" | "routines" | "channels" | "bots",
+) => {
+  const bot = await db
+    .prepare("SELECT tool_policy FROM bots WHERE workspace_id = ? AND id = ?")
+    .bind(run.workspaceId, run.botId)
+    .first<{ tool_policy: string }>();
+  if (!(bot && (JSON.parse(bot.tool_policy) as ToolPolicy).manage?.[kind])) {
+    throw new HttpError("FORBIDDEN", `bot is not allowed to manage ${kind}`);
+  }
+};
+
+const requireManagedBot = async (db: D1Database, run: Run, botId: string) => {
+  const bot = await db
+    .prepare(
+      "SELECT 1 FROM bots WHERE workspace_id = ? AND id = ? AND (id = ? OR created_by_bot_id = ?)",
+    )
+    .bind(run.workspaceId, botId, run.botId, run.botId)
+    .first();
+  if (!bot) throw new HttpError("FORBIDDEN", "a bot may only manage itself or a bot it created");
+};
+
+const requireRunDestinationMember = async (db: D1Database, run: Run, conversationId: string) => {
+  const conversation = await db
+    .prepare(
+      `SELECT c.channel_id FROM conversations c JOIN channel_members m
+         ON m.workspace_id = c.workspace_id AND m.channel_id = c.channel_id
+        WHERE c.workspace_id = ? AND c.id = ? AND m.actor_id = ? AND m.role <> 'viewer'`,
+    )
+    .bind(run.workspaceId, conversationId, run.botActorId)
+    .first<{ channel_id: string }>();
+  if (!conversation)
+    throw new HttpError("FORBIDDEN", "bot must be a non-viewer destination member");
+  return conversation.channel_id;
+};
+
+const runManagement = async (db: D1Database, run: Run, env: RunEnvelopeValue) => {
+  const { command, workspaceId } = env;
+  if (
+    command.type === "subscription.create" ||
+    command.type === "subscription.update" ||
+    command.type === "subscription.delete"
+  ) {
+    await requireManage(db, run, "subscriptions");
+    if (command.type === "subscription.create") {
+      await requireManagedBot(db, run, command.botId);
+      await requireRunDestinationMember(db, run, command.destination.conversationId);
+      const id = crypto.randomUUID();
+      return receipt(
+        db,
+        run.runId,
+        env as unknown as Envelope,
+        [
+          db
+            .prepare(
+              `INSERT INTO subscriptions (id, workspace_id, bot_id, integration_id, event_types, filter, destination,
+                 delivery, enabled, expires_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1)`,
+            )
+            .bind(
+              id,
+              workspaceId,
+              command.botId,
+              command.integrationId ?? null,
+              JSON.stringify(command.eventTypes),
+              JSON.stringify(command.filter),
+              JSON.stringify(command.destination),
+              JSON.stringify(command.delivery),
+              command.expiresAt ?? null,
+            ),
+          snapshotSubscription(db, id),
+        ],
+        { operationId: env.operationId, status: "accepted", subscriptionId: id, revision: 1 },
+        [subscriptionChange(workspaceId, id, 1)],
+      );
+    }
+    const id = command.subscriptionId;
+    const current = await loadSubscription(db, workspaceId, id);
+    await requireManagedBot(db, run, current.bot_id);
+    if (command.type === "subscription.update") {
+      if (command.destination)
+        await requireRunDestinationMember(db, run, command.destination.conversationId);
+      const [setGuard, clearGuard] = guard(db);
+      return receipt(
+        db,
+        run.runId,
+        env as unknown as Envelope,
+        [
+          db
+            .prepare(
+              `UPDATE subscriptions SET event_types = ?, filter = ?, destination = ?, delivery = ?, expires_at = ?,
+                 enabled = ?, revision = revision + 1, updated_at = ?
+               WHERE workspace_id = ? AND id = ? AND revision = ?`,
+            )
+            .bind(
+              json(command.eventTypes, current.event_types),
+              json(command.filter, current.filter),
+              json(command.destination, current.destination),
+              json(command.delivery, current.delivery),
+              command.expiresAt === undefined ? current.expires_at : command.expiresAt,
+              command.enabled === undefined ? current.enabled : Number(command.enabled),
+              new Date().toISOString(),
+              workspaceId,
+              id,
+              command.expectedRevision,
+            ),
+          setGuard,
+          clearGuard,
+          snapshotSubscription(db, id),
+        ],
+        {
+          operationId: env.operationId,
+          status: "accepted",
+          subscriptionId: id,
+          revision: command.expectedRevision + 1,
+        },
+        [subscriptionChange(workspaceId, id, command.expectedRevision + 1)],
+      );
+    }
+    return receipt(
+      db,
+      run.runId,
+      env as unknown as Envelope,
+      [
+        db
+          .prepare("DELETE FROM subscriptions WHERE workspace_id = ? AND id = ?")
+          .bind(workspaceId, id),
+      ],
+      { operationId: env.operationId, status: "accepted", subscriptionId: id },
+      [{ ...subscriptionChange(workspaceId, id), op: "delete" }],
+    );
+  }
+  if (
+    command.type === "routine.create" ||
+    command.type === "routine.update" ||
+    command.type === "routine.pause" ||
+    command.type === "routine.resume" ||
+    command.type === "routine.delete"
+  ) {
+    await requireManage(db, run, "routines");
+    if (command.type === "routine.create") {
+      await requireManagedBot(db, run, command.botId);
+      if (command.conversationId)
+        await requireRunDestinationMember(db, run, command.conversationId);
+      const id = crypto.randomUUID();
+      const nextFireAt = firstFireAt(command.schedule, Date.now());
+      return receipt(
+        db,
+        run.runId,
+        env as unknown as Envelope,
+        [
+          db
+            .prepare(
+              `INSERT INTO routines (id, workspace_id, bot_id, name, conversation_id, task_id, input_text, schedule,
+                 misfire, next_fire_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .bind(
+              id,
+              workspaceId,
+              command.botId,
+              command.name,
+              command.conversationId ?? null,
+              command.taskId ?? null,
+              command.inputText,
+              JSON.stringify(command.schedule),
+              command.misfire,
+              nextFireAt,
+            ),
+        ],
+        {
+          operationId: env.operationId,
+          status: "accepted",
+          routineId: id,
+          revision: 1,
+          nextFireAt,
+        },
+        [routineChange(workspaceId, id, 1)],
+      );
+    }
+    const routine = await loadRoutine(db, workspaceId, command.routineId);
+    await requireManagedBot(db, run, routine.bot_id);
+    if (command.type === "routine.delete") {
+      return receipt(
+        db,
+        run.runId,
+        env as unknown as Envelope,
+        [
+          db
+            .prepare("DELETE FROM routine_occurrences WHERE workspace_id = ? AND routine_id = ?")
+            .bind(workspaceId, routine.id),
+          db
+            .prepare("DELETE FROM routines WHERE workspace_id = ? AND id = ?")
+            .bind(workspaceId, routine.id),
+        ],
+        { operationId: env.operationId, status: "accepted", routineId: routine.id },
+        [routineChange(workspaceId, routine.id)],
+      );
+    }
+    if (command.type === "routine.pause" || command.type === "routine.resume") {
+      const enabled = command.type === "routine.resume";
+      const nextFireAt = enabled
+        ? firstFireAt(JSON.parse(routine.schedule) as RoutineSchedule, Date.now())
+        : routine.next_fire_at;
+      return receipt(
+        db,
+        run.runId,
+        env as unknown as Envelope,
+        [
+          db
+            .prepare(
+              "UPDATE routines SET enabled = ?, next_fire_at = ?, revision = revision + 1, updated_at = ? WHERE workspace_id = ? AND id = ?",
+            )
+            .bind(Number(enabled), nextFireAt, new Date().toISOString(), workspaceId, routine.id),
+        ],
+        { operationId: env.operationId, status: "accepted", routineId: routine.id, nextFireAt },
+        [routineChange(workspaceId, routine.id)],
+      );
+    }
+    const schedule = command.schedule;
+    const [setGuard, clearGuard] = guard(db);
+    return receipt(
+      db,
+      run.runId,
+      env as unknown as Envelope,
+      [
+        db
+          .prepare(
+            `UPDATE routines SET name = COALESCE(?, name), input_text = COALESCE(?, input_text),
+               misfire = COALESCE(?, misfire), schedule = COALESCE(?, schedule),
+               schedule_revision = schedule_revision + ?, next_fire_at = ?, revision = revision + 1, updated_at = ?
+             WHERE workspace_id = ? AND id = ? AND revision = ?`,
+          )
+          .bind(
+            command.name ?? null,
+            command.inputText ?? null,
+            command.misfire ?? null,
+            schedule ? JSON.stringify(schedule) : null,
+            schedule ? 1 : 0,
+            schedule ? firstFireAt(schedule, Date.now()) : routine.next_fire_at,
+            new Date().toISOString(),
+            workspaceId,
+            routine.id,
+            command.expectedRevision,
+          ),
+        setGuard,
+        clearGuard,
+      ],
+      {
+        operationId: env.operationId,
+        status: "accepted",
+        routineId: routine.id,
+        revision: command.expectedRevision + 1,
+      },
+      [routineChange(workspaceId, routine.id, command.expectedRevision + 1)],
+    );
+  }
+  if (command.type === "channel.create") {
+    await requireManage(db, run, "channels");
+    const channelId = crypto.randomUUID();
+    const conversationId = crypto.randomUUID();
+    return receipt(
+      db,
+      run.runId,
+      env as unknown as Envelope,
+      [
+        db
+          .prepare("INSERT INTO channels (id, workspace_id, name) VALUES (?, ?, ?)")
+          .bind(channelId, workspaceId, command.name),
+        db
+          .prepare("INSERT INTO conversations (id, workspace_id, channel_id) VALUES (?, ?, ?)")
+          .bind(conversationId, workspaceId, channelId),
+        db
+          .prepare(
+            "INSERT INTO channel_members (workspace_id, channel_id, actor_id, role) VALUES (?, ?, ?, 'owner')",
+          )
+          .bind(workspaceId, channelId, run.botActorId),
+        db
+          .prepare(
+            `INSERT INTO channel_members (workspace_id, channel_id, actor_id, role)
+             SELECT ?, ?, a.id, 'owner' FROM workspace_members w JOIN actors a
+               ON a.workspace_id = w.workspace_id AND a.user_id = w.user_id
+            WHERE w.workspace_id = ? AND w.role = 'owner'`,
+          )
+          .bind(workspaceId, channelId, workspaceId),
+      ],
+      { operationId: env.operationId, status: "accepted", channelId, conversationId },
+      [{ entityKind: "channel", entityId: channelId, scope: `channel:${channelId}` }],
+    );
+  }
+  if (command.type !== "bot.create")
+    throw new HttpError("INVALID_INPUT", "unsupported run command");
+  await requireManage(db, run, "bots");
+  const creator = await db
+    .prepare("SELECT tool_policy FROM bots WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, run.botId)
+    .first<{ tool_policy: string }>();
+  const toolPolicy: ToolPolicy = { ...command.toolPolicy, manage: {} };
+  if (!creator || !policyIsSubset(toolPolicy, JSON.parse(creator.tool_policy) as ToolPolicy)) {
+    throw new HttpError("FORBIDDEN", "child bot policy exceeds the creator policy");
+  }
+  validateSkills(command.skills, toolPolicy);
+  const actorId = crypto.randomUUID();
+  const botId = crypto.randomUUID();
+  return receipt(
+    db,
+    run.runId,
+    env as unknown as Envelope,
+    [
+      db
+        .prepare(
+          "INSERT INTO actors (id, workspace_id, kind, display_name) VALUES (?, ?, 'bot', ?)",
+        )
+        .bind(actorId, workspaceId, command.name),
+      db
+        .prepare(
+          `INSERT INTO bots (id, workspace_id, actor_id, name, placement_policy, instructions, tool_policy, skills, created_by_bot_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          botId,
+          workspaceId,
+          actorId,
+          command.name,
+          JSON.stringify(command.placementPolicy),
+          command.instructions,
+          JSON.stringify(toolPolicy),
+          JSON.stringify(command.skills),
+          run.botId,
+        ),
+    ],
+    { operationId: env.operationId, status: "accepted", botId },
+    [{ entityKind: "bot", entityId: botId, revision: 1, scope: `workspace:${workspaceId}` }],
+  );
+};
+
 export const runRunCommand = (db: D1Database, run: Run, envelope: RunEnvelopeValue) => {
   if (envelope.workspaceId !== run.workspaceId) {
     throw new HttpError("FORBIDDEN", "capability is for another workspace");
   }
   const { command } = envelope;
+  if (
+    command.type === "subscription.create" ||
+    command.type === "subscription.update" ||
+    command.type === "subscription.delete" ||
+    command.type === "routine.create" ||
+    command.type === "routine.update" ||
+    command.type === "routine.pause" ||
+    command.type === "routine.resume" ||
+    command.type === "routine.delete" ||
+    command.type === "channel.create" ||
+    command.type === "bot.create"
+  ) {
+    return runManagement(db, run, envelope);
+  }
   if (command.type === "agent.send") {
     return runAgentSend(db, run, envelope as RunEnvelopeValue & { command: typeof command });
   }

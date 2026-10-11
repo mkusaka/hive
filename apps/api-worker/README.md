@@ -17,13 +17,13 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/transcripts/:runId/raw`                                | Access assertion (user, owner)    | The confirmed raw JSONL parts concatenated (`application/x-ndjson`); never indexed                                                                                                             |
 | `GET /v1/inbox?botId=`                                          | Access assertion (user)           | The Bot's inbox items (first 100, no cursor yet)                                                                                                                                               |
 | `GET /v1/channels?workspaceId=`                                 | Access assertion (user)           | Channels the user is a member of, with the main `conversationId`, `topic` and `memberCount` (max 500)                                                                                          |
-| `GET /v1/sidebar?workspaceId=`                                  | Access assertion (user)           | The caller's own sidebar document `{workspaceName, prefs: {pinned, hidden, groups}, revision}`; the empty default at revision 0 when none                                                      |
-| `GET /v1/channels/:id/members`                                  | Access assertion (user)           | The channel's members (`role` owner / member; users and Bots), with `kind`, `name` (a Bot's current name), `userId`, `botId` (404 if not a member)                                             |
+| `GET /v1/channels/:id/members`                                  | Access assertion (user)           | The channel's members (`role` owner / member / viewer), with `actorId`, `name`, `userId`, `botId`, and `canManage` (404 if not a member)                                                       |
+| `GET /v1/users?workspaceId=`                                    | Access assertion (user)           | Workspace members for Channel membership pickers: `{users:[{id,label}]}`                                                                                                                       |
 | `GET /v1/dms?workspaceId=`                                      | Access assertion (user)           | The caller's direct messages by Bot name: `id` = `conversationId`, `botId`, `name`, `createdAt`, `lastMessage` (as on channels)                                                                |
 | `GET /v1/conversations/:id/messages?workspaceId=&limit=`        | Access assertion (user)           | A DM's or a thread's messages, newest first (who may read the DM / the thread's parent, 404 otherwise); a thread's response adds `root` (its root message)                                     |
 | `GET /v1/threads?participant=me&workspaceId=`                   | Access assertion (user)           | Threads the caller started or replied in (max 50, newest reply first): `conversationId`, `channelId`, `channelName`, `parentConversationId`, `parentKind`, `root`, `replyCount`, `lastReplyAt` |
 | `GET /v1/channels/:id/messages`                                 | Access assertion (user)           | Newest-first messages of a member channel (limit 1..200, default 50; 404 if not a member)                                                                                                      |
-| `GET /v1/bots?workspaceId=`                                     | Access assertion (user)           | Bots of the Workspace (max 500)                                                                                                                                                                |
+| `GET /v1/bots?workspaceId=`                                     | Access assertion (user)           | Bots with `skills`, `createdByBotId`, configuration revision and workspace-owner `canManage` (max 500)                                                                                         |
 | `GET /v1/bot-conversations?workspaceId=`                        | Access assertion (user)           | `bot_pair` conversations with both Bots and their last 20 messages (max 100); see Bot messaging                                                                                                |
 | `GET /v1/devices?workspaceId=`                                  | Access assertion (user)           | Devices of the Workspace, no credentials (max 500)                                                                                                                                             |
 | `GET /v1/jobs?limit=&state=`                                    | Access assertion (user)           | Newest-first Jobs (limit 1..200, default 50), optionally of one state                                                                                                                          |
@@ -74,19 +74,22 @@ token). The Worker falls back to `Authorization: Bearer <token>` for local dev a
   `withOperationReceipt`, so a replay with the same key returns the stored response and a different payload under
   the same key is 409 `IDEMPOTENCY_CONFLICT`.
 - **Command types:** `workspace.create`, `device.register`, `device.revoke`, `channel.create`, `channel.update`,
-  `channel.join`, `channel.leave`, `dm.open`, `bot.create`,
-  `agent.send`, `event.emit`, the Work commands, the Subscription / integration commands, the Routine commands,
-  `job.cancel` / `job.resolve` below, `bot.update`, `device.environment.register`, `approval.resolve` (Tools and
-  approvals), `memory.write` / `memory.delete` (Search and memory), `effect.resolve` (External effects) and `sidebar.update`.
-- **Actors.** A user's `actors` row is created by `workspace.create` together with the membership (the only path
-  that creates a membership today), unique per `(workspace_id, user_id)`. Messages and channel membership use it.
+  `channel.member.add` / `update` / `remove`, `dm.open`, `bot.create`, `bot.update`, `agent.send`, `event.emit`,
+  the Work, Subscription / integration and Routine commands, `job.cancel` / `job.resolve`,
+  `device.environment.register`, `approval.resolve`, `memory.write` / `memory.delete`, `effect.resolve` and
+  `sidebar.update`.
 - **`channel.create`** creates the channel, its main conversation and an `owner` channel membership for the caller.
-  **`channel.update {channelId, topic}`** sets the topic (≤ 250 chars; empty or blank clears it); members only (403),
-  404 for an unknown channel.
-  **`channel.join` / `channel.leave {channelId, botId}`** add or remove a Bot member (members only, 403; unknown Bot
-  404; idempotent; `channel` change row). Membership does not wake a Bot.
-  **`dm.open {botId}`** returns `{conversationId}` of the caller's DM with the Bot, creating it (and its member-less
-  backing channel row, same id `dm-<userId>-<botId>`) on first open; `dm` change row in `workspace:<ws>`.
+  **`channel.member.add {channelId, userId|botId, role}`**, **`channel.member.update`** and
+  **`channel.member.remove`** require a Channel owner (or Workspace owner); the last owner cannot be demoted or
+  removed. `viewer` members can read but cannot post, and viewer Bots are never woken.
+  **`channel.update {channelId, topic}`** sets the topic (≤ 250 chars; empty or blank clears it); non-viewer
+  members only (403), 404 for an unknown channel.
+  **`bot.create`** stores optional `skills` (at most 20; each instructions field ≤ 8 KiB); optional skill policies
+  are restrictions of the Bot policy. A Bot's `toolPolicy.manage` flags default false and only a Workspace owner may
+  grant them through `bot.update`.
+  `POST /v1/run/commands` acts as the Run's Bot, never an impersonated user. With the corresponding `manage` flag,
+  it may manage only itself or Bots it created; created Channels add the Bot and Workspace owners as owners, and
+  child Bots receive a no-wider policy with all `manage` flags false.
   **`sidebar.update {prefs, expectedRevision}`** replaces the caller's own sidebar document (`SidebarPrefs`: pinned /
   hidden `{kind: channel|bot, id}` lists and named groups, ≤ 64 KiB of JSON, also a SQL CHECK). Revision CAS:
   `expectedRevision` 0 creates it (a row already there fails on the primary key), otherwise a guarded conditional
@@ -94,17 +97,13 @@ token). The Worker falls back to `Authorization: Bearer <token>` for local dev a
   unknown ones).
   **`bot.create`** creates the Bot and its actor; it joins no channel. A duplicate name is 422. Optional
   `instructions` (≤ 64 KiB, default `""`) is the Bot's system prompt for its runs.
-- **`agent.send`** requires channel membership (403) and a Bot in the Workspace (404). One batch commits the
-  Message, the `agent.message.sent` Event, the Bot's inbox item (lane = channel, purpose `agent.send`,
+- **`agent.send`** requires a non-viewer Channel member caller and a non-viewer Bot member (403 otherwise). One batch
+  commits the Message, the `agent.message.sent` Event, the Bot's inbox item (lane = channel, purpose `agent.send`,
   `delivery_mode` wake/notify), an `event.route` outbox row and the receipt. The response has `jobId: null` and
   `routingStatus: "pending"`; the Job appears after routing (`GET /v1/operations/:id`).
-- **`message.post`** `{channelId | conversationId, text, mentions?}` requires channel membership (403) or being the
-  DM's user (404). It commits one Message
-  (body kept with its `<@bot:ID>` tokens) and, for each distinct mentioned Bot, the `agent.send` request / `wake`
-  delivery rows above (Event, inbox item, outbox), so routing creates one Job per Bot. The response has
-  `inboxItemIds` (empty: posted, nobody woken). An unknown Bot id in a token, or `mentions` not equal to the tokens,
-  is 422. Run contexts show tokens as `@name`. A mentioned Bot that is not a member joins the channel in the same
-  batch (`channel` change row). In a DM the DM's Bot is always the one recipient; a mention of another Bot is 422.
+- **`message.post`** `{channelId | conversationId, text, mentions?}` requires a non-viewer Channel member (403) or
+  being the DM's user (404). Mentioned Bots wake only when already non-viewer Channel members; unjoined or viewer
+  Bots do not receive a delivery. In a DM the DM's Bot is always the one recipient; a mention of another Bot is 422.
   With **`threadOf`** (a message of that Channel / DM, else 404) the message goes to the root's thread
   (`thread-<rootMessageId>`, created by the first reply in the same batch) and every Bot that already took part in
   the thread (posted there or was delivered there) is woken too, mentioned or not. The response's `conversationId`

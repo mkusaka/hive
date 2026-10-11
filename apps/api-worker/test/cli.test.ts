@@ -26,6 +26,16 @@ it("workspace → device → channel → bot → agent send → executor → job
   });
   const { channelId } = await hive.channelCreate(client, envelope(), "dev");
   const { botId } = await hive.botCreate(client, envelope(), "coder");
+  await hive.channelMember(
+    client,
+    envelope(),
+    "channel.member.add",
+    channelId as string,
+    {
+      botId: botId as string,
+    },
+    "member",
+  );
   const send = envelope();
   const accepted = await hive.agentSend(client, send, {
     botId: botId as string,

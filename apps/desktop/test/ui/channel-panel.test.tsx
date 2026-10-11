@@ -4,8 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import { renderApp } from "./fakeHive.ts";
 
 /** Opens #general's panel from the header pill. */
-const openGeneral = async () => {
-  const app = renderApp();
+const openGeneral = async (overrides: Parameters<typeof renderApp>[0] = {}) => {
+  const app = renderApp(overrides);
   await app.user.click(await screen.findByRole("button", { name: "# general" }));
   const panel = within(app.container.querySelector<HTMLElement>(".panel")!);
   return { ...app, panel };
@@ -45,26 +45,45 @@ describe("channel panel", () => {
     expect(await botPanel.findByText("Write small diffs.")).toBeTruthy();
   });
 
-  it("Add bot lists non-member Bots and sends channel.join; a Bot's menu sends channel.leave", async () => {
+  it("adds a user or Bot with a role, updates a Bot role, and removes the Bot", async () => {
     const { panel, user, hive } = await openGeneral();
     await user.click(panel.getByRole("tab", { name: "Members" }));
-    await user.click(await panel.findByRole("button", { name: "Add bot" }));
-    // The blob's letter, then the name.
-    expect(screen.getAllByRole("menuitem").map((b) => b.textContent)).toEqual(["R reviewer"]);
-    await user.click(screen.getByRole("menuitem", { name: /reviewer/ }));
+    expect(await panel.findByText("owner")).toBeTruthy();
+    expect(panel.getByText("member")).toBeTruthy();
+    await user.click(panel.getByRole("button", { name: "Add member" }));
+    await user.selectOptions(panel.getByRole("combobox", { name: "Member" }), "user:user-2");
+    await user.selectOptions(panel.getByRole("combobox", { name: "Member role" }), "viewer");
+    await user.click(panel.getByRole("button", { name: "Add" }));
+    await user.click(panel.getByRole("button", { name: "Add member" }));
+    await user.selectOptions(panel.getByRole("combobox", { name: "Member" }), "bot:bot-2");
+    await user.click(panel.getByRole("button", { name: "Add" }));
+    await user.click(panel.getByRole("button", { name: "coder actions" }));
+    await user.click(screen.getByRole("menuitem", { name: "Make viewer" }));
     await user.click(panel.getByRole("button", { name: "coder actions" }));
     await user.click(screen.getByRole("menuitem", { name: "Remove from channel" }));
-    expect([...hive.sent("channel.join"), ...hive.sent("channel.leave")]).toEqual([
-      { workspaceId: "ws-1", command: { type: "channel.join", channelId: "ch-1", botId: "bot-2" } },
-      {
-        workspaceId: "ws-1",
-        command: { type: "channel.leave", channelId: "ch-1", botId: "bot-1" },
-      },
+    expect(hive.calls.command.map((entry) => entry.command)).toEqual([
+      { type: "channel.member.add", channelId: "ch-1", userId: "user-2", role: "viewer" },
+      { type: "channel.member.add", channelId: "ch-1", botId: "bot-2", role: "member" },
+      { type: "channel.member.update", channelId: "ch-1", botId: "bot-1", role: "viewer" },
+      { type: "channel.member.remove", channelId: "ch-1", botId: "bot-1" },
     ]);
-    // Re-read after each change.
-    expect(
-      hive.calls.get.filter((p) => p.startsWith("/v1/channels/ch-1/members")).length,
-    ).toBeGreaterThanOrEqual(3);
+  });
+
+  it("hides membership controls when the caller cannot manage members", async () => {
+    const { panel, user } = await openGeneral({
+      get: {
+        "/v1/channels/ch-1/members": {
+          canManage: false,
+          members: [
+            { actorId: "actor-user-1", name: "Mina", userId: "user-1", botId: null, role: "owner" },
+          ],
+        },
+      },
+    });
+    await user.click(panel.getByRole("tab", { name: "Members" }));
+    await panel.findByText("owner");
+    expect(panel.queryByRole("button", { name: "Add member" })).toBeNull();
+    expect(panel.queryByRole("button", { name: "Mina (you) actions" })).toBeNull();
   });
 
   it("creates a routine in the channel's conversation", async () => {

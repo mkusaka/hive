@@ -247,6 +247,7 @@ describe("waiting_device (AT-12, AT-30)", () => {
         preferredDeviceIds: [pc2.deviceId],
       },
     });
+    await s.ok({ type: "channel.member.add", channelId: s.channelId, botId, role: "member" });
     const { jobId } = await queuedJob(s, botId as string);
     const job = async () => (await s.user.get(`/v1/jobs/${jobId}`)).json<Json>();
     expect(await job()).toMatchObject({ state: "waiting_device", revision: 2 });

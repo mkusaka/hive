@@ -22,6 +22,12 @@ const request = (text = "what is 2+2?") => ({
 const bots = async () => {
   const s = await setup();
   const { botId: helperId } = await s.ok({ type: "bot.create", name: "helper" });
+  await s.ok({
+    type: "channel.member.add",
+    channelId: s.channelId,
+    botId: helperId,
+    role: "member",
+  });
   const device = executor(s.deviceToken, s.workspaceId);
   // Several Runs at once on the one device.
   await device.post("/v1/executor/heartbeat", { capacity: { background: 8 } });

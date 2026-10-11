@@ -2,11 +2,11 @@
 import { screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { findComposer, renderApp, sidebar } from "./fakeHive.ts";
-import { dms } from "./fixtures.ts";
+import { bots, dms } from "./fixtures.ts";
 
 /** Opens coder's DM from its sidebar blob, then its panel from the DM header. */
 const openCoder = async (overrides: Parameters<typeof renderApp>[0] = {}) => {
-  const app = renderApp({ ...overrides, get: { "/v1/dms": { dms } } });
+  const app = renderApp({ ...overrides, get: { ...overrides.get, "/v1/dms": { dms } } });
   await app.user.click(await (await sidebar()).findByRole("button", { name: "coder" }));
   const head = within(await waitForHead(app.container));
   await app.user.click(head.getByRole("button", { name: "coder" }));
@@ -28,6 +28,76 @@ describe("bot panel", () => {
     expect(panel.getByText("Weekdays at 9:00 AM")).toBeTruthy();
     expect(panel.getByText("# general")).toBeTruthy();
     expect(hive.calls.get).toContain("/v1/routines?workspaceId=ws-1&botId=bot-1");
+  });
+  it("adds, edits, and removes Skills with bot.update revisions", async () => {
+    const { panel, user, hive } = await openCoder();
+    expect(panel.getByText("release-notes")).toBeTruthy();
+    await user.click(panel.getByRole("button", { name: "Add skill" }));
+    await user.type(panel.getByRole("textbox", { name: "Skill name" }), "triage");
+    await user.type(panel.getByRole("textbox", { name: "Skill description" }), "Triage issues.");
+    await user.type(
+      panel.getByRole("textbox", { name: "Skill instructions" }),
+      "Classify reports.",
+    );
+    await user.click(panel.getByRole("button", { name: "Save skill" }));
+    await user.click(panel.getByRole("button", { name: "Edit skill" }));
+    await user.clear(panel.getByRole("textbox", { name: "Skill description" }));
+    await user.type(
+      panel.getByRole("textbox", { name: "Skill description" }),
+      "Draft release notes.",
+    );
+    await user.click(panel.getByRole("button", { name: "Save skill" }));
+    await user.click(panel.getByRole("button", { name: "Remove skill" }));
+    expect(hive.sent("bot.update").map((entry) => entry.command)).toEqual([
+      {
+        type: "bot.update",
+        botId: "bot-1",
+        expectedRevision: 1,
+        skills: [
+          {
+            name: "release-notes",
+            description: "Draft release notes.",
+            instructions: "Summarize changes.",
+          },
+          { name: "triage", description: "Triage issues.", instructions: "Classify reports." },
+        ],
+      },
+      {
+        type: "bot.update",
+        botId: "bot-1",
+        expectedRevision: 1,
+        skills: [
+          {
+            name: "release-notes",
+            description: "Draft release notes.",
+            instructions: "Summarize changes.",
+          },
+        ],
+      },
+      { type: "bot.update", botId: "bot-1", expectedRevision: 1, skills: [] },
+    ]);
+  });
+
+  it("updates management flags without dropping the existing tool policy", async () => {
+    const { panel, user, hive } = await openCoder();
+    await user.click(panel.getByRole("checkbox", { name: "Manage channels" }));
+    expect(hive.sent("bot.update")).toEqual([
+      {
+        workspaceId: "ws-1",
+        command: {
+          type: "bot.update",
+          botId: "bot-1",
+          expectedRevision: 1,
+          toolPolicy: { bash: "ask", manage: { routines: true, channels: true } },
+        },
+      },
+    ]);
+  });
+
+  it("hides Skills and management controls from non-owners", async () => {
+    const { panel } = await openCoder({ get: { "/v1/bots": { bots, canManage: false } } });
+    expect(panel.queryByRole("button", { name: "Add skill" })).toBeNull();
+    expect(panel.queryByRole("checkbox", { name: "Manage channels" })).toBeNull();
   });
 
   it("pauses and deletes a routine from its menu", async () => {

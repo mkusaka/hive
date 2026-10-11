@@ -137,7 +137,13 @@ export const fireDueRoutines = async (db: D1Database, limit = 50) => {
   const { results } = await db
     .prepare(
       `SELECT ${routineColumns} FROM ${routineFrom}
-        WHERE r.enabled = 1 AND r.next_fire_at <= ? ORDER BY r.next_fire_at LIMIT ?`,
+        WHERE r.enabled = 1 AND r.next_fire_at <= ?
+          AND (r.conversation_id IS NULL OR EXISTS (
+            SELECT 1 FROM bots b JOIN channel_members m
+              ON m.workspace_id = b.workspace_id AND m.actor_id = b.actor_id AND m.channel_id = c.channel_id
+             WHERE b.workspace_id = r.workspace_id AND b.id = r.bot_id AND m.role <> 'viewer'
+          ))
+        ORDER BY r.next_fire_at LIMIT ?`,
     )
     .bind(iso(now), limit)
     .all<RoutineRow & { next_fire_at: string }>();

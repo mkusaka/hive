@@ -2,10 +2,12 @@
 import type {
   AgentSend,
   ApprovalResolve,
-  ChannelJoin,
-  ChannelLeave,
+  BotUpdate,
+  ChannelMemberAdd,
+  ChannelMemberRemove,
+  ChannelMemberUpdate,
   ChannelUpdate,
-  commandEnvelope,
+  IdempotencyKey,
   DmOpen,
   JobCancel,
   MemoryWrite,
@@ -18,6 +20,7 @@ import type {
   RoutineUpdate,
   SidebarUpdate,
   WorkspaceCreate,
+  WorkspaceId,
 } from "@hive/contracts";
 import type * as v from "valibot";
 
@@ -26,36 +29,33 @@ export type ApiResult =
   | { ok: true; value: Record<string, unknown> }
   | { ok: false; error: { code: string; message: string; body?: unknown } };
 
-/** The commands the UI sends today: message.post, agent.send, job.cancel, approval.resolve, memory.write, channel.update / join / leave, dm.open, the routine commands, sidebar.update and workspace.create (Welcome). */
-export type UiCommand = v.InferInput<
-  ReturnType<
-    typeof commandEnvelope<
-      v.VariantSchema<
-        "type",
-        [
-          typeof MessagePost,
-          typeof AgentSend,
-          typeof JobCancel,
-          typeof ApprovalResolve,
-          typeof MemoryWrite,
-          typeof ChannelUpdate,
-          typeof ChannelJoin,
-          typeof ChannelLeave,
-          typeof DmOpen,
-          typeof RoutineCreate,
-          typeof RoutineUpdate,
-          typeof RoutineDelete,
-          typeof RoutinePause,
-          typeof RoutineResume,
-          typeof RoutineRun,
-          typeof SidebarUpdate,
-          typeof WorkspaceCreate,
-        ],
-        undefined
-      >
-    >
-  >
->;
+/** The commands the UI sends. */
+export type UiCommand = {
+  operationId: string;
+  idempotencyKey: v.InferInput<typeof IdempotencyKey>;
+  workspaceId: v.InferInput<typeof WorkspaceId>;
+  command: v.InferInput<
+    | typeof MessagePost
+    | typeof AgentSend
+    | typeof JobCancel
+    | typeof ApprovalResolve
+    | typeof MemoryWrite
+    | typeof ChannelUpdate
+    | typeof ChannelMemberAdd
+    | typeof ChannelMemberUpdate
+    | typeof ChannelMemberRemove
+    | typeof DmOpen
+    | typeof BotUpdate
+    | typeof RoutineCreate
+    | typeof RoutineUpdate
+    | typeof RoutineDelete
+    | typeof RoutinePause
+    | typeof RoutineResume
+    | typeof RoutineRun
+    | typeof SidebarUpdate
+    | typeof WorkspaceCreate
+  >;
+};
 
 export type RealtimeEvent =
   | { type: "connection"; state: "connected" | "reconnecting" }

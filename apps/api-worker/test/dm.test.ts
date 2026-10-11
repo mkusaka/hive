@@ -144,50 +144,54 @@ const members = async (s: Awaited<ReturnType<typeof setup>>) =>
   ).members;
 
 describe("bots as channel members", () => {
-  it("channel.join / channel.leave add and remove a Bot; a channel change row each", async () => {
-    // channel.create wrote the first channel change row.
+  it("channel.member.add / update / remove manage a Bot and write channel changes", async () => {
     const s = await setup();
-    const join = { type: "channel.join", channelId: s.channelId, botId: s.botId };
-    await s.ok(join);
-    await s.ok(join);
+    const add = {
+      type: "channel.member.add",
+      channelId: s.channelId,
+      botId: s.botId,
+      role: "viewer",
+    };
+    await s.ok(add);
     expect(await members(s)).toEqual([
-      expect.objectContaining({ kind: "user", role: "owner" }),
-      expect.objectContaining({ kind: "bot", role: "member", botId: s.botId, name: "coder" }),
+      expect.objectContaining({ userId: expect.any(String), role: "owner" }),
+      expect.objectContaining({ botId: s.botId, role: "viewer", name: "coder" }),
     ]);
-    expect(
-      await count(
-        "change_log WHERE workspace_id = ? AND entity_kind = 'channel' AND scope = ?",
-        s.workspaceId,
-        `channel:${s.channelId}`,
-      ),
-    ).toBe(3);
-    await s.ok({ type: "channel.leave", channelId: s.channelId, botId: s.botId });
-    expect(await members(s)).toEqual([expect.objectContaining({ kind: "user" })]);
+    await s.ok({
+      type: "channel.member.update",
+      channelId: s.channelId,
+      botId: s.botId,
+      role: "member",
+    });
+    await s.ok({ type: "channel.member.remove", channelId: s.channelId, botId: s.botId });
+    expect(await members(s)).toEqual([expect.objectContaining({ userId: expect.any(String) })]);
 
     const outsider = await login();
-    const forbidden = await outsider.command(envelope(s.workspaceId, join));
+    const forbidden = await outsider.command(envelope(s.workspaceId, add));
     expect(forbidden.status).toBe(403);
   });
 
-  it("message.post auto-joins a mentioned non-member Bot; a member Bot is not woken unless mentioned", async () => {
+  it("only an explicitly added non-viewer Bot wakes from a mention", async () => {
     const s = await setup();
+    await s.ok({ type: "channel.member.remove", channelId: s.channelId, botId: s.botId });
+    const post = (text: string) => s.ok({ type: "message.post", channelId: s.channelId, text });
+    await post(`<@bot:${s.botId}> ignored`);
+    expect(await count("inbox_items WHERE workspace_id = ?", s.workspaceId)).toBe(0);
     await s.ok({
-      type: "message.post",
+      type: "channel.member.add",
       channelId: s.channelId,
-      text: `<@bot:${s.botId}> hi`,
+      botId: s.botId,
+      role: "viewer",
     });
-    expect(await members(s)).toEqual([
-      expect.objectContaining({ kind: "user" }),
-      expect.objectContaining({ kind: "bot", role: "member", botId: s.botId }),
-    ]);
+    await post(`<@bot:${s.botId}> still ignored`);
+    expect(await count("inbox_items WHERE workspace_id = ?", s.workspaceId)).toBe(0);
+    await s.ok({
+      type: "channel.member.update",
+      channelId: s.channelId,
+      botId: s.botId,
+      role: "member",
+    });
+    await post(`<@bot:${s.botId}> wake`);
     expect(await count("inbox_items WHERE workspace_id = ?", s.workspaceId)).toBe(1);
-    const plain = await s.ok({ type: "message.post", channelId: s.channelId, text: "no mention" });
-    expect(plain.inboxItemIds).toEqual([]);
-    expect(await count("inbox_items WHERE workspace_id = ?", s.workspaceId)).toBe(1);
-    // channel.create's row plus one join: the second mention adds no channel change row.
-    await s.ok({ type: "message.post", channelId: s.channelId, text: `<@bot:${s.botId}> again` });
-    expect(
-      await count("change_log WHERE workspace_id = ? AND entity_kind = 'channel'", s.workspaceId),
-    ).toBe(2);
   });
 });

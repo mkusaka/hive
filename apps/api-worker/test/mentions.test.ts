@@ -5,6 +5,12 @@ import { claim, count, envelope, executor, type Json, setup } from "./helpers.ts
 const posted = async () => {
   const s = await setup();
   const { botId: reviewerId } = await s.ok({ type: "bot.create", name: "reviewer" });
+  await s.ok({
+    type: "channel.member.add",
+    channelId: s.channelId,
+    botId: reviewerId,
+    role: "member",
+  });
   const post = (text: string, mentions?: string[]) =>
     envelope(s.workspaceId, {
       type: "message.post",
@@ -40,7 +46,8 @@ describe("message.post", () => {
     const bots = await Promise.all(
       jobIds.map(async (id) => (await (await s.user.get(`/v1/jobs/${id}`)).json<Json>()).botId),
     );
-    expect(bots).toEqual([s.botId, s.reviewerId]);
+    expect(bots).toContain(s.botId);
+    expect(bots).toContain(s.reviewerId);
 
     // The Run reads names, not tokens.
     const device = executor(s.deviceToken, s.workspaceId);

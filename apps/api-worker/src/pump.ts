@@ -94,6 +94,9 @@ const subscriptionRecipients = async (db: D1Database, event: EventRow) => {
          FROM subscriptions s
          JOIN conversations c ON c.workspace_id = s.workspace_id
                              AND c.id = json_extract(s.destination, '$.conversationId')
+         JOIN bots b ON b.workspace_id = s.workspace_id AND b.id = s.bot_id
+         JOIN channel_members m ON m.workspace_id = s.workspace_id AND m.channel_id = c.channel_id
+                               AND m.actor_id = b.actor_id AND m.role <> 'viewer'
         WHERE s.workspace_id = ? AND s.enabled = 1 AND (s.expires_at IS NULL OR s.expires_at > ?)
         ORDER BY s.id`,
     )
@@ -167,6 +170,22 @@ export const routeEvent = async (db: D1Database, eventId: string): Promise<Notif
       : { workspaceId, scopes };
   }
   const data = JSON.parse(event.data) as AgentMessageSent;
+  if (data.channelId) {
+    const member = await db
+      .prepare(
+        `SELECT c.kind, m.role FROM conversations c
+           JOIN bots b ON b.workspace_id = c.workspace_id AND b.id = ?
+           LEFT JOIN channel_members m ON m.workspace_id = b.workspace_id AND m.actor_id = b.actor_id
+                                      AND m.channel_id = c.channel_id
+          WHERE c.workspace_id = ? AND c.id = ?`,
+      )
+      .bind(data.recipientBotId, workspaceId, data.conversationId)
+      .first<{ kind: string; role: string | null }>();
+    if (!member || (member.kind !== "dm" && (member.role === null || member.role === "viewer"))) {
+      await recordEventRouted(db, { workspaceId, eventId });
+      return null;
+    }
+  }
   const scope = data.channelId ? `channel:${data.channelId}` : `workspace:${workspaceId}`;
   const routed = await createDeliveryAndInbox(db, {
     id: data.inboxItemId,

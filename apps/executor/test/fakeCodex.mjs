@@ -82,6 +82,19 @@ const play = () => {
         () => {},
       );
       break;
+    case "skill":
+    case "skill-unknown":
+      ask(
+        "t2",
+        "item/tool/call",
+        {
+          callId: "c2",
+          tool: "hive_skill_use",
+          arguments: { name: scenario === "skill" ? "release-notes" : "missing" },
+        },
+        (r) => done(JSON.stringify(r.result)),
+      );
+      break;
     case "crash":
       process.exit(3);
       break;

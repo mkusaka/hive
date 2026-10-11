@@ -33,11 +33,18 @@ const modeOf = (policy: ToolPolicy, tool: string) =>
 export const toolOptions = (
   policy: ToolPolicy,
   hiveTools: string[],
+  skillNames?: ReadonlySet<string>,
 ): Pick<Options, "tools" | "allowedTools" | "disallowedTools" | "permissionMode"> => {
   const named = (mode: string) => toolNames.filter((t) => modeOf(policy, t) === mode);
+  const tools: string[] = [...named("allow"), ...named("ask")];
+  const allowedTools: string[] = [...named("allow"), ...hiveTools];
+  if (skillNames?.size) {
+    tools.push("Skill");
+    allowedTools.push("Skill");
+  }
   return {
-    tools: [...named("allow"), ...named("ask")],
-    allowedTools: [...named("allow"), ...hiveTools],
+    tools,
+    allowedTools,
     disallowedTools: named("deny"),
     // `default` routes prompts to `canUseTool`; `dontAsk` would deny `ask` tools without calling it.
     permissionMode: "default",
@@ -85,10 +92,25 @@ const decide = (permissionDecision: "allow" | "deny" | "ask", reason: string) =>
 
 /** The mandatory before_tool hook (§20.3). */
 export const preToolUse =
-  (policy: ToolPolicy, roots: string[], hiveTools: Set<string>): HookCallback =>
+  (
+    policy: ToolPolicy,
+    roots: string[],
+    hiveTools: Set<string>,
+    skillNames?: ReadonlySet<string>,
+  ): HookCallback =>
   async (input) => {
     if (input.hook_event_name !== "PreToolUse") return {};
     const tool = input.tool_name;
+    if (tool === "Skill") {
+      const args = input.tool_input;
+      return args !== null &&
+        typeof args === "object" &&
+        "skill" in args &&
+        typeof args.skill === "string" &&
+        skillNames?.has(args.skill)
+        ? {}
+        : decide("deny", "this skill is not configured for this bot");
+    }
     if (hiveTools.has(tool)) return {};
     const mode = modeOf(policy, tool);
     if (mode === "deny") return decide("deny", `${tool} is not allowed for this bot`);
@@ -140,8 +162,13 @@ export const approvalGate =
     roots?: string[];
     hiveTools: Set<string>;
     pollMs?: number;
+    skillNames?: ReadonlySet<string>;
   }): CanUseTool =>
   async (toolName, input, { signal, mcpServer }) => {
+    if (toolName === "Skill")
+      return typeof input.skill === "string" && opts.skillNames?.has(input.skill)
+        ? { behavior: "allow", updatedInput: input }
+        : deny("this skill is not configured for this bot");
     if (opts.hiveTools.has(toolName)) {
       return mcpServer?.source === "sdk"
         ? { behavior: "allow", updatedInput: input }

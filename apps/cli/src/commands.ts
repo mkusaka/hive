@@ -21,13 +21,22 @@ export const channelCreate = (c: Client, e: Envelope, name: string) =>
 /** An empty topic clears it. */
 export const channelUpdate = (c: Client, e: Envelope, channelId: string, topic: string) =>
   c.command(e, { type: "channel.update", channelId, topic });
-export const channelMembership = (
+type MemberTarget = { userId: string } | { botId: string };
+
+export const channelMember = (
   c: Client,
   e: Envelope,
-  type: "channel.join" | "channel.leave",
+  type: "channel.member.add" | "channel.member.update" | "channel.member.remove",
   channelId: string,
-  botId: string,
-) => c.command(e, { type, channelId, botId });
+  target: MemberTarget,
+  role?: string,
+) =>
+  c.command(e, {
+    type,
+    channelId,
+    ...target,
+    ...(role === undefined ? {} : { role }),
+  });
 export const dmOpen = (c: Client, e: Envelope, botId: string) =>
   c.command(e, { type: "dm.open", botId });
 
@@ -47,18 +56,37 @@ export const botCreate = (
     ...(extra.toolPolicy ? { toolPolicy: extra.toolPolicy } : {}),
   });
 
+export type Bot = Json & {
+  id: string;
+  revision: number;
+  toolPolicy?: Json;
+  placementPolicy?: Json;
+  skills?: unknown[];
+};
+type BotChange = {
+  instructions?: string;
+  toolPolicy?: Json;
+  placementPolicy?: Json;
+  skills?: unknown[];
+};
+
+/** Reads a Bot immediately before a revision-checked update. */
+export const getBot = async (c: Client, workspaceId: string, botId: string): Promise<Bot> => {
+  const { bots } = (await listBots(c, workspaceId)) as { bots: Bot[] };
+  const bot = bots.find((candidate) => candidate.id === botId);
+  if (!bot) throw new CliError("NOT_FOUND", 7, `bot not found: ${botId}`);
+  return bot;
+};
+
 /** Replaces the given fields at the Bot's current revision (read from the Bot list). */
 export const botUpdate = async (
   c: Client,
   e: Envelope,
   botId: string,
-  change: { instructions?: string; toolPolicy?: Json; placementPolicy?: Json },
+  change: BotChange,
+  current?: Bot,
 ) => {
-  const { bots } = (await listBots(c, e.workspaceId)) as {
-    bots: { id: string; revision: number }[];
-  };
-  const bot = bots.find((b) => b.id === botId);
-  if (!bot) throw new CliError("NOT_FOUND", 7, `bot not found: ${botId}`);
+  const bot = current ?? (await getBot(c, e.workspaceId, botId));
   return c.command(e, { type: "bot.update", botId, expectedRevision: bot.revision, ...change });
 };
 

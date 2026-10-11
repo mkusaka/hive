@@ -13,7 +13,7 @@ import type {
 import { describe, expect, it } from "vitest";
 import { claudeAdapter, type QueryFn, userPrompt } from "../src/adapters/claude.ts";
 import { type JournalEntry, type LaunchContext, reconcile, runOnce } from "../src/runner.ts";
-import { context, fakeCloud, memoryJournal } from "./helpers.ts";
+import { context, fakeCloud, fakeRunApi, memoryJournal } from "./helpers.ts";
 
 // Fake SDK stream: the fields the adapter reads, shaped like the real 0.3.x message types.
 const sessionId = "11111111-1111-4111-8111-111111111111";
@@ -146,6 +146,38 @@ describe("claudeAdapter", () => {
       cwd: join(dir, "runs", "run-1"),
     });
     expect(options.resume).toBeUndefined();
+  });
+
+  it("materializes configured skills for the SDK's native main-session skills option", async () => {
+    const dir = await stateDir();
+    const skills: NonNullable<LaunchContext["context"]["bot"]["skills"]> = [
+      {
+        name: "release-notes",
+        description: "Prepare concise release notes.",
+        instructions: "Group changes by user impact.",
+        tools: { tools: { Bash: "allow" }, cwdMode: "run_scratch" },
+      },
+    ];
+    const { calls, queryFn } = fakeQuery([init, result()]);
+    const { api } = fakeRunApi();
+    const agent = await claudeAdapter({ stateDir: dir, queryFn }).start(
+      launch({ context: { ...context, bot: { ...context.bot, skills } }, run: api }),
+    );
+    await agent.waitForExit();
+    const options = calls[0]!.options;
+    const configRoot = join(dir, "runs", "run-1", "claude-config");
+    expect(options).toMatchObject({
+      settingSources: ["project"],
+      projectConfigRoot: configRoot,
+      skills: ["skill-release-notes"],
+    });
+    expect(options.tools).toContain("Skill");
+    expect(options.tools).not.toContain("Bash");
+    expect(options.allowedTools).toContain("mcp__hive__hive_send_request");
+    expect(options.allowedTools).not.toContain("mcp__hive__hive_skill_use");
+    await expect(
+      readFile(join(configRoot, ".claude", "skills", "skill-release-notes", "SKILL.md"), "utf8"),
+    ).resolves.toContain("Group changes by user impact.");
   });
 
   it("prompts a thread Run with the parent's messages before the root, then the thread", () => {

@@ -18,14 +18,20 @@ hive device register --name <n> --os <os> --agent-version <v>
                                                        # prints the token once, stores it for `executor run`
 hive channel create --name <name>
 hive channel update <channel-id> --topic <text>     # members only; "" clears it
-hive channel join <channel-id> --bot <bot-id>       # add a Bot member (members only); channel leave removes it
+hive channel member add <channel-id> (--user <user-id> | --bot <bot-id>) [--role owner|member|viewer]
+hive channel member update <channel-id> (--user <user-id> | --bot <bot-id>) --role owner|member|viewer
+hive channel member remove <channel-id> (--user <user-id> | --bot <bot-id>)
 hive dm open <bot-id>                                 # {conversationId} of your DM with the Bot (created once)
 hive dm list                                          # your DMs with botId, name, lastMessage
 hive bot create --name <name> [--instructions <text> | --instructions-file <path|->]
                 [--tools <Tool=allow|ask|deny,...>] [--effects <slack.post|github.comment=allow|ask|deny,...>]
                 [--cwd-mode run_scratch|environment] [placement flags]
 hive bot update <bot-id> [--instructions <text> | --instructions-file <path|->] [--tools ...] [--effects ...]
+                [--manage subscriptions=true,routines=false,channels=true,bots=false]
                 [--cwd-mode ...] [placement flags]
+hive bot skill add <bot-id> --name <name> --description <text>
+                   (--instructions <text> | --instructions-file <path|->)
+hive bot skill remove <bot-id> --name <name>
   placement flags: [--mode any|preferred|pinned] [--preferred <id,...>] [--allowed <id,...>] [--allowed-device <id>]...
                    [--overflow|--no-overflow] [--fallback|--no-fallback] [--capabilities <name,...>] [--environment <name>]
 hive device env add --name <name> --repo <url> --path <local checkout root>
@@ -96,24 +102,31 @@ a fresh UUID per invocation).
   until the old Run's stop is confirmed by its executor.
 - **`--tools`** is `Read=allow,Bash=ask` (Read, Grep, Glob, Edit, Write, Bash; a missing tool is `deny`).
   `bot update --tools` replaces the tool list and keeps the current `cwdMode` unless `--cwd-mode` is given; it reads
-  the Bot's revision from `bot list`, so a concurrent edit is 409 (exit 4). **Security:** Bash is not
-  path-restricted (see `apps/executor/README.md`, Tool policy and approvals); prefer `Bash=ask`.
+  the Bot's revision from `bot list`, so a concurrent edit is 409 (exit 4). `--manage` accepts comma-separated
+  `subscriptions=true|false`, `routines=true|false`, `channels=true|false`, and `bots=true|false`; omitted flags
+  keep their current value. **Security:** Bash is not path-restricted (see `apps/executor/README.md`, Tool policy
+  and approvals); prefer `Bash=ask`.
 - **Placement flags** build the Bot's `placementPolicy` (`apps/api-worker/README.md`, Placement): `--allowed` and
   `--allowed-device` add up, `--overflow` / `--no-fallback` set `overflowToFallback: true` /
   `fallbackOnUnavailable: false`. `bot update` merges the given fields over the Bot's current policy from `bot list`;
   the server rejects preferred devices outside a non-empty allowed list and a `pinned` mode without exactly one
   `--preferred` (422, exit 2). `device list` shows each device's `capabilities`, `capacityBackground` and
   `lastHeartbeatAt` (online = within 45 s).
+
+- **Channel members** are added as `member` unless `--role` is given. Adding, changing, and removing a user or Bot
+  requires exactly one of `--user` and `--bot`; the API enforces owner permission and the last-owner guard.
+- **Bot skills** are revision-checked Bot updates. Adding or removing a skill first reads the current Bot and
+  preserves its other skills; `--instructions-file -` reads instructions from standard input.
 - **`device env add`** resolves `--path` to an existing directory and writes it to
   `<config dir>/hive/executor/environments.json` first (the local path never leaves the device), then registers
   `{deviceId (from the stored device token), name, repository}` in the cloud. A Bot created with
   `--environment <name> --cwd-mode environment` then runs in that checkout on devices that registered the name.
-- **`search`** and **`memory`** follow `apps/api-worker/README.md`, Search and memory. `search` is the one
-  one-word command: the dispatcher tries `<group> <action>`, then `<group>`. `memory delete` defaults `--revision` to
-  1 because a memory's content never changes (corrections supersede it); a deleted one is 422 (exit 2).
+- **`search`** and **`memory`** follow `apps/api-worker/README.md`, Search and memory. The dispatcher matches
+  three-word commands first, then two-word commands, then one-word commands. `memory delete` defaults `--revision`
+  to 1 because a memory's content never changes (corrections supersede it); a deleted one is 422 (exit 2).
 - **`effect resolve`** is manual recovery of an `unknown` effect (`--succeeded` / `--failed`) or a re-send of an
-  `unknown` or performed `failed` one (`--retry`); see `apps/api-worker/README.md`, External effects. `--tools` and
-  `--effects` each replace their own list on `bot update`; the other is kept.
+  `unknown` or performed `failed` one (`--retry`); see `apps/api-worker/README.md`, External effects. `--tools`,
+  `--effects`, and `--manage` each replace or merge only their own part of the Bot policy; the other parts are kept.
 - **`approval resolve`** is one-use: a second resolve, an expired approval or one whose Run is no longer current is
   409 (exit 4).
 - **`subscription create`** sends the file's JSON object as the `subscription.create` command, for example

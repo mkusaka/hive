@@ -169,23 +169,25 @@ export const getSidebar = async (db: D1Database, workspaceId: string, userId: st
   };
 };
 
-/** The Channel's members (role `owner` / `member`); Bots carry `botId` and their current name. Callers must be members. */
+/** The Channel's members and whether the caller may manage them. */
 export const listChannelMembers = async (
   db: D1Database,
   input: { workspaceId: string; userId: string; channelId: string },
 ) => {
   const member = await db
     .prepare(
-      `SELECT 1 FROM channel_members m
-         JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+      `SELECT m.role, EXISTS (SELECT 1 FROM workspace_members w
+                                WHERE w.workspace_id = m.workspace_id AND w.user_id = ? AND w.role = 'owner')
+                         OR m.role = 'owner' AS can_manage
+         FROM channel_members m JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
         WHERE m.workspace_id = ? AND m.channel_id = ? AND a.user_id = ?`,
     )
-    .bind(input.workspaceId, input.channelId, input.userId)
-    .first();
+    .bind(input.userId, input.workspaceId, input.channelId, input.userId)
+    .first<{ can_manage: number }>();
   if (!member) throw notFound("channel");
   const { results } = await db
     .prepare(
-      `SELECT a.id AS actorId, a.kind, COALESCE(b.name, a.display_name) AS name, a.user_id AS userId,
+      `SELECT a.id AS actorId, COALESCE(b.name, a.display_name) AS name, a.user_id AS userId,
               b.id AS botId, m.role
          FROM channel_members m
          JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
@@ -195,7 +197,19 @@ export const listChannelMembers = async (
     )
     .bind(input.workspaceId, input.channelId)
     .all();
-  return { members: results };
+  return { members: results, canManage: Boolean(member.can_manage) };
+};
+
+/** Workspace users for Channel membership pickers. */
+export const listUsers = async (db: D1Database, workspaceId: string) => {
+  const { results } = await db
+    .prepare(
+      `SELECT u.id, COALESCE(u.email, u.id) AS label FROM workspace_members m
+         JOIN users u ON u.id = m.user_id WHERE m.workspace_id = ? ORDER BY label, u.id LIMIT 500`,
+    )
+    .bind(workspaceId)
+    .all();
+  return { users: results };
 };
 
 /** The caller's DMs by Bot name: `id` = `conversationId`, the Bot (`botId`, `name`) and `lastMessage` like a channel. */
@@ -216,20 +230,30 @@ export const listDms = async (db: D1Database, workspaceId: string, userId: strin
   return { dms: results };
 };
 
-export const listBots = async (db: D1Database, workspaceId: string) => {
-  const { results } = await db
-    .prepare(
-      `SELECT id, actor_id AS actorId, name, instructions, placement_policy AS placementPolicy, tool_policy AS toolPolicy,
-              config_revision AS revision, created_at AS createdAt, updated_at AS updatedAt
-         FROM bots WHERE workspace_id = ? ORDER BY name LIMIT 500`,
-    )
-    .bind(workspaceId)
-    .all<{ placementPolicy: unknown; toolPolicy: unknown }>();
-  for (const bot of results) {
+export const listBots = async (db: D1Database, workspaceId: string, userId: string) => {
+  const [bots, owner] = await Promise.all([
+    db
+      .prepare(
+        `SELECT id, actor_id AS actorId, name, instructions, placement_policy AS placementPolicy,
+                tool_policy AS toolPolicy, skills, created_by_bot_id AS createdByBotId,
+                config_revision AS configRevision, config_revision AS revision, created_at AS createdAt,
+                updated_at AS updatedAt FROM bots WHERE workspace_id = ? ORDER BY name LIMIT 500`,
+      )
+      .bind(workspaceId)
+      .all<{ placementPolicy: unknown; toolPolicy: unknown; skills: unknown }>(),
+    db
+      .prepare(
+        "SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ? AND role = 'owner'",
+      )
+      .bind(workspaceId, userId)
+      .first(),
+  ]);
+  for (const bot of bots.results) {
     bot.placementPolicy = JSON.parse(bot.placementPolicy as string);
     bot.toolPolicy = JSON.parse(bot.toolPolicy as string);
+    bot.skills = JSON.parse(bot.skills as string);
   }
-  return { bots: results };
+  return { bots: bots.results, canManage: owner !== null };
 };
 
 /** `bot_pair` conversations (§8.1) with both Bots and their last 20 messages, oldest first (max 100). */

@@ -109,6 +109,181 @@ const integrationId = z
   .optional()
   .describe("Integration id; omit when the workspace has one of this kind");
 
+const managementTools = (context: RunContext, run: RunApi) => {
+  const manage = context.bot.toolPolicy.manage ?? {};
+  const tools: SdkMcpToolDefinition<any>[] = [];
+  const command = (value: RunCommand) => cloud(() => run.command(value));
+  const botId = z.string().min(1).optional().describe("Bot id; omit for this Bot");
+  const conversationId = z
+    .string()
+    .min(1)
+    .optional()
+    .describe("Conversation id; omit for this conversation when one exists");
+  if (manage.subscriptions) {
+    tools.push(
+      tool(
+        "hive_subscription_create",
+        "Create a Subscription for this Bot or a child Bot.",
+        {
+          botId,
+          integrationId: z.string().min(1).optional(),
+          eventTypes: z.array(z.string().min(1)).min(1).max(20),
+          filter: z.unknown().optional(),
+          conversationId,
+          projectId: z.string().min(1).optional(),
+          taskId: z.string().min(1).optional(),
+          delivery: z.unknown().optional(),
+          expiresAt: z.iso.datetime().nullable().optional(),
+        },
+        async (args) => {
+          const destinationConversationId = args.conversationId ?? context.conversation?.id;
+          if (!destinationConversationId) {
+            return result("hive error: conversationId is required outside a conversation", true);
+          }
+          return command({
+            type: "subscription.create",
+            botId: args.botId ?? context.bot.id,
+            ...(args.integrationId ? { integrationId: args.integrationId } : {}),
+            eventTypes: args.eventTypes,
+            ...(args.filter === undefined ? {} : { filter: args.filter }),
+            destination: {
+              conversationId: destinationConversationId,
+              ...(args.projectId ? { projectId: args.projectId } : {}),
+              ...(args.taskId ? { taskId: args.taskId } : {}),
+            },
+            ...(args.delivery === undefined ? {} : { delivery: args.delivery }),
+            ...(args.expiresAt === undefined ? {} : { expiresAt: args.expiresAt }),
+          } as RunCommand);
+        },
+      ),
+      tool(
+        "hive_subscription_update",
+        "Update a Subscription this Bot or a child Bot owns.",
+        {
+          subscriptionId: z.string().min(1),
+          expectedRevision: z.number().int().min(1),
+          eventTypes: z.array(z.string().min(1)).min(1).max(20).optional(),
+          filter: z.unknown().optional(),
+          destination: z.unknown().optional(),
+          delivery: z.unknown().optional(),
+          expiresAt: z.iso.datetime().nullable().optional(),
+          enabled: z.boolean().optional(),
+        },
+        async (args) => command({ type: "subscription.update", ...args } as RunCommand),
+      ),
+      tool(
+        "hive_subscription_delete",
+        "Delete a Subscription this Bot or a child Bot owns.",
+        { subscriptionId: z.string().min(1) },
+        async (args) => command({ type: "subscription.delete", ...args } as RunCommand),
+      ),
+    );
+  }
+  if (manage.routines) {
+    const schedule = z.discriminatedUnion("kind", [
+      z.object({
+        kind: z.literal("cron"),
+        expr: z.string().min(1).max(200),
+        timezone: z.string().min(1),
+      }),
+      z.object({ kind: z.literal("once"), at: z.iso.datetime() }),
+    ]);
+    tools.push(
+      tool(
+        "hive_routine_create",
+        "Create a Routine for this Bot or a child Bot.",
+        {
+          botId,
+          name: z.string().min(1).max(200),
+          schedule,
+          inputText: z
+            .string()
+            .min(1)
+            .max(64 * 1024),
+          misfire: z.enum(["skip", "coalesce"]).optional(),
+          conversationId,
+          taskId: z.string().min(1).optional(),
+        },
+        async (args) => {
+          const routineConversationId = args.conversationId ?? context.conversation?.id;
+          return command({
+            type: "routine.create",
+            botId: args.botId ?? context.bot.id,
+            name: args.name,
+            schedule: args.schedule,
+            inputText: args.inputText,
+            ...(args.misfire ? { misfire: args.misfire } : {}),
+            ...(routineConversationId ? { conversationId: routineConversationId } : {}),
+            ...(args.taskId ? { taskId: args.taskId } : {}),
+          } as RunCommand);
+        },
+      ),
+      tool(
+        "hive_routine_update",
+        "Update a Routine this Bot or a child Bot owns.",
+        {
+          routineId: z.string().min(1),
+          expectedRevision: z.number().int().min(1),
+          name: z.string().min(1).max(200).optional(),
+          schedule: z
+            .discriminatedUnion("kind", [
+              z.object({
+                kind: z.literal("cron"),
+                expr: z.string().min(1).max(200),
+                timezone: z.string().min(1),
+              }),
+              z.object({ kind: z.literal("once"), at: z.iso.datetime() }),
+            ])
+            .optional(),
+          inputText: z
+            .string()
+            .min(1)
+            .max(64 * 1024)
+            .optional(),
+          misfire: z.enum(["skip", "coalesce"]).optional(),
+        },
+        async (args) => command({ type: "routine.update", ...args } as RunCommand),
+      ),
+      ...(["pause", "resume", "delete"] as const).map((action) =>
+        tool(
+          `hive_routine_${action}`,
+          `${action[0]!.toUpperCase()}${action.slice(1)} a Routine this Bot or a child Bot owns.`,
+          { routineId: z.string().min(1) },
+          async (args) => command({ type: `routine.${action}`, ...args } as RunCommand),
+        ),
+      ),
+    );
+  }
+  if (manage.channels) {
+    tools.push(
+      tool(
+        "hive_channel_create",
+        "Create a Channel. This Bot and the workspace owner become owners.",
+        { name: z.string().min(1).max(200) },
+        async (args) => command({ type: "channel.create", ...args } as RunCommand),
+      ),
+    );
+  }
+  if (manage.bots) {
+    tools.push(
+      tool(
+        "hive_bot_create",
+        "Create a child Bot. Its tool policy cannot exceed this Bot's policy.",
+        {
+          name: z.string().min(1).max(200),
+          instructions: z
+            .string()
+            .max(64 * 1024)
+            .optional(),
+          toolPolicy: z.unknown().optional(),
+        },
+        async (args) => command({ type: "bot.create", ...args } as RunCommand),
+      ),
+    );
+  }
+  return tools;
+};
+
 /**
  * The tools this Run may use: `hive_reply` only for a request from another Bot, task tools only for a Task Job, effect
  * tools only for kinds the Bot's policy does not deny. `signal` (the Run's stop) ends an effect tool's wait.
@@ -116,7 +291,7 @@ const integrationId = z
 export const hiveTools = (
   context: RunContext,
   run: RunApi,
-  opts: { signal?: AbortSignal; pollMs?: number } = {},
+  opts: { signal?: AbortSignal; pollMs?: number; skillUse?: boolean } = {},
 ) => {
   const tools: SdkMcpToolDefinition<any>[] = [
     tool(
@@ -264,6 +439,23 @@ export const hiveTools = (
       async (args) => cloud(() => run.search(args.q)),
     ),
   );
+  if (opts.skillUse !== false && context.bot.skills?.length) {
+    tools.push(
+      tool(
+        "hive_skill_use",
+        "Load the instructions for one of this Bot's configured skills by name.",
+        { name: z.string().min(1) },
+        async ({ name }) => {
+          const skill = context.bot.skills?.find((candidate) => candidate.name === name);
+          return skill
+            ? result({ name: skill.name, instructions: skill.instructions })
+            : result(`hive error: unknown skill ${name}`, true);
+        },
+      ),
+    );
+  }
+  tools.push(...managementTools(context, run));
+
   const effects = context.bot.toolPolicy.effects ?? {};
   const offered = (kind: EffectKind) => effects[kind] === "allow" || effects[kind] === "ask";
   if (offered("slack.post")) {

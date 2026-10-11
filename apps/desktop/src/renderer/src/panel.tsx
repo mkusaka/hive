@@ -60,6 +60,8 @@ export const BotPanel = (props: {
   bots: Row[];
   channels: Row[];
   devices: Row[];
+  canManage: boolean;
+  refreshBots: () => void;
   refreshDevices: () => void;
   close: () => void;
 }) => {
@@ -98,9 +100,12 @@ export const BotPanel = (props: {
           <div className="card">
             <p className="pre">{text(bot.instructions) || "—"}</p>
           </div>
+          <h3>Skills</h3>
+          <Skills bot={bot} ws={ws} canManage={props.canManage} refresh={props.refreshBots} />
           <h3>Tool policy</h3>
           <div className="card">
             <pre className="mono">{JSON.stringify(bot.toolPolicy, null, 2)}</pre>
+            {props.canManage && <ManagePolicy bot={bot} ws={ws} refresh={props.refreshBots} />}
           </div>
           <h3>Routines</h3>
           {/* All channels; routines are created from a Channel panel. */}
@@ -157,11 +162,177 @@ export const BotPanel = (props: {
     </PanelChrome>
   );
 };
+type SkillDraft = { name: string; description: string; instructions: string };
+
+const ManagePolicy = (props: { bot: Row; ws: string; refresh: () => void }) => {
+  const [error, setError] = useState<string | null>(null);
+  const policy = (props.bot.toolPolicy as Record<string, unknown> | null) ?? {};
+  const manage = (policy.manage as Record<string, boolean> | undefined) ?? {};
+  const update = async (
+    key: "subscriptions" | "routines" | "channels" | "bots",
+    enabled: boolean,
+  ) => {
+    const res = await command(props.ws, {
+      type: "bot.update",
+      botId: props.bot.id,
+      expectedRevision: Number(props.bot.configRevision ?? props.bot.revision),
+      toolPolicy: { ...policy, manage: { ...manage, [key]: enabled } },
+    });
+    if (!res.ok) {
+      if (res.error.code === "REVISION_CONFLICT") {
+        props.refresh();
+        return setError("The Bot changed elsewhere; reloaded it.");
+      }
+      return setError(failure(res));
+    }
+    setError(null);
+    props.refresh();
+  };
+  return (
+    <>
+      {error && <p className="error">{error}</p>}
+      <fieldset>
+        <legend>Management</legend>
+        {(["subscriptions", "routines", "channels", "bots"] as const).map((key) => (
+          <label key={key}>
+            <input
+              type="checkbox"
+              checked={Boolean(manage[key])}
+              onChange={(e) => void update(key, e.target.checked)}
+            />{" "}
+            Manage {key}
+          </label>
+        ))}
+      </fieldset>
+    </>
+  );
+};
+
+const Skills = (props: { bot: Row; ws: string; canManage: boolean; refresh: () => void }) => {
+  const skills = (props.bot.skills as SkillDraft[] | undefined) ?? [];
+  const [editing, setEditing] = useState<number | "new" | null>(null);
+  const [draft, setDraft] = useState<SkillDraft>({ name: "", description: "", instructions: "" });
+  const [error, setError] = useState<string | null>(null);
+  const save = async () => {
+    const next =
+      editing === "new" ? [...skills, draft] : skills.map((s, i) => (i === editing ? draft : s));
+    const res = await command(props.ws, {
+      type: "bot.update",
+      botId: props.bot.id,
+      expectedRevision: Number(props.bot.configRevision ?? props.bot.revision),
+      skills: next,
+    });
+    if (!res.ok) {
+      if (res.error.code === "REVISION_CONFLICT") {
+        props.refresh();
+        return setError("The Bot changed elsewhere; reloaded it.");
+      }
+      return setError(failure(res));
+    }
+    setError(null);
+    setEditing(null);
+    props.refresh();
+  };
+  const remove = async (index: number) => {
+    const res = await command(props.ws, {
+      type: "bot.update",
+      botId: props.bot.id,
+      expectedRevision: Number(props.bot.configRevision ?? props.bot.revision),
+      skills: skills.filter((_, i) => i !== index),
+    });
+    if (!res.ok) {
+      if (res.error.code === "REVISION_CONFLICT") {
+        props.refresh();
+        return setError("The Bot changed elsewhere; reloaded it.");
+      }
+      return setError(failure(res));
+    }
+    setError(null);
+    props.refresh();
+  };
+  if (editing !== null)
+    return (
+      <form
+        className="card editor"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void save();
+        }}
+      >
+        {error && <p className="error">{error}</p>}
+        <label>
+          Name
+          <input
+            aria-label="Skill name"
+            value={draft.name}
+            onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+            required
+          />
+        </label>
+        <label>
+          Description
+          <input
+            aria-label="Skill description"
+            value={draft.description}
+            onChange={(e) => setDraft({ ...draft, description: e.target.value })}
+            required
+          />
+        </label>
+        <label>
+          Instructions
+          <textarea
+            aria-label="Skill instructions"
+            value={draft.instructions}
+            onChange={(e) => setDraft({ ...draft, instructions: e.target.value })}
+            required
+          />
+        </label>
+        <button type="submit">Save skill</button>
+        <button type="button" onClick={() => setEditing(null)}>
+          Cancel
+        </button>
+      </form>
+    );
+  return (
+    <div className="card">
+      {error && <p className="error">{error}</p>}
+      {skills.length === 0 && <p className="meta">No skills.</p>}
+      {skills.map((skill, index) => (
+        <div key={`${skill.name}-${index}`}>
+          <strong>{skill.name}</strong>
+          <p>{skill.description}</p>
+          {props.canManage && (
+            <>
+              <button
+                onClick={() => {
+                  setDraft(skill);
+                  setEditing(index);
+                }}
+              >
+                Edit skill
+              </button>
+              <button onClick={() => void remove(index)}>Remove skill</button>
+            </>
+          )}
+        </div>
+      ))}
+      {props.canManage && (
+        <button
+          onClick={() => {
+            setDraft({ name: "", description: "", instructions: "" });
+            setEditing("new");
+          }}
+        >
+          Add skill
+        </button>
+      )}
+    </div>
+  );
+};
 
 /**
  * Channel details, like Slack's: About (name, topic edited inline, created date), Members (`GET
- * /v1/channels/:id/members`, "Add bot" → channel.join, a Bot's row menu → channel.leave) and Routines (each with its
- * assigned Bot).
+ * /v1/channels/:id/members`, owner-only role management) and Routines (each with its assigned Bot).
  */
 export type ChannelTab = "about" | "members" | "routines";
 
@@ -187,8 +358,10 @@ export const ChannelPanel = (props: {
   const { tab, setTab } = props;
   const [members, setMembers] = useState<Row[]>([]);
   const [error, setError] = useState<string | null>(null);
-  // "Add bot" picker, or a Bot member's row menu.
-  const [menu, setMenu] = useState<{ x: number; y: number; botId?: string } | null>(null);
+  const [canManage, setCanManage] = useState(false);
+  const [users, setUsers] = useState<Row[]>([]);
+  const [adding, setAdding] = useState(false);
+  const [menu, setMenu] = useState<{ x: number; y: number; member: Row } | null>(null);
   const closeMenu = useCallback(() => setMenu(null), []);
   const { ws, channel } = props;
   const conversationId = String(channel.conversationId);
@@ -196,18 +369,32 @@ export const ChannelPanel = (props: {
     () =>
       void window.hive.api
         .get(inWorkspace(`channels/${encodeURIComponent(channel.id)}/members`, ws))
-        .then((res) => (res.ok ? setMembers(res.value.members as Row[]) : setError(failure(res)))),
+        .then((res) => {
+          if (!res.ok) return setError(failure(res));
+          setMembers(res.value.members as Row[]);
+          setCanManage(Boolean(res.value.canManage));
+        }),
     [ws, channel.id],
   );
   useEffect(() => {
     setError(null);
     if (tab === "members") loadMembers();
   }, [tab, loadMembers]);
-  const membership = async (type: "channel.join" | "channel.leave", botId: string) => {
+  const updateMember = async (
+    type: "channel.member.add" | "channel.member.update" | "channel.member.remove",
+    member: { userId?: string; botId?: string },
+    role?: "owner" | "member" | "viewer",
+  ) => {
     setMenu(null);
-    const res = await command(ws, { type, channelId: channel.id, botId });
+    const target = member.userId ? { userId: member.userId } : { botId: member.botId! };
+    const memberCommand =
+      type === "channel.member.remove"
+        ? { type, channelId: channel.id, ...target }
+        : { type, channelId: channel.id, ...target, role: role! };
+    const res = await command(ws, memberCommand);
     if (!res.ok) return setError(failure(res));
     setError(null);
+    setAdding(false);
     loadMembers();
     props.refreshChannels();
   };
@@ -246,58 +433,96 @@ export const ChannelPanel = (props: {
       )}
       {tab === "members" && (
         <div className="card">
-          <button className="member" onClick={(e) => setMenu(below(e))}>
-            <Icon name="users" /> Add bot
-          </button>
+          {canManage && (
+            <button
+              className="member"
+              onClick={() => {
+                setAdding(true);
+                void window.hive.api
+                  .get(inWorkspace("users", ws))
+                  .then((res) =>
+                    res.ok ? setUsers(res.value.users as Row[]) : setError(failure(res)),
+                  );
+              }}
+            >
+              <Icon name="users" /> Add member
+            </button>
+          )}
+          {adding && (
+            <MemberPicker
+              users={users}
+              bots={props.bots}
+              members={members}
+              add={(member, role) => void updateMember("channel.member.add", member, role)}
+              close={() => setAdding(false)}
+            />
+          )}
           {members.map((m) => {
             const label =
               m.userId && m.userId === props.me ? `${text(m.name)} (you)` : text(m.name);
-            return m.botId ? (
+            return (
               <div key={m.actorId as string} className="member-row">
-                <button
-                  className="inline-bot member"
-                  onClick={() => props.openBot(String(m.botId))}
-                >
-                  <Avatar id={String(m.botId)} name={String(m.name)} size={28} /> {label}
-                </button>
-                <button
-                  className="icon"
-                  aria-label={`${label} actions`}
-                  aria-haspopup="menu"
-                  onClick={(e) => setMenu({ ...below(e), botId: String(m.botId) })}
-                >
-                  <Icon name="more" />
-                </button>
-              </div>
-            ) : (
-              <div key={m.actorId as string} className="member">
-                <Avatar id={String(m.actorId)} name={String(m.name)} size={28} plain /> {label}
-                {m.role === "owner" && <span className="meta">owner</span>}
+                {m.botId ? (
+                  <button
+                    className="inline-bot member"
+                    onClick={() => props.openBot(String(m.botId))}
+                  >
+                    <Avatar id={String(m.botId)} name={String(m.name)} size={28} /> {label}
+                  </button>
+                ) : (
+                  <div className="member">
+                    <Avatar id={String(m.actorId)} name={String(m.name)} size={28} plain /> {label}
+                  </div>
+                )}
+                <span className="meta">{text(m.role)}</span>
+                {canManage && (
+                  <button
+                    className="icon"
+                    aria-label={`${label} actions`}
+                    aria-haspopup="menu"
+                    onClick={(e) => setMenu({ ...below(e), member: m })}
+                  >
+                    <Icon name="more" />
+                  </button>
+                )}
               </div>
             );
           })}
           {menu && (
             <Menu x={menu.x} y={menu.y} close={closeMenu}>
-              {menu.botId ? (
+              {(["owner", "member", "viewer"] as const).map((role) => (
                 <button
+                  key={role}
                   role="menuitem"
-                  onClick={() => void membership("channel.leave", menu.botId!)}
+                  disabled={menu.member.role === role}
+                  onClick={() =>
+                    void updateMember(
+                      "channel.member.update",
+                      menu.member.userId
+                        ? { userId: String(menu.member.userId) }
+                        : { botId: String(menu.member.botId) },
+                      role,
+                    )
+                  }
                 >
-                  <Icon name="trash" /> Remove from channel
+                  Make {role}
                 </button>
-              ) : (
-                props.bots
-                  .filter((b) => !members.some((m) => m.botId === b.id))
-                  .map((b) => (
-                    <button
-                      key={b.id}
-                      role="menuitem"
-                      onClick={() => void membership("channel.join", b.id)}
-                    >
-                      <Avatar id={b.id} name={String(b.name)} size={20} /> {text(b.name)}
-                    </button>
-                  ))
-              )}
+              ))}
+              <hr />
+              <button
+                role="menuitem"
+                className="danger"
+                onClick={() =>
+                  void updateMember(
+                    "channel.member.remove",
+                    menu.member.userId
+                      ? { userId: String(menu.member.userId) }
+                      : { botId: String(menu.member.botId) },
+                  )
+                }
+              >
+                <Icon name="trash" /> Remove from channel
+              </button>
             </Menu>
           )}
         </div>
@@ -321,6 +546,61 @@ export const ChannelPanel = (props: {
         />
       )}
     </PanelChrome>
+  );
+};
+const MemberPicker = (props: {
+  users: Row[];
+  bots: Row[];
+  members: Row[];
+  add: (member: { userId?: string; botId?: string }, role: "owner" | "member" | "viewer") => void;
+  close: () => void;
+}) => {
+  const [target, setTarget] = useState("");
+  const [role, setRole] = useState<"owner" | "member" | "viewer">("member");
+  const choices = [
+    ...props.users
+      .filter((user) => !props.members.some((member) => member.userId === user.id))
+      .map((user) => ({ value: `user:${user.id}`, label: text(user.label ?? user.id) })),
+    ...props.bots
+      .filter((bot) => !props.members.some((member) => member.botId === bot.id))
+      .map((bot) => ({ value: `bot:${bot.id}`, label: text(bot.name) })),
+  ];
+  return (
+    <div className="card editor">
+      <label>
+        Member
+        <select aria-label="Member" value={target} onChange={(e) => setTarget(e.target.value)}>
+          <option value="">Choose a user or Bot</option>
+          {choices.map((choice) => (
+            <option key={choice.value} value={choice.value}>
+              {choice.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        Role
+        <select
+          aria-label="Member role"
+          value={role}
+          onChange={(e) => setRole(e.target.value as typeof role)}
+        >
+          <option value="owner">Owner</option>
+          <option value="member">Member</option>
+          <option value="viewer">Viewer</option>
+        </select>
+      </label>
+      <button
+        disabled={!target}
+        onClick={() => {
+          const [kind, id] = target.split(":");
+          props.add(kind === "user" ? { userId: id } : { botId: id }, role);
+        }}
+      >
+        Add
+      </button>
+      <button onClick={props.close}>Cancel</button>
+    </div>
   );
 };
 

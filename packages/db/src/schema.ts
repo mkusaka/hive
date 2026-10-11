@@ -202,7 +202,7 @@ export const channels = sqliteTable(
   (t) => [scoped(t), unique().on(t.workspaceId, t.name)],
 );
 
-const channelRoles = ["owner", "member"] as const;
+const channelRoles = ["owner", "member", "viewer"] as const;
 
 /** current state. Users and Bots join a Channel through their actor row. */
 export const channelMembers = sqliteTable(
@@ -322,6 +322,10 @@ export const bots = sqliteTable(
     toolPolicy: text("tool_policy", { mode: "json" })
       .notNull()
       .default({ tools: {}, cwdMode: "run_scratch" }),
+    /** @hive/contracts `BotSkill` list (PERM-01). */
+    skills: text("skills", { mode: "json" }).notNull().default([]),
+    /** Bot creator when a Run self-services `bot.create`; null for a user-created Bot. */
+    createdByBotId: text("created_by_bot_id"),
     configRevision: integer("config_revision").notNull().default(1),
     createdAt: createdAt(),
     updatedAt: updatedAt(),

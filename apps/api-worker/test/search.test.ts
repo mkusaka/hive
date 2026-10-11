@@ -330,15 +330,19 @@ describe("memory", () => {
     const s = await world();
     const { botId: otherBot } = await s.ok({ type: "bot.create", name: "other" });
     const { channelId: privateChannel } = await s.ok({ type: "channel.create", name: "private" });
-    await s.user.command(
-      envelope(s.workspaceId, {
-        type: "agent.send",
-        recipientBotId: s.botId,
-        channelId: privateChannel,
-        message: { kind: "notification", text: "hidden pancake recipe" },
-        delivery: "notify",
-      }),
-    );
+    await s.ok({
+      type: "channel.member.add",
+      channelId: privateChannel as string,
+      botId: s.botId,
+      role: "member",
+    });
+    await s.ok({
+      type: "agent.send",
+      recipientBotId: s.botId,
+      channelId: privateChannel as string,
+      message: { kind: "notification", text: "hidden pancake recipe" },
+      delivery: "notify",
+    });
     await s.remember("bot", otherBot as string, "other bot pancake memory");
     const run = await s.runFor("hello");
 

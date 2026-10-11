@@ -10,8 +10,8 @@
 // With a `sessionStore` (sessionStore.ts) the SDK mirrors the native session to it, and a Run resumes the session an
 // earlier Run of the Job left (`previousProviderSessionId`) only when the store can load it; otherwise it starts
 // fresh. A `mirror_error` is journaled like every message and marks the exit summary degraded.
-import { mkdir, open, readFile, realpath } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, open, readFile, realpath, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
   type Options,
   query,
@@ -19,6 +19,7 @@ import {
   type SDKResultMessage,
   type SessionStore,
 } from "@anthropic-ai/claude-agent-sdk";
+import type { BotSkill } from "@hive/contracts";
 import { runCwd } from "../environments.ts";
 import type { AgentAdapter, LaunchContext, RunningAgent } from "../runner.ts";
 import { approvalGate, preToolUse, toolOptions, truncate } from "../toolPolicy.ts";
@@ -29,11 +30,45 @@ type Exit = Awaited<ReturnType<RunningAgent["waitForExit"]>>;
 
 const kib8 = 8 * 1024;
 
-/** System prompt: who the Bot is plus its instructions. */
-export const systemPrompt = ({ bot }: LaunchContext["context"]) =>
-  [`You are ${bot.name}, a bot in a hive workspace.`, bot.instructions]
+const skillsPrompt = (skills: BotSkill[]) =>
+  skills.length
+    ? `Skills:\n${skills.map((skill) => `- ${skill.name}: ${skill.description}`).join("\n")}\n\n` +
+      "Call hive_skill_use with a skill name to load its instructions."
+    : "";
+
+/** System prompt: who the Bot is plus its instructions and, for providers without native skills, skill discovery. */
+export const systemPrompt = ({ bot }: LaunchContext["context"], includeSkills = false) =>
+  [
+    `You are ${bot.name}, a bot in a hive workspace.`,
+    bot.instructions,
+    ...(includeSkills ? [skillsPrompt(bot.skills ?? [])] : []),
+  ]
     .filter(Boolean)
     .join("\n\n");
+
+const nativeSkills = async (stateDir: string, runId: string, skills: BotSkill[]) => {
+  const projectConfigRoot = join(stateDir, "runs", runId, "claude-config");
+  await Promise.all(
+    skills.map(async (skill) => {
+      const path = join(
+        projectConfigRoot,
+        ".claude",
+        "skills",
+        `skill-${encodeURIComponent(skill.name)}`,
+        "SKILL.md",
+      );
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(
+        path,
+        `---\nname: ${JSON.stringify(skill.name)}\ndescription: ${JSON.stringify(skill.description)}\n---\n\n${skill.instructions}\n`,
+      );
+    }),
+  );
+  return {
+    projectConfigRoot,
+    names: skills.map((skill) => `skill-${encodeURIComponent(skill.name)}`),
+  };
+};
 
 /** One conversation line of the prompt. */
 const promptLine = (m: { actorKind: string; actorId: string; body: string }) =>
@@ -192,12 +227,20 @@ export const claudeAdapter = ({
           })
       : null;
     const sessionId = restarted ?? (loaded?.length ? earlier! : undefined);
+    const skillConfig = ctx.context.bot.skills?.length
+      ? await nativeSkills(stateDir, ctx.runId, ctx.context.bot.skills)
+      : undefined;
+    const skillNames = skillConfig ? new Set(skillConfig.names) : undefined;
     let mirrorErrors = 0;
 
     const abort = new AbortController();
     let stopReason: string | undefined;
     const tools = ctx.run
-      ? hiveTools(ctx.context, ctx.run, { signal: abort.signal, pollMs: approvalPollMs })
+      ? hiveTools(ctx.context, ctx.run, {
+          signal: abort.signal,
+          pollMs: approvalPollMs,
+          skillUse: false,
+        })
       : [];
     const hive = tools.map((t) => toolName(t.name));
     // tool_use id → requestMessageId of `hive_wait_for_reply` calls not yet answered.
@@ -221,9 +264,11 @@ export const claudeAdapter = ({
             cwd,
             abortController: abort,
             systemPrompt: systemPrompt(ctx.context),
-            // No settings / MCP / hooks from the user's Claude config: the tool policy and the hive tools only.
-            ...toolOptions(policy, hive),
-            hooks: { PreToolUse: [{ hooks: [preToolUse(policy, roots, new Set(hive))] }] },
+            // Only generated per-Run project settings are loaded; user and checkout settings stay isolated.
+            ...toolOptions(policy, hive, skillNames),
+            hooks: {
+              PreToolUse: [{ hooks: [preToolUse(policy, roots, new Set(hive), skillNames)] }],
+            },
             canUseTool: approvalGate({
               policy,
               run: ctx.run,
@@ -231,8 +276,12 @@ export const claudeAdapter = ({
               roots,
               hiveTools: new Set(hive),
               pollMs: approvalPollMs,
+              skillNames,
             }),
-            settingSources: [],
+            settingSources: skillConfig ? ["project"] : [],
+            ...(skillConfig
+              ? { projectConfigRoot: skillConfig.projectConfigRoot, skills: skillConfig.names }
+              : {}),
             mcpServers: tools.length ? { hive: hiveMcpServer(tools) } : {},
             strictMcpConfig: true,
             maxTurns,

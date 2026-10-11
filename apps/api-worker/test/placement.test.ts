@@ -115,6 +115,7 @@ const twoDevices = async (placement: (pc1: string, pc2: string) => Json, pc2Caps
     name: "placed",
     placementPolicy: placement(ids.pc1, ids.pc2),
   });
+  await s.ok({ type: "channel.member.add", channelId: s.channelId, botId, role: "member" });
   const listed = async (name: "pc1" | "pc2") =>
     (
       (await (await device(name).get("/v1/executor/jobs?state=queued")).json<Json>()).jobs as Json[]

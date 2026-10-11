@@ -105,18 +105,62 @@ const modes = (option: string, value: string) =>
       }),
   );
 
+const manageFlags: Record<string, true> = {
+  subscriptions: true,
+  routines: true,
+  channels: true,
+  bots: true,
+};
+
+const managePolicy = (value: unknown, current?: cmd.Json) => {
+  const currentManage = current?.manage;
+  const existing =
+    typeof currentManage === "object" && currentManage !== null && !Array.isArray(currentManage)
+      ? currentManage
+      : undefined;
+  if (value === undefined) return existing;
+  if (typeof value !== "string" || value === "") throw invalid("--manage is required");
+  const change = Object.fromEntries(
+    value.split(",").map((pair) => {
+      const [name, enabled, ...rest] = pair.split("=");
+      if (
+        !name ||
+        !manageFlags[name.trim()] ||
+        (enabled !== "true" && enabled !== "false") ||
+        rest.length > 0
+      )
+        throw invalid(`--manage: bad entry ${pair}`);
+      return [name.trim(), enabled === "true"];
+    }),
+  );
+  return { ...existing, ...change };
+};
+
 /** `--tools` / `--effects` replace their list; an omitted part keeps the Bot's own. */
 const toolPolicy = (values: Values, current?: cmd.Json) => {
   const { tools, effects, "cwd-mode": cwdMode } = values;
-  if (tools === undefined && effects === undefined && cwdMode === undefined) return undefined;
+  if (
+    tools === undefined &&
+    effects === undefined &&
+    cwdMode === undefined &&
+    values.manage === undefined
+  )
+    return undefined;
+  const manage = managePolicy(values.manage, current);
+  const currentEffects = current?.effects;
   const effectModes =
     typeof effects === "string"
       ? modes("effects", effects)
-      : (current?.effects as cmd.Json | undefined);
+      : typeof currentEffects === "object" &&
+          currentEffects !== null &&
+          !Array.isArray(currentEffects)
+        ? currentEffects
+        : undefined;
   return {
     tools: typeof tools === "string" ? modes("tools", tools) : (current?.tools ?? {}),
     cwdMode: cwdMode ?? current?.cwdMode ?? "run_scratch",
     ...(effectModes ? { effects: effectModes } : {}),
+    ...(manage ? { manage } : {}),
   };
 };
 
@@ -169,6 +213,18 @@ const instructionsOf = async (c: Ctx) => {
     throw invalid("use --instructions or --instructions-file, not both");
   return typeof file === "string" ? c.deps.readInput(file) : (instructions as string | undefined);
 };
+
+const memberTarget = (values: Values) => {
+  const userId = values.user;
+  const botId = values.bot;
+  if (typeof userId === "string" && typeof botId !== "string")
+    return { userId: need(values, "user") };
+  if (typeof botId === "string" && typeof userId !== "string")
+    return { botId: need(values, "bot") };
+  throw invalid("exactly one of --user, --bot is required");
+};
+
+const memberRoles: Record<string, true> = { owner: true, member: true, viewer: true };
 
 const specs: Record<string, Spec> = {
   "workspace create": {
@@ -263,41 +319,86 @@ const specs: Record<string, Spec> = {
     },
   },
   "bot update": {
-    usage: `<bot-id> [--instructions <text> | --instructions-file <path|->] [--tools <Tool=allow|ask|deny,...>] [--effects <slack.post|github.comment=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] ${placementUsage}`,
+    usage: `<bot-id> [--instructions <text> | --instructions-file <path|->] [--tools <Tool=allow|ask|deny,...>] [--effects <slack.post|github.comment=allow|ask|deny,...>] [--manage subscriptions=true,routines=false,channels=true,bots=false] [--cwd-mode run_scratch|environment] ${placementUsage}`,
     args: 1,
     options: {
       instructions: str,
       "instructions-file": str,
       tools: str,
       effects: str,
+      manage: str,
       "cwd-mode": str,
       ...placementOptions,
     },
     run: async (c) => {
       const instructions = await instructionsOf(c);
       const botId = c.args[0]!;
-      // `--tools` replaces the tool list; an omitted part (and every placement field not given) keeps the Bot's own.
-      const current =
-        toolPolicy(c.values) === undefined && placementPolicy(c.values) === undefined
-          ? undefined
-          : (
-              (await cmd.listBots(c.client(), c.workspace())) as {
-                bots: { id: string; toolPolicy: cmd.Json; placementPolicy: cmd.Json }[];
-              }
-            ).bots.find((b) => b.id === botId);
+      const needsCurrent =
+        toolPolicy(c.values) !== undefined || placementPolicy(c.values) !== undefined;
+      const current = needsCurrent ? await cmd.getBot(c.client(), c.workspace(), botId) : undefined;
       const policy = toolPolicy(c.values, current?.toolPolicy);
       const placement = placementPolicy(c.values, current?.placementPolicy);
       if (instructions === undefined && policy === undefined && placement === undefined)
         throw invalid(
-          "nothing to update: give --instructions(-file), --tools, --effects, --cwd-mode or placement flags",
+          "nothing to update: give --instructions(-file), --tools, --effects, --manage, --cwd-mode or placement flags",
         );
       c.print(
-        await cmd.botUpdate(c.client(), c.envelope(), botId, {
-          ...(instructions === undefined ? {} : { instructions }),
-          ...(policy ? { toolPolicy: policy } : {}),
-          ...(placement ? { placementPolicy: placement } : {}),
-        }),
+        await cmd.botUpdate(
+          c.client(),
+          c.envelope(),
+          botId,
+          {
+            ...(instructions === undefined ? {} : { instructions }),
+            ...(policy ? { toolPolicy: policy } : {}),
+            ...(placement ? { placementPolicy: placement } : {}),
+          },
+          current,
+        ),
       );
+    },
+  },
+  "bot skill add": {
+    usage:
+      "<bot-id> --name <name> --description <text> (--instructions <text> | --instructions-file <path|->)",
+    args: 1,
+    options: { name: str, description: str, instructions: str, "instructions-file": str },
+    run: async (c) => {
+      const instructions = await instructionsOf(c);
+      if (instructions === undefined)
+        throw invalid("--instructions or --instructions-file is required");
+      const botId = c.args[0]!;
+      const name = need(c.values, "name");
+      const description = need(c.values, "description");
+      const current = await cmd.getBot(c.client(), c.workspace(), botId);
+      const skills = Array.isArray(current.skills) ? current.skills : [];
+      c.print(
+        await cmd.botUpdate(
+          c.client(),
+          c.envelope(),
+          botId,
+          {
+            skills: [...skills, { name, description, instructions }],
+          },
+          current,
+        ),
+      );
+    },
+  },
+  "bot skill remove": {
+    usage: "<bot-id> --name <name>",
+    args: 1,
+    options: { name: str },
+    run: async (c) => {
+      const botId = c.args[0]!;
+      const name = need(c.values, "name");
+      const current = await cmd.getBot(c.client(), c.workspace(), botId);
+      const skills = Array.isArray(current.skills) ? current.skills : [];
+      const remaining = skills.filter((skill) => {
+        if (typeof skill !== "object" || skill === null || !("name" in skill)) return true;
+        return skill.name !== name;
+      });
+      if (remaining.length === skills.length) throw invalid(`skill not found: ${name}`);
+      c.print(await cmd.botUpdate(c.client(), c.envelope(), botId, { skills: remaining }, current));
     },
   },
   "device env": {
@@ -586,33 +687,57 @@ const specs: Record<string, Spec> = {
         await cmd.channelUpdate(c.client(), c.envelope(), c.args[0]!, need(c.values, "topic")),
       ),
   },
-  "channel join": {
-    usage: "<channel-id> --bot <bot-id>",
+  "channel member add": {
+    usage: "<channel-id> (--user <user-id> | --bot <bot-id>) [--role owner|member|viewer]",
     args: 1,
-    options: { bot: str },
-    run: async (c) =>
+    options: { user: str, bot: str, role: str },
+    run: async (c) => {
+      const role = c.values.role ?? "member";
+      if (typeof role !== "string" || !memberRoles[role])
+        throw invalid("--role must be owner, member or viewer");
       c.print(
-        await cmd.channelMembership(
+        await cmd.channelMember(
           c.client(),
           c.envelope(),
-          "channel.join",
+          "channel.member.add",
           c.args[0]!,
-          need(c.values, "bot"),
+          memberTarget(c.values),
+          role,
         ),
-      ),
+      );
+    },
   },
-  "channel leave": {
-    usage: "<channel-id> --bot <bot-id>",
+  "channel member update": {
+    usage: "<channel-id> (--user <user-id> | --bot <bot-id>) --role owner|member|viewer",
     args: 1,
-    options: { bot: str },
-    run: async (c) =>
+    options: { user: str, bot: str, role: str },
+    run: async (c) => {
+      const role = need(c.values, "role");
+      if (!memberRoles[role]) throw invalid("--role must be owner, member or viewer");
       c.print(
-        await cmd.channelMembership(
+        await cmd.channelMember(
           c.client(),
           c.envelope(),
-          "channel.leave",
+          "channel.member.update",
           c.args[0]!,
-          need(c.values, "bot"),
+          memberTarget(c.values),
+          role,
+        ),
+      );
+    },
+  },
+  "channel member remove": {
+    usage: "<channel-id> (--user <user-id> | --bot <bot-id>)",
+    args: 1,
+    options: { user: str, bot: str },
+    run: async (c) =>
+      c.print(
+        await cmd.channelMember(
+          c.client(),
+          c.envelope(),
+          "channel.member.remove",
+          c.args[0]!,
+          memberTarget(c.values),
         ),
       ),
   },
@@ -972,9 +1097,9 @@ const line = (value: unknown) =>
 
 /** Runs one `hive` invocation and returns its exit code (§23). */
 export const run = async (argv: string[], deps: Deps): Promise<number> => {
-  // Two-word commands (`memory write`), else one-word ones (`search <query>`).
-  const two = `${argv[0]} ${argv[1]}`;
-  const name = two in specs ? two : (argv[0] ?? "");
+  // Prefer the longest registered command (`bot skill add`), then two-word and one-word commands.
+  const names = [`${argv[0]} ${argv[1]} ${argv[2]}`, `${argv[0]} ${argv[1]}`, argv[0] ?? ""];
+  const name = names.find((candidate) => candidate in specs) ?? "";
   const rest = argv.slice(name.split(" ").length);
   const spec = specs[name];
   if (!spec) {
