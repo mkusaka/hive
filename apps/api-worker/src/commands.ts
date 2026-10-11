@@ -174,7 +174,8 @@ const workspaceCreate: Handler<v.InferOutput<typeof WorkspaceCreate>> = async (d
     .bind(workspaceId)
     .first();
   if (exists && !member) throw new HttpError("FORBIDDEN", "workspace already exists");
-  return receipt(
+  // A member with a new idempotency key: the INSERT hits the primary key; replays return the receipt before that.
+  const run = receipt(
     db,
     user.userId,
     env,
@@ -197,6 +198,11 @@ const workspaceCreate: Handler<v.InferOutput<typeof WorkspaceCreate>> = async (d
     ],
     { operationId: env.operationId, status: "accepted", workspaceId },
     [{ entityKind: "workspace", entityId: workspaceId, scope: `workspace:${workspaceId}` }],
+  );
+  return explainFailure(run, async () =>
+    (await db.prepare("SELECT 1 FROM workspaces WHERE id = ?").bind(workspaceId).first())
+      ? new HttpError("INVALID_INPUT", `workspace already exists: ${workspaceId}`)
+      : null,
   );
 };
 

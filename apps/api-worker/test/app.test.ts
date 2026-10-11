@@ -93,7 +93,7 @@ describe("commands", () => {
   });
 
   it("forbids commands for a workspace the user is not a member of", async () => {
-    const { workspaceId } = await withWorkspace();
+    const { user, workspaceId } = await withWorkspace();
     const stranger = await login();
     const res = await stranger.command(envelope(workspaceId, register));
     expect(res.status).toBe(403);
@@ -103,6 +103,11 @@ describe("commands", () => {
       envelope(workspaceId, { type: "workspace.create", name: "x" }),
     );
     expect(create.status).toBe(403);
+    // A member repeating it with a new idempotency key gets 422, not a bare D1 error.
+    const again = await user.command(
+      envelope(workspaceId, { type: "workspace.create", name: "x" }),
+    );
+    expect(again.status).toBe(422);
   });
 });
 
