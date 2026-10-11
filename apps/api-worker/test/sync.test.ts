@@ -274,6 +274,18 @@ const until = async (ready: () => boolean) => {
 };
 
 describe("realtime", () => {
+  it("takes X-Hive-Token as a device and a Bearer next to an Access assertion as the user", async () => {
+    const s = await setup();
+    const device = await connect({ "X-Hive-Token": s.deviceToken }, s.workspaceId);
+    // Behind Access with Managed OAuth, the user's OAuth Bearer reaches the Worker with the assertion.
+    const user = await connect(
+      { ...s.user.headers, Authorization: "Bearer opaque-oauth-token" },
+      s.workspaceId,
+    );
+    device.ws.close();
+    user.ws.close();
+  });
+
   it("fans sync.changed out only to sockets whose scopes intersect", async () => {
     const s = await setup();
     const other = await outsider(s.workspaceId);

@@ -13,6 +13,7 @@ import { fileJournal, transcriptReader } from "@hive/executor/journal";
 import { runLoop } from "@hive/executor/runner";
 import { sessionJournals, sessionStore } from "@hive/executor/sessionStore";
 import { transcriptUploader } from "@hive/executor/uploader";
+import { systemBrowser } from "./accessLogin.ts";
 import { type Credentials, run } from "./cli.ts";
 
 const dir = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "hive");
@@ -29,7 +30,7 @@ const readCredentials = async (): Promise<Credentials> =>
     },
   );
 
-// Owner-only: the file holds the Access assertion and the device token (§23).
+// Owner-only: the file holds the Access assertion / OAuth grant, the device and service tokens (§23).
 const writePrivate = async (path: string, data: string) => {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   await writeFile(path, data, { mode: 0o600 });
@@ -39,10 +40,14 @@ const writePrivate = async (path: string, data: string) => {
 process.exitCode = await run(process.argv.slice(2), {
   fetch: (input, init) => fetch(input, init),
   loadCredentials: async () => {
-    const creds = await readCredentials();
-    return process.env.HIVE_ACCESS_JWT
-      ? { ...creds, accessJwt: process.env.HIVE_ACCESS_JWT }
-      : creds;
+    const { HIVE_ACCESS_JWT, CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET } = process.env;
+    return {
+      ...(await readCredentials()),
+      ...(HIVE_ACCESS_JWT ? { accessJwt: HIVE_ACCESS_JWT } : {}),
+      ...(CF_ACCESS_CLIENT_ID && CF_ACCESS_CLIENT_SECRET
+        ? { accessClientId: CF_ACCESS_CLIENT_ID, accessClientSecret: CF_ACCESS_CLIENT_SECRET }
+        : {}),
+    };
   },
   saveCredentials: async (patch) => {
     await writePrivate(
@@ -53,6 +58,7 @@ process.exitCode = await run(process.argv.slice(2), {
     await writePrivate(tokenFile, `${patch.deviceToken}\n`);
     return { tokenFile };
   },
+  openBrowser: systemBrowser((line) => console.error(line)),
   readInput: (path) => (path === "-" ? text(process.stdin) : readFile(path, "utf8")),
   saveEnvironment: async (name, path) => {
     const root = await realpath(path);

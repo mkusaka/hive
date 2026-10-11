@@ -25,6 +25,7 @@ export const App = () => {
   const [config, setConfig] = useState<HiveConfig | null>(null);
   const [view, setView] = useState<View>("channel");
   const [error, setError] = useState<string | null>(null);
+  const [loggingIn, setLoggingIn] = useState(false);
   const [connection, setConnection] = useState("reconnecting");
   const [sync, setSync] = useState<SyncStatus>({ cursor: null, unsynced: 0, error: null });
 
@@ -119,7 +120,7 @@ export const App = () => {
   }, []);
 
   useEffect(() => {
-    if (!config || config.problem) return;
+    if (!config || config.problem || config.loginRequired) return;
     const controller = createSync({
       workspaceId: config.workspaceId,
       get: window.hive.api.get,
@@ -148,15 +149,17 @@ export const App = () => {
 
   // Selection changes load their list directly.
   useEffect(() => {
-    if (config && !config.problem && channelId)
+    if (config && !config.problem && !config.loginRequired && channelId)
       void refetch(new Set(["messages"]), config.workspaceId);
   }, [config, channelId, refetch]);
   useEffect(() => {
-    if (config && !config.problem && botId) void refetch(new Set(["inbox"]), config.workspaceId);
+    if (config && !config.problem && !config.loginRequired && botId)
+      void refetch(new Set(["inbox"]), config.workspaceId);
   }, [config, botId, refetch]);
   useEffect(() => {
     setRun(null);
-    if (config && !config.problem && runId) void refetch(new Set(["run"]), config.workspaceId);
+    if (config && !config.problem && !config.loginRequired && runId)
+      void refetch(new Set(["run"]), config.workspaceId);
   }, [config, runId, refetch]);
   useEffect(() => {
     if (!channelId && channels[0]) setChannelId(channels[0].id);
@@ -165,6 +168,28 @@ export const App = () => {
 
   if (!config) return <p className="pad">Loading…</p>;
   if (config.problem) return <p className="pad error">{config.problem}</p>;
+  if (config.loginRequired)
+    return (
+      <div className="pad">
+        <p>Not logged in to Cloudflare Access (shared with the hive CLI).</p>
+        <button
+          type="button"
+          disabled={loggingIn}
+          onClick={() => {
+            setLoggingIn(true);
+            void window.hive.login().then(async (result) => {
+              setLoggingIn(false);
+              if (!result.ok) return setError(result.message);
+              setError(null);
+              setConfig(await window.hive.getConfig());
+            });
+          }}
+        >
+          {loggingIn ? "Waiting for the browser…" : "Log in"}
+        </button>
+        {error && <p className="error">{error}</p>}
+      </div>
+    );
   const ws = config.workspaceId;
 
   const botPicker = (

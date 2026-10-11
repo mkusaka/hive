@@ -94,6 +94,14 @@ on the same Workspace; see [apps/desktop/README.md](apps/desktop/README.md).
 Credentials (`apiUrl`, `workspaceId`, `deviceToken`) are stored in `~/.config/hive/credentials.json`; see
 [apps/cli/README.md](apps/cli/README.md).
 
+## Deploy
+
+Follow [infra/README.md](infra/README.md): `terraform apply` (D1, R2, the Access application, one Service Token
+per executor PC), wire its outputs into `wrangler.jsonc` and deploy, then put the Worker's id into Terraform and
+apply again so preview URLs are protected too. Against the
+deployed API, humans run `hive login` (Access Managed OAuth in the browser) instead of `HIVE_ACCESS_JWT`, and each
+executor PC stores its own Service Token with `hive device register --access-client-id ...`.
+
 ## License
 
 [MIT](LICENSE)

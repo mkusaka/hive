@@ -9,10 +9,12 @@
   "exports": {
     "./client": "./src/client.ts",
     "./commands": "./src/commands.ts",
-    "./cli": "./src/cli.ts"
+    "./cli": "./src/cli.ts",
+    "./accessLogin": "./src/accessLogin.ts"
   },
   "dependencies": {
     "@hive/contracts": "workspace:*",
-    "@hive/executor": "workspace:*"
+    "@hive/executor": "workspace:*",
+    "oauth4webapi": "3.8.8"
   }
 }

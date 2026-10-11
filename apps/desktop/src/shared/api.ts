@@ -38,6 +38,8 @@ export type HiveConfig = {
   apiUrl: string;
   workspaceId: string;
   problem: string | null;
+  /** No usable Access grant in the shared credentials file: show the Login button. */
+  loginRequired: boolean;
   connection: "connected" | "reconnecting";
 };
 
@@ -45,11 +47,13 @@ export type HiveApi = {
   api: { get(path: string): Promise<ApiResult>; command(envelope: UiCommand): Promise<ApiResult> };
   onRealtime(cb: (event: RealtimeEvent) => void): () => void;
   getConfig(): Promise<HiveConfig>;
+  login(): Promise<{ ok: true } | { ok: false; message: string }>;
 };
 
 export const channels = {
   get: "hive:api.get",
   command: "hive:api.command",
   config: "hive:config",
+  login: "hive:login",
   realtime: "hive:realtime",
 } as const;

@@ -13,9 +13,12 @@ bun run --cwd apps/desktop dev     # downloads the Electron binary on first run,
 bun run --cwd apps/desktop build   # out/{main,preload,renderer}
 ```
 
-- **Credentials.** `$XDG_CONFIG_HOME/hive/credentials.json`, else `~/.config/hive/credentials.json`: `apiUrl`,
-  `workspaceId` and `accessJwt`; `HIVE_ACCESS_JWT` overrides `accessJwt`, as in the CLI. Without them the window
-  shows what is missing. There is no OAuth login (G-02).
+- **Credentials.** `$XDG_CONFIG_HOME/hive/credentials.json`, else `~/.config/hive/credentials.json`: `apiUrl` and
+  `workspaceId` (without them the window shows what is missing). Auth follows the CLI and shares its store:
+  `HIVE_ACCESS_JWT` / `accessJwt` for `wrangler dev`, else the OAuth grant in the same file (`hive login` and the app
+  each see the other's login and refreshes; see `apps/cli/README.md`, Credentials). Only when the file has no usable
+  grant does the window show a Login button, which runs the same browser login (`@hive/cli/accessLogin`) and writes
+  the grant to the file.
 - **Screenshot hook (dev only).** `HIVE_SCREENSHOT=<png path>` saves `webContents.capturePage()` once,
   `HIVE_SCREENSHOT_DELAY_MS` (default 5000) after the first load. Ignored in a packaged app.
 - **Tooling.** `electron-vite` is the one build dependency: it builds main, preload and renderer with Vite and
@@ -61,8 +64,9 @@ pulls fail.
 - `BrowserWindow` with `contextIsolation: true`, `sandbox: true`, `nodeIntegration: false`. The preload is built as
   CommonJS (required for a sandboxed preload) and exposes only `window.hive`.
 - **The renderer never sees the Access assertion or the device token.** Main reads the credentials, makes every
-  HTTP request (through `@hive/cli/client`, which sets `Cf-Access-Jwt-Assertion`) and holds the Realtime socket,
-  because a browser WebSocket cannot send custom headers.
+  HTTP request (through `@hive/cli/client`, which sets `Cf-Access-Jwt-Assertion` or the OAuth
+  `Authorization: Bearer` header) and holds the Realtime socket, because a browser WebSocket cannot send custom
+  headers. The upgrade carries the same header, fetched per attempt so a reconnect uses a refreshed token.
 - IPC handlers accept calls only from the app's own window, main frame, at the URL main loaded; anything else
   throws. Arguments are validated with Valibot before any request (`src/main/ipc.ts`).
 - CSP meta tag: `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self';
@@ -90,7 +94,9 @@ rejection, ApiError mapping, Access header injection).
 
 ## Known gaps
 
-- No OAuth login (G-02), no threads, no local outbox / `queued_local`.
+- OAuth login is not run against a real Access tenant (G-02). A grant that expires while the window is open shows
+  as request errors until the app restarts (the Login button is chosen at startup and after a login), and Access's handling of a Bearer token on a
+  WebSocket upgrade is not documented by Cloudflare (G-04). No threads, no local outbox / `queued_local`.
 - Run Inspector: loads every transcript page at once (no lazy paging); no raw transcript view, observation
   history, input snapshot or Agent Tree.
 - G-04 (Access + WebSocket from a native client) is not executed: the socket was verified only against

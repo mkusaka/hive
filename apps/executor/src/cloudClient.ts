@@ -79,13 +79,24 @@ export type CloudClient = {
   forRun(capabilityToken: string): RunApi;
 };
 
+/** This device's Access Service Token (§18.1); Access checks it before the Worker sees the device token. */
+export type AccessServiceToken = { clientId: string; clientSecret: string };
+
+export const serviceTokenHeaders = (service?: AccessServiceToken): Record<string, string> =>
+  service
+    ? { "CF-Access-Client-Id": service.clientId, "CF-Access-Client-Secret": service.clientSecret }
+    : {};
+
 export const createCloudClient = ({
   apiUrl,
   token,
+  accessService,
   fetch: fetchImpl = fetch,
 }: {
   apiUrl: string;
   token: string;
+  /** Omitted against `wrangler dev`, which has no Access in front. */
+  accessService?: AccessServiceToken;
   fetch?: (input: URL, init: RequestInit) => Promise<Response>;
 }): CloudClient => {
   const send = async (
@@ -99,7 +110,9 @@ export const createCloudClient = ({
     const res = await fetchImpl(new URL(path, apiUrl), {
       method,
       headers: {
-        Authorization: `Bearer ${bearer}`,
+        ...serviceTokenHeaders(accessService),
+        // Not `Authorization`: behind Access with Managed OAuth that header belongs to Access.
+        "X-Hive-Token": bearer,
         "Content-Type": raw ? "application/octet-stream" : "application/json",
       },
       body: body === undefined ? undefined : raw ? body : JSON.stringify(body),

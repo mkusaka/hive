@@ -1,27 +1,38 @@
 // Electron main: owns the Access assertion, all HTTP and the Realtime WebSocket (docs/architecture.md §20.1).
 // The renderer gets only the typed IPC surface in src/shared/api.ts.
-import { readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { createClient } from "@hive/cli/client";
+import { accessTokens, login, systemBrowser } from "@hive/cli/accessLogin";
+import type { Credentials } from "@hive/cli/cli";
+import { CliError, createClient } from "@hive/cli/client";
 import { app, BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
 import { channels, type HiveConfig, type RealtimeEvent } from "../shared/api.ts";
 import { handlers } from "./ipc.ts";
 
-// Same file and env override as the CLI (apps/cli/src/main.ts).
+// Same file and env override as the CLI (apps/cli/src/main.ts): one credential store, so a login or refresh by
+// either client is seen by the other.
 const credentialsFile = join(
   process.env.XDG_CONFIG_HOME || join(homedir(), ".config"),
   "hive",
   "credentials.json",
 );
-type Credentials = { apiUrl?: string; accessJwt?: string; workspaceId?: string };
-const loadCredentials = async (): Promise<Credentials> => {
-  const creds = await readFile(credentialsFile, "utf8").then(
+const readCredentials = async (): Promise<Credentials> =>
+  readFile(credentialsFile, "utf8").then(
     (data) => JSON.parse(data) as Credentials,
     () => ({}),
   );
+const loadCredentials = async (): Promise<Credentials> => {
+  const creds = await readCredentials();
   return process.env.HIVE_ACCESS_JWT ? { ...creds, accessJwt: process.env.HIVE_ACCESS_JWT } : creds;
+};
+// Owner-only, merged like the CLI's saveCredentials.
+const saveCredentials = async (patch: Credentials) => {
+  await mkdir(dirname(credentialsFile), { recursive: true, mode: 0o700 });
+  const data = `${JSON.stringify({ ...(await readCredentials()), ...patch }, null, 2)}\n`;
+  await writeFile(credentialsFile, data, { mode: 0o600 });
+  await chmod(credentialsFile, 0o600);
 };
 
 const rendererUrl = new URL(
@@ -30,11 +41,23 @@ const rendererUrl = new URL(
 ).href;
 
 /** Reconnects with capped exponential backoff plus jitter; every message is only a refetch hint (§12.2). */
-const connectRealtime = (url: URL, accessJwt: string, send: (event: RealtimeEvent) => void) => {
+const connectRealtime = (
+  url: URL,
+  accessHeaders: () => Promise<Record<string, string>>,
+  send: (event: RealtimeEvent) => void,
+) => {
   let delay = 1000;
-  const open = () => {
+  const retry = () => {
+    send({ type: "connection", state: "reconnecting" });
+    setTimeout(() => void open(), delay + Math.random() * 1000);
+    delay = Math.min(delay * 2, 30_000);
+  };
+  const open = async () => {
+    // Per attempt, so a reconnect carries a refreshed OAuth token.
+    const headers = await accessHeaders().catch(() => null);
+    if (!headers) return retry();
     // Node's WebSocket (undici) accepts headers; the browser one in the renderer cannot.
-    const ws = new WebSocket(url, { headers: { "Cf-Access-Jwt-Assertion": accessJwt } });
+    const ws = new WebSocket(url, { headers });
     ws.addEventListener("open", () => {
       delay = 1000;
       send({ type: "connection", state: "connected" });
@@ -58,13 +81,9 @@ const connectRealtime = (url: URL, accessJwt: string, send: (event: RealtimeEven
       }
     });
     // An error is always followed by close.
-    ws.addEventListener("close", () => {
-      send({ type: "connection", state: "reconnecting" });
-      setTimeout(open, delay + Math.random() * 1000);
-      delay = Math.min(delay * 2, 30_000);
-    });
+    ws.addEventListener("close", retry);
   };
-  open();
+  void open();
 };
 
 const createWindow = async () => {
@@ -72,9 +91,7 @@ const createWindow = async () => {
   const problem =
     !creds.apiUrl || !creds.workspaceId
       ? `no apiUrl / workspaceId in ${credentialsFile}: run the CLI walkthrough first`
-      : !creds.accessJwt
-        ? "no Access assertion: set HIVE_ACCESS_JWT or accessJwt in the credentials file"
-        : null;
+      : null;
   const config = { apiUrl: creds.apiUrl ?? "", workspaceId: creds.workspaceId ?? "", problem };
   // The socket can open before the page subscribes, so the config reply carries the current state.
   let connection: HiveConfig["connection"] = "reconnecting";
@@ -103,11 +120,48 @@ const createWindow = async () => {
       return fn(...args);
     };
 
-  const client = createClient({ apiUrl: config.apiUrl, accessJwt: creds.accessJwt, fetch });
+  // HIVE_ACCESS_JWT / accessJwt (local dev) wins; otherwise the shared OAuth grant, refreshed silently. Without a
+  // usable grant requests fail with LOGIN_REQUIRED and the window shows the Login button.
+  const client = createClient({
+    apiUrl: config.apiUrl,
+    accessJwt: creds.accessJwt,
+    accessToken: accessTokens({
+      apiUrl: config.apiUrl,
+      load: async () => (await readCredentials()).oauth,
+      save: (oauth) => saveCredentials({ oauth }),
+    }),
+    fetch,
+  });
+  const loginRequired = async () =>
+    !problem &&
+    (await client.accessHeaders().then(
+      () => false,
+      (error: unknown) => error instanceof CliError && error.code === "LOGIN_REQUIRED",
+    ));
   const h = handlers(client);
   ipcMain.handle(
     channels.config,
-    guard((): HiveConfig => ({ ...config, connection })),
+    guard(async (): Promise<HiveConfig> => ({
+      ...config,
+      loginRequired: await loginRequired(),
+      connection,
+    })),
+  );
+  // Browser login (PKCE on a loopback redirect); the grant goes to the shared file. Never throws across IPC.
+  ipcMain.handle(
+    channels.login,
+    guard(() =>
+      login(
+        config.apiUrl,
+        systemBrowser((line) => console.log(line)),
+      ).then(
+        async (oauth) => {
+          await saveCredentials({ oauth });
+          return { ok: true as const };
+        },
+        (error: unknown) => ({ ok: false as const, message: String(error) }),
+      ),
+    ),
   );
   ipcMain.handle(channels.get, guard(h.get));
   ipcMain.handle(channels.command, guard(h.command));
@@ -117,13 +171,13 @@ const createWindow = async () => {
     if (url !== rendererUrl) event.preventDefault();
   });
 
-  if (!problem && creds.accessJwt) {
+  if (!problem) {
     const url = new URL(
       `/v1/realtime?${new URLSearchParams({ workspaceId: config.workspaceId })}`,
       config.apiUrl,
     );
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    connectRealtime(url, creds.accessJwt, (event) => {
+    connectRealtime(url, client.accessHeaders, (event) => {
       if (event.type === "connection") connection = event.state;
       if (!win.isDestroyed()) win.webContents.send(channels.realtime, event);
     });

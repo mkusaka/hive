@@ -788,7 +788,7 @@ export type JobClaimed = {
   executionId: string;
   executionGeneration: number;
   leaseExpiresAt: string;
-  /** `Bearer` token for `/v1/run/*` (§18.2). Returned once: null on a replayed claim. */
+  /** `X-Hive-Token` for `/v1/run/*` (§18.2). Returned once: null on a replayed claim. */
   capability: { token: string; expiresAt: string } | null;
   job: { id: string; botId: string; inboxItemId: string | null; placement: PlacementPolicy };
 };

@@ -12,7 +12,7 @@ import { type Context, Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { JWTVerifyGetKey } from "jose";
 import { authenticateUser, remoteJwks } from "./auth/access.ts";
-import { authenticateDevice } from "./auth/device.ts";
+import { authenticateDevice, hiveToken } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
 import { authenticateRun } from "./auth/run.ts";
 import { CommandEnvelope, RunEnvelope, runCommand, runRunCommand } from "./commands.ts";
@@ -151,15 +151,18 @@ export const createApp = ({
   app.get("/healthz", (c) => c.json({ ok: true }));
 
   // Executor routes take device tokens (uploads also a Run capability) and `/v1/run/` routes a Run capability; every other /v1 route takes a user's
-  // Access assertion, except `/v1/realtime`, which takes a device token when a Bearer token is presented.
+  // Access assertion, except `/v1/realtime`, which takes a device token when one is presented (hiveToken). A Bearer
+  // next to an Access assertion is the user's OAuth token that Access already resolved, not a device token.
   app.use("/v1/*", async (c, next) => {
+    const token = hiveToken(c.req.raw);
     const deviceAuth =
       c.req.path.startsWith("/v1/executor/") ||
-      (c.req.path === "/v1/realtime" && c.req.header("Authorization")?.startsWith("Bearer "));
+      (c.req.path === "/v1/realtime" &&
+        (c.req.header("X-Hive-Token") !== undefined ||
+          (token !== undefined && c.req.header("Cf-Access-Jwt-Assertion") === undefined)));
     const capability =
       c.req.path.startsWith("/v1/run/") ||
-      (c.req.path.startsWith("/v1/executor/uploads/") &&
-        c.req.header("Authorization")?.startsWith("Bearer cap."));
+      (c.req.path.startsWith("/v1/executor/uploads/") && token?.startsWith("cap.") === true);
     c.set(
       "principal",
       capability

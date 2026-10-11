@@ -34,19 +34,32 @@ export const invalid = (message: string) => new CliError("INVALID_ARGS", 2, mess
 
 export type Client = ReturnType<typeof createClient>;
 
-export const createClient = (opts: { apiUrl: string; accessJwt?: string; fetch: Fetch }) => {
+/**
+ * Access credentials, in precedence order: `accessJwt` (local dev: `HIVE_ACCESS_JWT` or the credentials file, sent
+ * straight to `wrangler dev`), then `accessToken` (the Managed OAuth token; Access converts it into the assertion).
+ */
+export const createClient = (opts: {
+  apiUrl: string;
+  accessJwt?: string;
+  accessToken?: () => Promise<string>;
+  fetch: Fetch;
+}) => {
+  const auth = async (): Promise<Record<string, string>> => {
+    if (opts.accessJwt) return { "Cf-Access-Jwt-Assertion": opts.accessJwt };
+    if (!opts.accessToken)
+      throw new CliError("LOGIN_REQUIRED", 3, "not logged in: run `hive login`");
+    const token = await opts.accessToken().catch((error: unknown) => {
+      if (error instanceof CliError) throw error;
+      throw new CliError("UNAUTHENTICATED", 3, `Access login failed: ${String(error)}`);
+    });
+    return { Authorization: `Bearer ${token}` };
+  };
   const send = async (method: "GET" | "POST", path: string, body?: unknown) => {
-    if (!opts.accessJwt) {
-      throw new CliError(
-        "UNAUTHENTICATED",
-        3,
-        "no Access assertion: set HIVE_ACCESS_JWT or accessJwt in the credentials file",
-      );
-    }
+    const headers = await auth();
     const res = await opts
       .fetch(new URL(path, opts.apiUrl), {
         method,
-        headers: { "Cf-Access-Jwt-Assertion": opts.accessJwt, "Content-Type": "application/json" },
+        headers: { ...headers, "Content-Type": "application/json" },
         body: body === undefined ? undefined : JSON.stringify(body),
       })
       .catch((error: unknown) => {
@@ -67,6 +80,8 @@ export const createClient = (opts: { apiUrl: string; accessJwt?: string; fetch: 
   const request = async (method: "GET" | "POST", path: string, body?: unknown) =>
     (await (await send(method, path, body)).json().catch(() => null)) as Record<string, unknown>;
   return {
+    /** The Access header alone, for the Realtime WebSocket upgrade. */
+    accessHeaders: auth,
     get: (path: string) => request("GET", path),
     /** A non-JSON body as text (the raw transcript). */
     getText: async (path: string) =>

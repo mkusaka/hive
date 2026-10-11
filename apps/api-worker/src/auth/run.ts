@@ -1,9 +1,9 @@
-// Run capability (docs/architecture.md §18.2): `Authorization: Bearer cap.<runId>.<secret>`, issued with job.claim.
+// Run capability (docs/architecture.md §18.2): `X-Hive-Token: cap.<runId>.<secret>`, issued with job.claim.
 // Only SHA-256(secret) is stored. Valid while the Run is active at the capability's generation, before `expires_at`
 // and not revoked.
 import type { Bindings } from "../app.ts";
 import { HttpError } from "../errors.ts";
-import { hashSecret } from "./device.ts";
+import { hashSecret, hiveToken } from "./device.ts";
 import type { Principal } from "./principal.ts";
 
 /** docs/roadmap.md §1 lease (90 s) plus this grace: a renewal extends both. */
@@ -58,7 +58,7 @@ type Row = {
 };
 
 export const authenticateRun = async (request: Request, env: Bindings): Promise<Principal> => {
-  const token = request.headers.get("Authorization")?.match(/^Bearer cap\.([^.]+)\.(.+)$/);
+  const token = hiveToken(request)?.match(/^cap\.([^.]+)\.(.+)$/);
   if (!token) throw unauthenticated();
   const runId = token[1]!;
   const secret = token[2]!;

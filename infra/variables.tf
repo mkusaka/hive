@@ -17,3 +17,15 @@ variable "allowed_emails" {
   type        = list(string)
   description = "Emails allowed through Access to the API."
 }
+
+variable "api_worker_id" {
+  type        = string
+  description = "Immutable id of the hive-api Worker (not its name), for the preview URL destination. Empty until the first deploy; see README."
+  default     = ""
+}
+
+variable "executor_devices" {
+  type        = list(string)
+  description = "Names of the PCs that run `hive executor run`; each gets its own Access Service Token."
+  default     = []
+}

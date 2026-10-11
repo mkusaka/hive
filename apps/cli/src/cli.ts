@@ -2,7 +2,12 @@
 // by main.ts, so tests drive `run` with fakes.
 import { type ParseArgsOptionsConfig, parseArgs } from "node:util";
 import { parseConcurrency } from "@hive/executor/capabilities";
-import { type CloudClient, createCloudClient } from "@hive/executor/cloudClient";
+import {
+  type CloudClient,
+  createCloudClient,
+  serviceTokenHeaders,
+} from "@hive/executor/cloudClient";
+import { accessTokens, login, type OAuthToken, type OpenBrowser } from "./accessLogin.ts";
 import { CliError, type Client, createClient, type Fetch, invalid } from "./client.ts";
 import * as cmd from "./commands.ts";
 
@@ -11,6 +16,11 @@ export type Credentials = {
   accessJwt?: string;
   deviceToken?: string;
   workspaceId?: string;
+  /** Managed OAuth grant from `hive login`. */
+  oauth?: OAuthToken;
+  /** This device's Access Service Token for `executor run` (env CF_ACCESS_CLIENT_ID / _SECRET override). */
+  accessClientId?: string;
+  accessClientSecret?: string;
 };
 
 export type Deps = {
@@ -18,6 +28,8 @@ export type Deps = {
   loadCredentials(): Promise<Credentials>;
   /** Merges `patch` into the credentials file; a device token is also written to `tokenFile`. */
   saveCredentials(patch: Credentials): Promise<{ tokenFile?: string }>;
+  /** `hive login` and a re-login after `invalid_grant`. */
+  openBrowser: OpenBrowser;
   /** File contents; `-` is stdin. */
   readInput(path: string): Promise<string>;
   stdout(line: string): void;
@@ -168,9 +180,19 @@ const specs: Record<string, Spec> = {
     },
   },
   "device register": {
-    usage: "--name <name> --os <os> --agent-version <version>",
-    options: { name: str, os: str, "agent-version": str },
+    usage:
+      "--name <name> --os <os> --agent-version <version> [--access-client-id <id> --access-client-secret-file <path|->]",
+    options: {
+      name: str,
+      os: str,
+      "agent-version": str,
+      "access-client-id": str,
+      "access-client-secret-file": str,
+    },
     run: async (c) => {
+      const { "access-client-id": clientId, "access-client-secret-file": secretFile } = c.values;
+      if ((clientId === undefined) !== (secretFile === undefined))
+        throw invalid("--access-client-id and --access-client-secret-file go together");
       const res = await cmd.deviceRegister(c.client(), c.envelope(), {
         name: need(c.values, "name"),
         os: need(c.values, "os"),
@@ -185,6 +207,31 @@ const specs: Record<string, Spec> = {
         });
         c.deps.stderr(`device token saved; executor --token-file ${saved.tokenFile}`);
       }
+      // The secret comes from a file so it never sits in shell history; it is never printed.
+      if (typeof clientId === "string" && typeof secretFile === "string") {
+        const accessClientSecret = (await c.deps.readInput(secretFile)).trim();
+        if (!accessClientSecret) throw invalid("--access-client-secret-file is empty");
+        await c.deps.saveCredentials({ accessClientId: clientId, accessClientSecret });
+        c.deps.stderr("Access service token saved for `hive executor run`");
+      }
+    },
+  },
+  login: {
+    usage: "",
+    run: async (c) => {
+      const oauth = await login(c.apiUrl(), c.deps.openBrowser).catch((error: unknown) => {
+        throw new CliError("UNAUTHENTICATED", 3, `Access login failed: ${String(error)}`);
+      });
+      await c.deps.saveCredentials({ apiUrl: c.apiUrl(), oauth });
+      c.deps.stderr("logged in");
+    },
+  },
+  logout: {
+    usage: "",
+    run: async (c) => {
+      // Local only: the Access session ends when the grant's session duration does.
+      await c.deps.saveCredentials({ oauth: undefined });
+      c.deps.stderr("logged out");
     },
   },
   "channel create": {
@@ -739,7 +786,9 @@ const specs: Record<string, Spec> = {
       if (!token)
         throw new CliError("UNAUTHENTICATED", 3, "no deviceToken: run `hive device register`");
       const apiUrl = c.apiUrl();
-      const cloud = createCloudClient({ apiUrl, token, fetch: c.deps.fetch });
+      const { accessClientId: clientId, accessClientSecret: clientSecret } = c.creds;
+      const accessService = clientId && clientSecret ? { clientId, clientSecret } : undefined;
+      const cloud = createCloudClient({ apiUrl, token, accessService, fetch: c.deps.fetch });
       // ponytail: no Queue consumer yet and `wrangler dev` fires no cron, so each poll pumps the outbox
       // first (POST /v1/executor/pump). Drop this once Queues route events.
       const pumping: CloudClient = {
@@ -748,7 +797,7 @@ const specs: Record<string, Spec> = {
           await c.deps
             .fetch(new URL("/v1/executor/pump", apiUrl), {
               method: "POST",
-              headers: { Authorization: `Bearer ${token}` },
+              headers: { ...serviceTokenHeaders(accessService), "X-Hive-Token": token },
             })
             .catch(() => undefined);
           return cloud.listQueuedJobs(limit);
@@ -760,6 +809,34 @@ const specs: Record<string, Spec> = {
         },
       );
     },
+  },
+  "executor install": {
+    usage: "[--provider fake|claude|codex] [--concurrency N]",
+    options: {
+      provider: { type: "string", default: "fake" },
+      concurrency: { type: "string", default: "1" },
+    },
+    run: async (c) => {
+      const provider = c.values.provider as string;
+      if (!["fake", "claude", "codex"].includes(provider))
+        throw invalid("--provider must be fake, claude or codex");
+      const concurrency = parseConcurrency(c.values.concurrency as string);
+      if (concurrency === null) throw invalid("--concurrency must be an integer in 1..64");
+      // The service runs `executor run`, which needs both; without them KeepAlive restarts a failing process forever.
+      if (!c.creds.deviceToken)
+        throw new CliError("UNAUTHENTICATED", 3, "no deviceToken: run `hive device register`");
+      if (!c.creds.apiUrl) throw invalid("no apiUrl in the credentials file");
+      const service = await import("./service.ts");
+      c.print(await service.install(provider, concurrency));
+    },
+  },
+  "executor uninstall": {
+    usage: "",
+    run: async (c) => c.print(await (await import("./service.ts")).uninstall()),
+  },
+  "executor status": {
+    usage: "",
+    run: async (c) => c.print(await (await import("./service.ts")).status()),
   },
 };
 
@@ -810,6 +887,16 @@ export const run = async (argv: string[], deps: Deps): Promise<number> => {
       if (!id) throw invalid("--workspace is required (or run `hive workspace create`)");
       return id;
     };
+    // One getter per invocation, so a refreshed token is reused by later requests of the same command.
+    let tokens: (() => Promise<string>) | undefined;
+    const oauthToken = () =>
+      (tokens ??= accessTokens({
+        apiUrl: apiUrl(),
+        // The file, not `creds`: Electron may have refreshed the shared grant since this command started.
+        load: async () => (await deps.loadCredentials()).oauth,
+        save: async (oauth) => void (await deps.saveCredentials({ oauth })),
+        openBrowser: deps.openBrowser,
+      }));
     const timeout = Number(values.timeout ?? 300);
     if (!(timeout > 0)) throw invalid("--timeout must be a positive number of seconds");
     const code = await spec.run({
@@ -819,7 +906,12 @@ export const run = async (argv: string[], deps: Deps): Promise<number> => {
       creds,
       apiUrl,
       client: () =>
-        createClient({ apiUrl: apiUrl(), accessJwt: creds.accessJwt, fetch: deps.fetch }),
+        createClient({
+          apiUrl: apiUrl(),
+          accessJwt: creds.accessJwt,
+          accessToken: oauthToken(),
+          fetch: deps.fetch,
+        }),
       workspace,
       envelope: (workspaceId = workspace()) => ({
         operationId: (values["operation-id"] as string | undefined) ?? crypto.randomUUID(),

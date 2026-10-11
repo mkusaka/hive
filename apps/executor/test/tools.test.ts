@@ -38,7 +38,7 @@ describe("hive tools", () => {
       apiUrl: "http://cloud.test",
       token: "device-1.device-secret",
       fetch: async (url, init) => {
-        const auth = new Headers(init.headers).get("Authorization");
+        const auth = new Headers(init.headers).get("X-Hive-Token");
         requests.push({
           url: url.pathname,
           auth,
@@ -55,7 +55,7 @@ describe("hive tools", () => {
 
     expect(textOf(result)).toContain('"messageId":"m-1"');
     const sent = requests.find((r) => r.url === "/v1/run/commands")!;
-    expect(sent.auth).toBe("Bearer cap.run-1.secret");
+    expect(sent.auth).toBe("cap.run-1.secret");
     expect(sent.body).toMatchObject({
       workspaceId: "ws-1",
       command: {

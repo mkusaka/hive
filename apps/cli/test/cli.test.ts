@@ -35,6 +35,9 @@ const harness = (
       saved.push(patch);
       return { tokenFile: "/cfg/hive/device-token" };
     },
+    openBrowser: async () => {
+      throw new Error("no browser in tests");
+    },
     readInput: async (path) => (path === "-" ? stdin : `{"file":"${path}"}`),
     stdout: (line) => void out.push(line),
     stderr: (line) => void err.push(line),
@@ -61,6 +64,9 @@ const apiError = (status: number, code: string) =>
     { code, message: code, requestId: "r", operationId: null, retryable: false },
     { status },
   );
+
+const accessHeaders = (calls: Call[]) =>
+  calls.map((c) => [c.headers.get("Cf-Access-Jwt-Assertion"), c.headers.get("Authorization")]);
 
 describe("argv → request", () => {
   it("agent send builds the command envelope with the Access assertion", async () => {
@@ -392,10 +398,76 @@ describe("output and credentials", () => {
     );
     h.deps.runExecutor = async (cloud) => cloud.listQueuedJobs(10);
     expect(await h.hive("executor", "run", "--once")).toBe(0);
-    expect(h.calls.map((c) => [c.method, c.path, c.headers.get("Authorization")])).toEqual([
-      ["POST", "/v1/executor/pump", "Bearer d-1.secret"],
-      ["GET", "/v1/executor/jobs?state=queued&limit=10", "Bearer d-1.secret"],
+    expect(h.calls.map((c) => [c.method, c.path, c.headers.get("X-Hive-Token")])).toEqual([
+      ["POST", "/v1/executor/pump", "d-1.secret"],
+      ["GET", "/v1/executor/jobs?state=queued&limit=10", "d-1.secret"],
     ]);
+  });
+
+  it("executor run adds the Access service token to every executor request", async () => {
+    const h = harness(
+      (call) =>
+        Response.json(
+          call.path.startsWith("/v1/executor/jobs") ? { jobs: [] } : { processed: 0, dead: 0 },
+        ),
+      {
+        creds: { deviceToken: "d-1.secret", accessClientId: "cid", accessClientSecret: "csecret" },
+      },
+    );
+    h.deps.runExecutor = async (cloud) => cloud.listQueuedJobs(10);
+    expect(await h.hive("executor", "run", "--once")).toBe(0);
+    expect(
+      h.calls.map((c) => [
+        c.path,
+        c.headers.get("CF-Access-Client-Id"),
+        c.headers.get("CF-Access-Client-Secret"),
+        c.headers.get("X-Hive-Token"),
+        c.headers.get("Authorization"),
+      ]),
+    ).toEqual([
+      ["/v1/executor/pump", "cid", "csecret", "d-1.secret", null],
+      ["/v1/executor/jobs?state=queued&limit=10", "cid", "csecret", "d-1.secret", null],
+    ]);
+  });
+
+  it("device register stores the service token from a file and never prints it", async () => {
+    const h = harness(() => Response.json({ deviceId: "d-1", deviceToken: null }));
+    h.deps.readInput = async () => "csecret\n";
+    const args = ["device", "register", "--name", "pc1", "--os", "darwin", "--agent-version", "0"];
+    expect(await h.hive(...args, "--access-client-id", "cid")).toBe(2);
+    expect(
+      await h.hive(...args, "--access-client-id", "cid", "--access-client-secret-file", "/s"),
+    ).toBe(0);
+    expect(h.saved).toEqual([{ accessClientId: "cid", accessClientSecret: "csecret" }]);
+    expect([...h.out, ...h.err].join("\n")).not.toContain("csecret");
+  });
+
+  it("sends the dev assertion first, else the OAuth bearer, else asks for hive login", async () => {
+    const oauth = {
+      authorizationServer: "https://team.cloudflareaccess.com",
+      clientId: "c",
+      accessToken: "oauth-token",
+      refreshToken: "r",
+      expiresAt: Date.now() + 600_000,
+    };
+    const dev = harness(undefined, { creds: { oauth } });
+    expect(await dev.hive("job", "get", "j-1")).toBe(0);
+    expect(accessHeaders(dev.calls)).toEqual([["jwt", null]]);
+
+    const bearer = harness(undefined, { creds: { accessJwt: undefined, oauth } });
+    expect(await bearer.hive("job", "get", "j-1")).toBe(0);
+    expect(accessHeaders(bearer.calls)).toEqual([[null, "Bearer oauth-token"]]);
+
+    const none = harness(undefined, { creds: { accessJwt: undefined } });
+    expect(await none.hive("job", "get", "j-1")).toBe(3);
+    expect(none.calls).toEqual([]);
+    expect(none.err).toEqual(["error: LOGIN_REQUIRED: not logged in: run `hive login`"]);
+  });
+
+  it("logout drops the stored grant", async () => {
+    const h = harness();
+    expect(await h.hive("logout")).toBe(0);
+    expect(h.saved).toEqual([{ oauth: undefined }]);
   });
 
   it("bot create sends instructions inline or from a file, not both", async () => {

@@ -42,7 +42,12 @@ if (concurrency === null) {
   process.exit(2);
 }
 
-const cloud = createCloudClient({ apiUrl, token: (await readFile(tokenFile, "utf8")).trim() });
+const { CF_ACCESS_CLIENT_ID: clientId, CF_ACCESS_CLIENT_SECRET: clientSecret } = process.env;
+const cloud = createCloudClient({
+  apiUrl,
+  token: (await readFile(tokenFile, "utf8")).trim(),
+  accessService: clientId && clientSecret ? { clientId, clientSecret } : undefined,
+});
 const journal = await fileJournal(stateDir);
 const result = await runLoop(
   {

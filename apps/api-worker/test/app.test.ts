@@ -128,6 +128,9 @@ describe("device auth", () => {
       workspaceIds: [workspaceId],
     });
 
+    // X-Hive-Token is the header behind Access; Authorization: Bearer is the fallback.
+    expect((await call("/v1/executor/me", { "X-Hive-Token": deviceToken })).status).toBe(200);
+
     const bad = [`${deviceId}.${"0".repeat(64)}`, deviceId, "", `x.${deviceToken}`];
     const statuses = await Promise.all(bad.map(async (t) => (await executorMe(t)).status));
     expect(statuses).toEqual([401, 401, 401, 401]);

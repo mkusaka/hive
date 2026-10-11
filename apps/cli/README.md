@@ -11,7 +11,10 @@ alias hive='bun apps/cli/src/main.ts'   # from the repo root
 
 ```text
 hive workspace create --id <id> --name <name>          # stores apiUrl + workspaceId in the credentials file
+hive login                                             # Access Managed OAuth in the system browser
+hive logout                                            # forgets the stored OAuth grant
 hive device register --name <n> --os <os> --agent-version <v>
+                     [--access-client-id <id> --access-client-secret-file <path|->]
                                                        # prints the token once, stores it for `executor run`
 hive channel create --name <name>
 hive bot create --name <name> [--instructions <text> | --instructions-file <path|->]
@@ -117,6 +120,29 @@ a fresh UUID per invocation).
   `<seq> <kind>[(<tool>)]: <text>` per entry (`--format json`: `{entries}`). It needs membership of the Run's
   channel or Workspace ownership (404 otherwise). `--raw` prints `GET /v1/transcripts/:id/raw` as-is (owner only).
 
+## Run as a service (macOS)
+
+```sh
+hive executor install --provider claude [--concurrency N]   # writes and loads the launchd agent, prints captured env names
+hive executor status                                        # loaded, state, pid, last exit code, plist and log paths
+hive executor uninstall                                     # bootout + removes the plist; logs and credentials stay
+```
+
+- `install` writes `~/Library/LaunchAgents/com.hive.executor.plist` (0600) running
+  `<bun> apps/cli/src/main.ts executor run --provider P --concurrency N` with `RunAtLoad` and `KeepAlive`, working
+  directory `<config dir>/hive`, logs in `<config dir>/hive/executor/logs/{stdout,stderr}.log`, then
+  `launchctl bootout` (if loaded) and `launchctl bootstrap gui/<uid>`. Rerun it to change flags or after moving the
+  checkout or Bun (paths are absolute). It needs `apiUrl` and `deviceToken` in the credentials file.
+- Environment: only `PATH`, `HOME`, and, when set in the installing shell, `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR`,
+  `CLAUDE_CODE_OAUTH_TOKEN` are copied into the plist (names are printed, values never). A store-backed Claude
+  resume needs a login the SDK can copy: `CLAUDE_CODE_OAUTH_TOKEN`, or `.credentials.json` in `CLAUDE_CONFIG_DIR`;
+  the keychain login works only with `CLAUDE_CONFIG_DIR` unset.
+- Stop: on SIGTERM (`launchctl bootout`, `launchctl kill SIGTERM`, logout) the executor stops polling, stops its
+  running agents (their Runs get no result, so the restarted executor resumes them through reconcile) and exits
+  within 10 s. `KeepAlive` restarts it after any
+  exit except `uninstall`.
+- Other platforms: the three commands exit 2 with "not supported yet".
+
 ## Credentials
 
 `$XDG_CONFIG_HOME/hive/credentials.json`, else `~/.config/hive/credentials.json` (directory 0700, file 0600):
@@ -124,15 +150,38 @@ a fresh UUID per invocation).
 ```json
 {
   "apiUrl": "https://api.example.com",
-  "accessJwt": "<optional>",
+  "accessJwt": "<optional, local dev>",
+  "oauth": "<optional, written by hive login>",
   "deviceToken": "<optional>",
+  "accessClientId": "<optional>",
+  "accessClientSecret": "<optional>",
   "workspaceId": "ws"
 }
 ```
 
-- **Access assertion.** Sent as `Cf-Access-Jwt-Assertion`. `HIVE_ACCESS_JWT` overrides `accessJwt`. In production
-  get it with `cloudflared access login <api url>` and `cloudflared access token -app <api url>` (Managed OAuth
-  login, gate G-02, is not implemented). Locally use `apps/api-worker/scripts/dev-token.ts`.
+- **User auth, in this order.** `HIVE_ACCESS_JWT`, else `accessJwt`, is sent as `Cf-Access-Jwt-Assertion`
+  straight to `wrangler dev` (mint it with `apps/api-worker/scripts/dev-token.ts`). Else the stored OAuth grant
+  from `hive login` is sent as `Authorization: Bearer <access token>`; Cloudflare Access resolves it and forwards
+  the same `Cf-Access-Jwt-Assertion`, so the Worker is unchanged. Else the command fails with
+  `not logged in: run hive login` (exit 3).
+- **`hive login`** (`src/accessLogin.ts`, `oauth4webapi`): an unauthenticated request to `apiUrl` gets Access's
+  401 with `resource_metadata` (RFC 9728), then OAuth discovery, dynamic client registration with a
+  `http://127.0.0.1:<OS-chosen port>/callback` redirect, Authorization Code + PKCE (S256) in the system browser
+  (`open` / `xdg-open` / `explorer.exe`; the URL is also printed for a headless machine). It stores
+  `oauth: {authorizationServer, clientId, accessToken, refreshToken, expiresAt}`.
+- **One store for the CLI and Electron.** Both read and write the `oauth` grant in this file, so a login or refresh
+  by either is seen by the other. Each token request re-reads the file. A token within 30 s of expiry is refreshed
+  and the rotated tokens are written back. Access rotates refresh tokens, so on `invalid_grant` the file is read
+  again and a grant the other client refreshed meanwhile is used. Only then does the CLI open the browser again;
+  without a stored grant it fails with `LOGIN_REQUIRED` (exit 3).
+- **Logout and revocation.** `hive logout` deletes the grant from the file, for Electron too. Access session
+  revocation is invisible to the Worker until the current assertion expires (access tokens live 15 min).
+- **Executor service token.** `executor run` (and the standalone executor) adds `CF-Access-Client-Id` /
+  `CF-Access-Client-Secret` to every executor and Run request, next to the device token (`X-Hive-Token`), from
+  `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` or `accessClientId` / `accessClientSecret`. Store them with
+  `device register --access-client-id <id> --access-client-secret-file <path|->` (the secret is read from a file
+  so it stays out of shell history, and never printed). Each PC gets its own token from Terraform
+  (`infra/README.md`); `executor run` never needs a browser.
 - **Device token.** `device register` also writes it alone to `<config dir>/hive/device-token`, the
   `--token-file` of the standalone executor (`apps/executor/src/main.ts`).
 
@@ -155,16 +204,21 @@ a fresh UUID per invocation).
   with `code` and `exitCode`. Web-standard APIs only.
 - `src/commands.ts`: command bodies, `watchJob`, `waitForOperationJob`. Web-standard APIs only, so
   `apps/api-worker/test/cli.test.ts` runs them in workerd.
+- `src/accessLogin.ts`: Managed OAuth login, refresh and the browser opener (Node only; reused by
+  `apps/desktop`).
 - `src/cli.ts`: `node:util` `parseArgs` dispatcher; I/O is injected. `src/main.ts`: real files, stdin, executor.
 
 ## Tests
 
-`test/cli.test.ts` (Node): argv → request bodies, stdin data, exit codes, `job watch`, output formats. The
+`test/cli.test.ts` (Node): argv → request bodies, stdin data, exit codes, `job watch`, output formats, Access
+header precedence, service-token headers. `test/accessLogin.test.ts`: login, PKCE pairing, refresh and
+`invalid_grant` against a fake Access (stubbed `fetch`, real loopback callback). The
 end-to-end loop is `apps/api-worker/test/cli.test.ts`.
 
 ## Known gaps
 
-- No OAuth login (`hive login`): the Access assertion is pasted or minted (G-02 not executed).
+- Managed OAuth and service tokens are implemented but not run against a real Access tenant (G-02). Adding a PC
+  means a `terraform apply` for its service token; there is no runtime token creation.
 - No local operation store: after a network timeout, query `hive op get <id>` and resend with the same
   `--operation-id` / `--idempotency-key` by hand.
 - No offline queue (`--offline-queue`, exit 8).
