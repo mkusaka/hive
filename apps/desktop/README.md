@@ -20,7 +20,8 @@ bun run --cwd apps/desktop build   # out/{main,preload,renderer}
   grant does the window show a Login button, which runs the same browser login (`@hive/cli/accessLogin`) and writes
   the grant to the file.
 - **Screenshot hook (dev only).** `HIVE_SCREENSHOT=<png path>` saves `webContents.capturePage()` once,
-  `HIVE_SCREENSHOT_DELAY_MS` (default 5000) after the first load. Ignored in a packaged app.
+  `HIVE_SCREENSHOT_DELAY_MS` (default 5000) after the first load. `HIVE_OPEN_BOT=<bot id>` opens that Bot's panel at
+  start (sent as `openBot` in the config reply). Both are ignored in a packaged app.
 - **Tooling.** `electron-vite` is the one build dependency: it builds main, preload and renderer with Vite and
   starts Electron with the dev server URL. There is no React plugin: esbuild's automatic JSX runtime is enough,
   so there is no fast refresh (edits reload the page) and no inline preamble script to allow in the CSP. Main
@@ -28,20 +29,29 @@ bun run --cwd apps/desktop build   # out/{main,preload,renderer}
 
 ## Views
 
-| View          | Data                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Channel       | Channels, the selected channel's latest 50 messages oldest first, Bot picker, composer                                                                                                                                                                                                                                                                                                                                                                                                                |
-| Inbox         | `GET /v1/inbox?botId=` for the picked Bot, with state badges                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| Activity      | `GET /v1/jobs?limit=50` with state badges (incl. `waiting_device`, `recovery_required`) and a Cancel button for queued / waiting / active Jobs; selecting a Job shows `GET /v1/jobs/:id` and its Runs; selecting a Run opens the Run Inspector                                                                                                                                                                                                                                                        |
-| Run Inspector | `GET /v1/runs/:id`: state and `persistence` badges, generation, device, started / finished, provider session present, transcript parts / watermark, result; then every page of `GET /v1/runs/:id/transcript` (kind, tool name, redacted text). Without access to the transcript (not in the Run's channel, bot-pair Run) it says so. An Effects table (`GET /v1/effects?runId=`): kind, state, request summary, external URL or id, attempts, last error. Refetched on `run` and `effect` change rows |
-| Approvals     | Pending approvals (`GET /v1/approvals?state=pending`): action, argument summary, cwd label, Bot, expires-in; Allow / Deny send `approval.resolve`. An external effect shows as `slack.post` / `github.comment` with the redacted target and text and `cloud`. The nav shows the pending count                                                                                                                                                                                                         |
-| Search        | Query box → `GET /v1/search`: kind badge, title, snippet and the index's `indexed through` time; a message hit opens its channel in the Channel view                                                                                                                                                                                                                                                                                                                                                  |
-| Memory        | Scope picker (Workspace, member channels, Bots) → `GET /v1/memories`, newest first; the form sends `memory.write` to the picked scope                                                                                                                                                                                                                                                                                                                                                                 |
-| Devices       | Name, OS, online / offline (heartbeat within 45 s; refetched when the view opens, since heartbeats write no change rows), capabilities, background capacity, last heartbeat, revoked                                                                                                                                                                                                                                                                                                                  |
-| Status        | Workspace, WebSocket state (connected / reconnecting), last sync cursor (tail), unsynced hint count                                                                                                                                                                                                                                                                                                                                                                                                   |
+Dark theme (CSS variables in `style.css`: one light base mixed into every grey, accent / danger / added colors).
+A sidebar shows the Bots (`GET /v1/bots`) as colored initial blobs (color from the id hash) and the Channels
+(`GET /v1/channels`, each with its `lastMessage` as a one-line preview); bot-pair conversations are not listed. The
+toggle collapses it to an icon rail (remembered in `localStorage`). Icon buttons at its bottom open the other views;
+Approvals shows the pending count.
+
+| View          | Data                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Channel       | Header pill with the channel name, "N messages with" the Bots that posted in the loaded page (latest 50, oldest first), date dividers, left-aligned bubbles: a Bot's blob + name, "You" for the caller's own messages (`userId` = `GET /v1/me`), else the actor id's short form. Bodies render a safe Markdown subset as React elements (`format.ts`: paragraphs, `-` / `*` / numbered lists, bold, inline code, fenced code, links as text + URL). Hover action: Copy. Composer: Bot pill + "Message <bot>", Enter sends, Shift+Enter is a newline |
+| Bot panel     | Opens from a Bot in the sidebar or a Bot name in the conversation. **Details**: instructions and tool policy (read-only), Routines of the Bot (`GET /v1/routines?botId=`) with the schedule as a line ("Weekdays at 9:00 AM", "Every 20 minutes", "Once October 10 at 9:47 AM", else the cron expression), an on / off switch (`routine.pause` / `routine.resume`) and Run now (`routine.run`). **Library**: the Bot's memories. **Computer**: the Executor section and the Devices list                                                            |
+| Inbox         | `GET /v1/inbox?botId=` for the picked Bot, with state badges                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Activity      | `GET /v1/jobs?limit=50` with state badges (incl. `waiting_device`, `recovery_required`) and a Cancel button for queued / waiting / active Jobs; selecting a Job shows `GET /v1/jobs/:id` and its Runs; selecting a Run opens the Run Inspector                                                                                                                                                                                                                                                                                                      |
+| Run Inspector | `GET /v1/runs/:id`: state and `persistence` badges, generation, device, started / finished, provider session present, transcript parts / watermark, result; then every page of `GET /v1/runs/:id/transcript` (kind, tool name, redacted text). Without access to the transcript (not in the Run's channel, bot-pair Run) it says so. An Effects table (`GET /v1/effects?runId=`): kind, state, request summary, external URL or id, attempts, last error. Refetched on `run` and `effect` change rows                                               |
+| Approvals     | Pending approvals (`GET /v1/approvals?state=pending`): action, argument summary, cwd label, Bot, expires-in; Allow / Deny send `approval.resolve`. An external effect shows as `slack.post` / `github.comment` with the redacted target and text and `cloud`                                                                                                                                                                                                                                                                                        |
+| Search        | Query box → `GET /v1/search`: kind badge, title, snippet and the index's `indexed through` time; a message hit opens its channel in the Channel view                                                                                                                                                                                                                                                                                                                                                                                                |
+| Memory        | Scope picker (Workspace, member channels, Bots) → `GET /v1/memories`, newest first; the form sends `memory.write` to the picked scope                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Status        | Workspace, WebSocket state (connected / reconnecting), last sync cursor (tail), unsynced hint count, last sync error                                                                                                                                                                                                                                                                                                                                                                                                                                |
+
+Devices (in the Computer tab): name, OS, online / offline (heartbeat within 45 s; refetched when the tab opens, since
+heartbeats write no change rows), capabilities, background capacity, last heartbeat, revoked.
 
 The composer sends `agent.send` (`delivery: "wake"`) with a fresh operation id and idempotency key, shows the
-accepted operation, then polls `GET /v1/operations/:id` every 2 s (up to 10 min) until routing created the Job.
+accepted operation in a status line under the composer, then polls `GET /v1/operations/:id` every 2 s (up to 10 min) until routing created the Job.
 Accepted is not started: the Job id appears only after the outbox pump ran (`hive executor run`).
 
 ## Sync
@@ -75,15 +85,15 @@ img-src 'self'`. `'unsafe-inline'` styles are for Vite's dev-time `<style>` inje
 
 ## IPC surface (`src/shared/api.ts`)
 
-| `window.hive`       | Channel                | Validation / behavior                                                                                                                                   |
-| ------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `api.get(path)`     | `hive:api.get`         | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, the query also allows URLSearchParams' `+` and `*`, no `..` anywhere                            |
-| `api.command(env)`  | `hive:api.command`     | `commandEnvelope(variant [AgentSend, JobCancel, ApprovalResolve, MemoryWrite])`: only `agent.send`, `job.cancel`, `approval.resolve` and `memory.write` |
-| `getConfig()`       | `hive:config`          | `{apiUrl, workspaceId, problem, connection}`; no secrets                                                                                                |
-| `onRealtime(cb)`    | `hive:realtime`        | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                                                             |
-| `executor.status()` | `hive:executor.status` | launchd state, pid, last exit code, installed provider / concurrency / argv, plist and log paths, `registered`; never the plist's env values            |
-| `executor.start(o)` | `hive:executor.start`  | `{provider: fake\|claude\|codex, concurrency: 1..64}` (strict); installs or replaces the service; `UNAUTHENTICATED` without a device token              |
-| `executor.stop()`   | `hive:executor.stop`   | `launchctl bootout` only; the plist stays                                                                                                               |
+| `window.hive`       | Channel                | Validation / behavior                                                                                                                                    |
+| ------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `api.get(path)`     | `hive:api.get`         | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, the query also allows URLSearchParams' `+` and `*`, no `..` anywhere                             |
+| `api.command(env)`  | `hive:api.command`     | `commandEnvelope(variant [AgentSend, JobCancel, ApprovalResolve, MemoryWrite, RoutinePause, RoutineResume, RoutineRun])`: only these seven command types |
+| `getConfig()`       | `hive:config`          | `{apiUrl, workspaceId, problem, connection}`; no secrets                                                                                                 |
+| `onRealtime(cb)`    | `hive:realtime`        | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                                                              |
+| `executor.status()` | `hive:executor.status` | launchd state, pid, last exit code, installed provider / concurrency / argv, plist and log paths, `registered`; never the plist's env values             |
+| `executor.start(o)` | `hive:executor.start`  | `{provider: fake\|claude\|codex, concurrency: 1..64}` (strict); installs or replaces the service; `UNAUTHENTICATED` without a device token               |
+| `executor.stop()`   | `hive:executor.stop`   | `launchctl bootout` only; the plist stays                                                                                                                |
 
 `api.*` never rejects: it resolves to `{ok: true, value}` or `{ok: false, error: {code, message, body?}}`, where
 `code` is the `ApiError` code (e.g. `CURSOR_EXPIRED`), `INVALID_ARGS` for rejected arguments, or a CLI client code
@@ -101,11 +111,11 @@ this app in headless executor mode, so the service always runs the installed Ele
   main renders the plist for this build (`[process.execPath, app.getAppPath(), "--executor"]` plus the installed
   provider / concurrency, default `claude`, 1) and reinstalls it unless the file on disk is byte-identical and the
   agent runs with a pid (`ensure` in `apps/cli/src/service.ts`). It logs the result (names, no values). Without a
-  device token nothing is installed and the Devices view says to run `hive device register`.
+  device token nothing is installed and the Computer tab says to run `hive device register`.
 - **Closing the window or quitting the app leaves the service running.**
-- **Devices view, Executor section.** State (not installed / loaded + pid / stopped + last exit code), the installed
+- **Computer tab, Executor section.** State (not installed / loaded + pid / stopped + last exit code), the installed
   provider and concurrency, the program's first path (to see drift), log paths, a provider select, a concurrency
-  input, Start and Stop; polled every 10 s while the view is open. Start installs the service with the chosen
+  input, Start and Stop; polled every 10 s while the tab is open. Start installs the service with the chosen
   options. Stop only unloads it (`launchctl bootout`): the plist stays and the next app start brings it back.
   Permanent removal is `hive executor uninstall`.
 - **Program path.** In dev, `process.execPath` is the Electron binary under `node_modules` and `app.getAppPath()` is
@@ -120,8 +130,8 @@ this app in headless executor mode, so the service always runs the installed Ele
 ## Tests
 
 `bun run test` from the repo root (Node environment, Electron is never launched): `test/sync.test.ts` (bootstrap,
-refetch sets by scope, paging, 410 re-bootstrap, failed pull), `test/ipc.test.ts` (path and envelope
-rejection, ApiError mapping, Access header injection) and `test/executor.test.ts` (executor IPC argument rejection,
+refetch sets by scope, paging, 410 re-bootstrap, failed pull), `test/format.test.ts` (Markdown subset, schedule lines, avatar colors), `test/ipc.test.ts` (path and envelope
+rejection, routine commands, ApiError mapping, Access header injection) and `test/executor.test.ts` (executor IPC argument rejection,
 unregistered device, error mapping; the service module is mocked).
 
 ## Known gaps
@@ -138,6 +148,11 @@ unregistered device, error mapping; the service module is mocked).
 - Inbox state and Job ids are not linked in the UI; accepted / delivered / started / completed are shown only as
   the raw states of the operation, inbox item and Job.
 - No packaging or installer (electron-builder).
+- Chat UI (UI-02): sidebar previews come from the channel list, refetched whole on every `channel:*` change row (no
+  revision merge). No reply threads, reactions, voice,
+  labels, sharing or avatar images; links in messages are text (the window denies opening links); Markdown is a small
+  subset (no headings, tables, nested lists or images). The Bot panel's Routines and memories load when a tab opens
+  and after its own commands (no change-row refetch); no routine create / edit form (use `hive routine create`).
 - Executor service: macOS only; no device registration in the app; a Claude Run under launchd was verified only with
   `CLAUDE_CONFIG_DIR` captured from the starting shell (keychain login); launched from Finder, main has
   launchd's minimal `PATH`, which the service then inherits. The Executor section is hidden while the window shows

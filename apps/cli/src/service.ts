@@ -27,8 +27,15 @@ const passthrough = [
   "CLAUDE_CODE_OAUTH_TOKEN",
 ] as const;
 
-export const captureEnv = (env: Record<string, string | undefined>) =>
-  Object.fromEntries(passthrough.flatMap((name) => (env[name] ? [[name, env[name]]] : [])));
+export const captureEnv = (env: Record<string, string | undefined>) => {
+  const out = Object.fromEntries(
+    passthrough.flatMap((name) => (env[name] ? [[name, env[name]]] : [])),
+  );
+  // `bun run` prepends node_modules/.bin on every start, so an undeduplicated PATH differs per start and `ensure`
+  // would reinstall the service each time the desktop app runs from `dev`.
+  if (out.PATH) out.PATH = [...new Set(out.PATH.split(":"))].join(":");
+  return out;
+};
 
 const esc = (value: string) =>
   value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");

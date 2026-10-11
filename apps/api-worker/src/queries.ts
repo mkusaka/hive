@@ -104,10 +104,14 @@ export const listInbox = async (db: D1Database, wsIds: string[], botId: string) 
 // ---------------------------------------------- Bootstrap lists (§12.3)
 // The caller already checked Workspace membership. Bounded; no pagination yet.
 
+/** Member channels by name, each with its main conversation's latest message (`lastMessage`, null when empty). */
 export const listChannels = async (db: D1Database, workspaceId: string, userId: string) => {
   const { results } = await db
     .prepare(
-      `SELECT ch.id, ch.name, c.id AS conversationId, m.role, ch.created_at AS createdAt
+      `SELECT ch.id, ch.name, c.id AS conversationId, m.role, ch.created_at AS createdAt,
+              (SELECT json_object('body', lm.body, 'createdAt', lm.created_at, 'actorId', lm.actor_id)
+                 FROM messages lm WHERE lm.workspace_id = c.workspace_id AND lm.conversation_id = c.id
+                ORDER BY lm.seq DESC LIMIT 1) AS lastMessage
          FROM channels ch
          JOIN channel_members m ON m.workspace_id = ch.workspace_id AND m.channel_id = ch.id
          JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
@@ -116,14 +120,15 @@ export const listChannels = async (db: D1Database, workspaceId: string, userId: 
         ORDER BY ch.name LIMIT 500`,
     )
     .bind(workspaceId, userId)
-    .all();
+    .all<{ lastMessage: string | null }>();
+  for (const ch of results) ch.lastMessage = ch.lastMessage && JSON.parse(ch.lastMessage);
   return { channels: results };
 };
 
 export const listBots = async (db: D1Database, workspaceId: string) => {
   const { results } = await db
     .prepare(
-      `SELECT id, name, placement_policy AS placementPolicy, tool_policy AS toolPolicy,
+      `SELECT id, actor_id AS actorId, name, instructions, placement_policy AS placementPolicy, tool_policy AS toolPolicy,
               config_revision AS revision, created_at AS createdAt, updated_at AS updatedAt
          FROM bots WHERE workspace_id = ? ORDER BY name LIMIT 500`,
     )
@@ -236,9 +241,10 @@ export const listMessages = async (
   if (!member) throw notFound("channel");
   const { results } = await db
     .prepare(
-      `SELECT m.id, m.conversation_id AS conversationId, m.seq, m.actor_id AS actorId, m.body,
+      `SELECT m.id, m.conversation_id AS conversationId, m.seq, m.actor_id AS actorId, a.user_id AS userId, m.body,
               m.created_at AS createdAt
          FROM messages m
+         LEFT JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
          JOIN conversations c ON c.workspace_id = m.workspace_id AND c.id = m.conversation_id
         WHERE c.workspace_id = ? AND c.channel_id = ?
         ORDER BY m.seq DESC LIMIT ?`,
@@ -433,16 +439,16 @@ export const listSubscriptions = async (db: D1Database, workspaceId: string) => 
   return { subscriptions: results };
 };
 
-/** Routines of the Workspace with their schedule parsed (max 500). */
-export const listRoutines = async (db: D1Database, workspaceId: string) => {
+/** Routines of the Workspace (or of one Bot) with their schedule parsed (max 500). */
+export const listRoutines = async (db: D1Database, workspaceId: string, botId?: string) => {
   const { results } = await db
     .prepare(
       `SELECT id, bot_id AS botId, name, conversation_id AS conversationId, task_id AS taskId, input_text AS inputText,
               schedule, schedule_revision AS scheduleRevision, misfire, next_fire_at AS nextFireAt, enabled, revision,
               created_at AS createdAt, updated_at AS updatedAt
-         FROM routines WHERE workspace_id = ? ORDER BY created_at, id LIMIT 500`,
+         FROM routines WHERE workspace_id = ? AND (? IS NULL OR bot_id = ?) ORDER BY created_at, id LIMIT 500`,
     )
-    .bind(workspaceId)
+    .bind(workspaceId, botId ?? null, botId ?? null)
     .all<Record<string, unknown>>();
   for (const r of results) {
     r.schedule = JSON.parse(r.schedule as string);

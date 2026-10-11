@@ -26,15 +26,14 @@ export const allLists: ListKey[] = [
 type Change = { scope: string; entityKind: string };
 
 /**
- * `channel:*` → messages / inbox (and the channel list for a new channel); `workspace:*` → jobs / bots / devices /
- * approvals (and the inspected Run for a `run` or `effect` row).
+ * `channel:*` → messages / inbox and the channel list (its `lastMessage` previews); `workspace:*` → jobs / bots /
+ * devices / approvals (and the inspected Run for a `run` or `effect` row).
  */
 export const refetchFor = (changes: Change[]) => {
   const keys = new Set<ListKey>();
   for (const { scope, entityKind } of changes) {
     if (scope.startsWith("channel:")) {
-      keys.add("messages").add("inbox");
-      if (entityKind === "channel") keys.add("channels");
+      keys.add("messages").add("inbox").add("channels");
     } else if (scope.startsWith("workspace:")) {
       keys.add("jobs").add("bots").add("devices").add("approvals");
       if (entityKind === "run" || entityKind === "effect") keys.add("run");

@@ -148,6 +148,10 @@ const createWindow = async () => {
       ...config,
       loginRequired: await loginRequired(),
       connection,
+      // Dev-only hook for screenshots of the Bot panel.
+      ...(!app.isPackaged && process.env.HIVE_OPEN_BOT
+        ? { openBot: process.env.HIVE_OPEN_BOT }
+        : {}),
     })),
   );
   // Browser login (PKCE on a loopback redirect); the grant goes to the shared file. Never throws across IPC.

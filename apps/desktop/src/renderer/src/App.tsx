@@ -1,25 +1,33 @@
-// Phase 2 UI slice: Channel / Inbox / Activity (with the Run Inspector) / Approvals / Search / Memory / Devices views
-// and a status bar (docs/architecture.md §21).
+// The desktop shell (docs/architecture.md §21): a sidebar of Bots and Channels, the Channel conversation, the Bot
+// panel, and the Inbox / Activity (with the Run Inspector) / Approvals / Search / Memory / Status views.
 /* oxlint-disable no-await-in-loop */
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ExecutorProvider, HiveConfig } from "../../shared/api.ts";
+import type { HiveConfig } from "../../shared/api.ts";
+import { ChannelView } from "./chat.tsx";
+import { BotPanel } from "./panel.tsx";
 import { createSync, type ListKey, type SyncStatus } from "./sync.ts";
+import {
+  Avatar,
+  Badge,
+  failure,
+  get,
+  Icon,
+  inWorkspace,
+  MemoryList,
+  type Row,
+  text,
+} from "./ui.tsx";
 
-type Row = Record<string, unknown> & { id: string };
-type View = "channel" | "inbox" | "activity" | "approvals" | "search" | "memory" | "devices";
-
-const get = async (path: string) => {
-  const result = await window.hive.api.get(path);
-  if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`);
-  return result.value;
-};
-const inWorkspace = (resource: string, workspaceId: string, query: Record<string, string> = {}) =>
-  `/v1/${resource}?${new URLSearchParams({ workspaceId, ...query })}`;
-const text = (value: unknown) => (value === null || value === undefined ? "—" : String(value));
-
-const Badge = ({ state }: { state: unknown }) => (
-  <span className={`badge ${text(state)}`}>{text(state)}</span>
-);
+type View = "channel" | "inbox" | "activity" | "approvals" | "search" | "memory" | "status";
+const otherViews = [
+  ["inbox", "Inbox"],
+  ["activity", "Activity"],
+  ["approvals", "Approvals"],
+  ["search", "Search"],
+  ["memory", "Memory"],
+  ["status", "Status"],
+] as const;
+const collapsedKey = "hive.sidebarCollapsed";
 
 export const App = () => {
   const [config, setConfig] = useState<HiveConfig | null>(null);
@@ -41,6 +49,22 @@ export const App = () => {
   const [jobDetail, setJobDetail] = useState<Record<string, unknown> | null>(null);
   const [runId, setRunId] = useState("");
   const [run, setRun] = useState<Inspected | null>(null);
+  const [me, setMe] = useState<string | null>(null);
+  const [panelBot, setPanelBot] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem(collapsedKey) === "1";
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(collapsedKey, collapsed ? "1" : "0");
+    } catch {
+      // Storage unavailable: the sidebar state is not remembered.
+    }
+  }, [collapsed]);
 
   /** job.cancel (§9.3): an active Job keeps running until its executor stops it; sync shows the outcome. */
   const cancelJob = async (workspaceId: string, jobId: string) => {
@@ -115,6 +139,7 @@ export const App = () => {
     void window.hive.getConfig().then((c) => {
       setConfig(c);
       setConnection(c.connection);
+      if (c.openBot) setPanelBot(c.openBot);
     });
     return off;
   }, []);
@@ -145,6 +170,18 @@ export const App = () => {
       clearTimeout(timer);
       window.removeEventListener("focus", onFocus);
     };
+  }, [config, refetch]);
+
+  // Who "You" is in the message list (messages carry the author's user id).
+  useEffect(() => {
+    if (config && !config.problem && !config.loginRequired)
+      void get("/v1/me").then(
+        (p) => setMe(String(p.userId)),
+        () => setMe(null),
+      );
+  }, [config]);
+  const refreshDevices = useCallback(() => {
+    if (config) void refetch(new Set(["devices"]), config.workspaceId);
   }, [config, refetch]);
 
   // Selection changes load their list directly.
@@ -192,56 +229,111 @@ export const App = () => {
     );
   const ws = config.workspaceId;
 
-  const botPicker = (
-    <select value={botId} onChange={(e) => setBotId(e.target.value)} aria-label="Bot">
-      {bots.map((b) => (
-        <option key={b.id} value={b.id}>
-          {text(b.name)}
-        </option>
-      ))}
-    </select>
-  );
+  const panel = panelBot ? bots.find((b) => b.id === panelBot) : undefined;
 
   return (
-    <div className="app">
-      <nav>
-        {(
-          ["channel", "inbox", "activity", "approvals", "search", "memory", "devices"] as const
-        ).map((v) => (
+    <div className={`app ${panel ? "with-panel" : ""}`}>
+      <aside className={`sidebar ${collapsed ? "collapsed" : ""}`}>
+        <div className="side-top">
           <button
-            key={v}
-            className={v === view ? "active" : ""}
-            onClick={() => {
-              setView(v);
-              // Heartbeats write no change rows, so online state is refetched when the view opens.
-              if (v === "devices") void refetch(new Set(["devices"]), ws);
-            }}
+            className="icon"
+            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            aria-label="Toggle sidebar"
+            onClick={() => setCollapsed(!collapsed)}
           >
-            {v[0]!.toUpperCase() + v.slice(1)}
-            {v === "approvals" && approvals.length > 0 && (
-              <span className="count" aria-label={`${approvals.length} pending`}>
-                {approvals.length}
-              </span>
-            )}
+            <Icon name="sidebar" />
           </button>
-        ))}
-      </nav>
+        </div>
+        <div className="bots">
+          {bots.map((b) => (
+            <button
+              key={b.id}
+              className={`bot ${b.id === panelBot ? "active" : ""}`}
+              title={text(b.name)}
+              onClick={() => setPanelBot(b.id === panelBot ? null : b.id)}
+            >
+              <Avatar id={b.id} name={String(b.name)} size={collapsed ? 40 : 56} />
+              {!collapsed && <span className="ellipsis">{text(b.name)}</span>}
+            </button>
+          ))}
+        </div>
+        <ul className="convs">
+          {channels.map((c) => {
+            const last = c.lastMessage as { body: string } | null;
+            return (
+              <li key={c.id}>
+                <button
+                  className={view === "channel" && c.id === channelId ? "active" : ""}
+                  title={`# ${text(c.name)}`}
+                  onClick={() => {
+                    setChannelId(c.id);
+                    setView("channel");
+                  }}
+                >
+                  <Avatar id={c.id} name={String(c.name)} size={40} />
+                  {!collapsed && (
+                    <span className="conv-text">
+                      <span className="ellipsis"># {text(c.name)}</span>
+                      <span className="preview ellipsis">
+                        {last
+                          ? last.body
+                              .split("\n")[0]!
+                              .replace(/^\s*([-*]|\d+[.)])\s+/, "")
+                              .replaceAll(/\*\*|`/g, "")
+                          : "No messages yet"}
+                      </span>
+                    </span>
+                  )}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+        <nav className="side-nav">
+          {otherViews.map(([v, label]) => (
+            <button
+              key={v}
+              className={`icon ${v === view ? "active" : ""}`}
+              title={label}
+              aria-label={label}
+              onClick={() => setView(v)}
+            >
+              <Icon name={v} />
+              {v === "approvals" && approvals.length > 0 && (
+                <span className="count" aria-label={`${approvals.length} pending`}>
+                  {approvals.length}
+                </span>
+              )}
+            </button>
+          ))}
+        </nav>
+      </aside>
       <main>
-        {error && <p className="error">{error}</p>}
+        {error && <p className="error banner">{error}</p>}
         {view === "channel" && (
           <ChannelView
             ws={ws}
-            channels={channels}
-            channelId={channelId}
-            setChannelId={setChannelId}
+            channel={channels.find((c) => c.id === channelId)}
             messages={messages}
+            bots={bots}
             botId={botId}
-            botPicker={botPicker}
+            setBotId={setBotId}
+            me={me}
+            openBot={setPanelBot}
           />
         )}
         {view === "inbox" && (
-          <section>
-            <h2>Inbox {botPicker}</h2>
+          <section className="view">
+            <h2>
+              Inbox{" "}
+              <select value={botId} onChange={(e) => setBotId(e.target.value)} aria-label="Bot">
+                {bots.map((b) => (
+                  <option key={b.id} value={b.id}>
+                    {text(b.name)}
+                  </option>
+                ))}
+              </select>
+            </h2>
             <table>
               <thead>
                 <tr>
@@ -269,7 +361,7 @@ export const App = () => {
           </section>
         )}
         {view === "activity" && (
-          <section className="split">
+          <section className="view split">
             <div>
               <h2>Jobs</h2>
               <ul className="list">
@@ -343,166 +435,35 @@ export const App = () => {
           />
         )}
         {view === "memory" && <MemoryView ws={ws} channels={channels} bots={bots} />}
-        {view === "devices" && <ExecutorPanel />}
-        {view === "devices" && (
-          <section>
-            <h2>Devices</h2>
-            <table>
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>OS</th>
-                  <th>Status</th>
-                  <th>Capabilities</th>
-                  <th>Capacity</th>
-                  <th>Last heartbeat</th>
-                  <th>Revoked</th>
-                </tr>
-              </thead>
-              <tbody>
-                {devices.map((d) => {
-                  // Online = heartbeat within 45 s, as placement counts it (api-worker placement.ts).
-                  const online =
-                    typeof d.lastHeartbeatAt === "string" &&
-                    Date.now() - Date.parse(d.lastHeartbeatAt) <= 45_000;
-                  return (
-                    <tr key={d.id}>
-                      <td>{text(d.name)}</td>
-                      <td>{text(d.os)}</td>
-                      <td className={online ? "ok" : "warn"}>{online ? "online" : "offline"}</td>
-                      <td>{Array.isArray(d.capabilities) ? d.capabilities.join(", ") : "—"}</td>
-                      <td>{text(d.capacityBackground)}</td>
-                      <td>{text(d.lastHeartbeatAt)}</td>
-                      <td>{text(d.revokedAt)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+        {view === "status" && (
+          <section className="view">
+            <h2>Status</h2>
+            <dl className="kv">
+              <dt>Workspace</dt>
+              <dd className="mono">{ws}</dd>
+              <dt>WebSocket</dt>
+              <dd className={connection === "connected" ? "ok" : "warn"}>{connection}</dd>
+              <dt>Sync cursor</dt>
+              <dd className="mono" title={sync.cursor ?? ""}>
+                {sync.cursor ? sync.cursor.slice(-12) : "—"}
+              </dd>
+              <dt>Unsynced hints</dt>
+              <dd>{sync.unsynced}</dd>
+            </dl>
+            {sync.error && <p className="error">{sync.error}</p>}
           </section>
         )}
       </main>
-      <footer>
-        <span>workspace {ws}</span>
-        <span className={connection === "connected" ? "ok" : "warn"}>WS {connection}</span>
-        <span className="mono" title={sync.cursor ?? ""}>
-          cursor {sync.cursor ? `${sync.cursor.slice(-12)}` : "—"}
-        </span>
-        <span>unsynced hints {sync.unsynced}</span>
-        {sync.error && <span className="error">{sync.error}</span>}
-      </footer>
-    </div>
-  );
-};
-
-/**
- * This PC's executor launchd service (README "Executor service"), polled every 10 s while shown. Stop only unloads it;
- * the next app start brings it back (permanent removal: `hive executor uninstall`).
- */
-const ExecutorPanel = () => {
-  const [status, setStatus] = useState<Record<string, unknown> | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [provider, setProvider] = useState<ExecutorProvider>("claude");
-  const [concurrency, setConcurrency] = useState(1);
-  const [busy, setBusy] = useState(false);
-  const show = (result: Awaited<ReturnType<typeof window.hive.executor.status>>) => {
-    if (result.ok) {
-      setStatus(result.value);
-      setError(null);
-    } else setError(`${result.error.code}: ${result.error.message}`);
-  };
-  const refresh = useCallback(async () => show(await window.hive.executor.status()), []);
-  useEffect(() => {
-    void window.hive.executor.status().then((result) => {
-      show(result);
-      // The form starts from what is installed.
-      if (!result.ok) return;
-      if (typeof result.value.provider === "string")
-        setProvider(result.value.provider as ExecutorProvider);
-      if (typeof result.value.concurrency === "number") setConcurrency(result.value.concurrency);
-    });
-    const timer = setInterval(() => void refresh(), 10_000);
-    return () => clearInterval(timer);
-  }, [refresh]);
-  const act = async (call: () => ReturnType<typeof window.hive.executor.stop>) => {
-    setBusy(true);
-    const result = await call();
-    setBusy(false);
-    if (!result.ok) return setError(`${result.error.code}: ${result.error.message}`);
-    await refresh();
-  };
-  const logs = status?.logs as { stdout?: string; stderr?: string } | undefined;
-  const state = !status
-    ? "—"
-    : !status.installed
-      ? "not installed"
-      : status.pid
-        ? `loaded, pid ${text(status.pid)}`
-        : `stopped, last exit code ${text(status.lastExitCode)}`;
-  return (
-    <section>
-      <h2>Executor</h2>
-      {status?.registered === false && (
-        <p className="warn">this device is not registered: run `hive device register`</p>
+      {panel && (
+        <BotPanel
+          ws={ws}
+          bot={panel}
+          devices={devices}
+          refreshDevices={refreshDevices}
+          close={() => setPanelBot(null)}
+        />
       )}
-      {error && <p className="error">{error}</p>}
-      <table>
-        <tbody>
-          <tr>
-            <th>State</th>
-            <td className={status?.pid ? "ok" : "warn"}>{state}</td>
-          </tr>
-          <tr>
-            <th>Installed</th>
-            <td>
-              {text(status?.provider)}, concurrency {text(status?.concurrency)}
-            </td>
-          </tr>
-          <tr>
-            <th>Program</th>
-            <td className="mono">
-              {Array.isArray(status?.program) ? text(status.program[0]) : "—"}
-            </td>
-          </tr>
-          <tr>
-            <th>Logs</th>
-            <td className="mono">
-              {text(logs?.stdout)}
-              <br />
-              {text(logs?.stderr)}
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <p>
-        <select
-          value={provider}
-          onChange={(e) => setProvider(e.target.value as ExecutorProvider)}
-          aria-label="Provider"
-        >
-          {(["fake", "claude", "codex"] as const).map((p) => (
-            <option key={p}>{p}</option>
-          ))}
-        </select>{" "}
-        <input
-          type="number"
-          min={1}
-          max={64}
-          value={concurrency}
-          onChange={(e) => setConcurrency(Number(e.target.value))}
-          aria-label="Concurrency"
-        />{" "}
-        <button
-          disabled={busy}
-          onClick={() => void act(() => window.hive.executor.start({ provider, concurrency }))}
-        >
-          Start
-        </button>{" "}
-        <button disabled={busy} onClick={() => void act(window.hive.executor.stop)}>
-          Stop
-        </button>
-      </p>
-    </section>
+    </div>
   );
 };
 
@@ -678,7 +639,7 @@ const ApprovalsView = (props: {
     return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
   };
   return (
-    <section>
+    <section className="view">
       <h2>Approvals</h2>
       {props.approvals.length === 0 && <p>No pending approvals.</p>}
       <table>
@@ -714,106 +675,6 @@ const ApprovalsView = (props: {
   );
 };
 
-type Operation = { operationId: string; jobId: string | null; error?: string };
-
-const ChannelView = (props: {
-  ws: string;
-  channels: Row[];
-  channelId: string;
-  setChannelId: (id: string) => void;
-  messages: Row[];
-  botId: string;
-  botPicker: React.ReactNode;
-}) => {
-  const [draft, setDraft] = useState("");
-  const [op, setOp] = useState<Operation | null>(null);
-
-  const send = async () => {
-    const operationId = crypto.randomUUID();
-    const result = await window.hive.api.command({
-      operationId,
-      idempotencyKey: crypto.randomUUID(),
-      workspaceId: props.ws,
-      command: {
-        type: "agent.send",
-        recipientBotId: props.botId,
-        channelId: props.channelId,
-        message: { kind: "request", text: draft },
-        delivery: "wake",
-      },
-    });
-    if (!result.ok) return setOp({ operationId, jobId: null, error: result.error.message });
-    setDraft("");
-    setOp({ operationId, jobId: null });
-    // Accepted is not started: the Job id appears once routing created it (§22.4). ponytail: polls 2 s for 10 min.
-    for (let i = 0; i < 300; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-      const res = await window.hive.api.get(`/v1/operations/${encodeURIComponent(operationId)}`);
-      if (res.ok && typeof res.value.jobId === "string")
-        return setOp({ operationId, jobId: res.value.jobId });
-    }
-  };
-
-  return (
-    <section className="split">
-      <ul className="list">
-        {props.channels.map((c) => (
-          <li key={c.id}>
-            <button
-              className={c.id === props.channelId ? "active" : ""}
-              onClick={() => props.setChannelId(c.id)}
-            >
-              # {text(c.name)}
-            </button>
-          </li>
-        ))}
-      </ul>
-      <div className="channel">
-        <ol className="messages">
-          {props.messages.map((m) => (
-            <li key={m.id}>
-              <span className="meta">
-                {text(m.createdAt)} <span className="mono">{text(m.actorId)}</span>
-              </span>
-              <div>{text(m.body)}</div>
-            </li>
-          ))}
-        </ol>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            void send();
-          }}
-        >
-          {props.botPicker}
-          <input
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder="Message the Bot"
-          />
-          <button disabled={!draft || !props.botId || !props.channelId}>Send</button>
-        </form>
-        {op && (
-          <p className="op">
-            operation <span className="mono">{op.operationId}</span>:{" "}
-            {op.error ??
-              (op.jobId ? (
-                <>
-                  job <span className="mono">{op.jobId}</span>
-                </>
-              ) : (
-                "accepted, routing pending"
-              ))}
-          </p>
-        )}
-      </div>
-    </section>
-  );
-};
-
-const failure = (result: { ok: false; error: { code: string; message: string } }) =>
-  `${result.error.code}: ${result.error.message}`;
-
 /**
  * Full-text search (§14). Results come from a lagging projection, so `indexedThrough` is shown (AT-32); a message hit
  * opens its channel.
@@ -830,7 +691,7 @@ const SearchView = (props: { ws: string; openChannel: (channelId: string) => voi
   };
   const hits = (result?.hits ?? []) as Row[];
   return (
-    <section>
+    <section className="view">
       <h2>Search</h2>
       <form
         onSubmit={(e) => {
@@ -903,7 +764,7 @@ const MemoryView = (props: { ws: string; channels: Row[]; bots: Row[] }) => {
     void load();
   };
   return (
-    <section>
+    <section className="view">
       <h2>
         Memory{" "}
         <select value={scope} onChange={(e) => setScope(e.target.value)} aria-label="Scope">
@@ -921,13 +782,7 @@ const MemoryView = (props: { ws: string; channels: Row[]; bots: Row[] }) => {
         </select>
       </h2>
       {error && <p className="error">{error}</p>}
-      <ul className="list">
-        {memories.map((m) => (
-          <li key={m.id}>
-            <span className="meta">{text(m.createdAt)}</span> {text(m.content)}
-          </li>
-        ))}
-      </ul>
+      <MemoryList memories={memories} />
       <form
         onSubmit={(e) => {
           e.preventDefault();

@@ -8,6 +8,9 @@ import {
   JobCancel,
   MemoryWrite,
   parse,
+  RoutinePause,
+  RoutineResume,
+  RoutineRun,
 } from "@hive/contracts";
 import * as v from "valibot";
 import type { ApiResult } from "../shared/api.ts";
@@ -25,7 +28,15 @@ export const ApiPath = v.pipe(
 );
 
 export const UiCommandSchema = commandEnvelope(
-  v.variant("type", [AgentSend, JobCancel, ApprovalResolve, MemoryWrite]),
+  v.variant("type", [
+    AgentSend,
+    JobCancel,
+    ApprovalResolve,
+    MemoryWrite,
+    RoutinePause,
+    RoutineResume,
+    RoutineRun,
+  ]),
 );
 
 const invalid = (issues: string[]): ApiResult => ({

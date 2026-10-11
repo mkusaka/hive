@@ -5,6 +5,9 @@ import type {
   commandEnvelope,
   JobCancel,
   MemoryWrite,
+  RoutinePause,
+  RoutineResume,
+  RoutineRun,
 } from "@hive/contracts";
 import type * as v from "valibot";
 
@@ -13,13 +16,21 @@ export type ApiResult =
   | { ok: true; value: Record<string, unknown> }
   | { ok: false; error: { code: string; message: string; body?: unknown } };
 
-/** The commands the UI sends today: agent.send, job.cancel, approval.resolve and memory.write. */
+/** The commands the UI sends today: agent.send, job.cancel, approval.resolve, memory.write and routine pause / resume / run. */
 export type UiCommand = v.InferInput<
   ReturnType<
     typeof commandEnvelope<
       v.VariantSchema<
         "type",
-        [typeof AgentSend, typeof JobCancel, typeof ApprovalResolve, typeof MemoryWrite],
+        [
+          typeof AgentSend,
+          typeof JobCancel,
+          typeof ApprovalResolve,
+          typeof MemoryWrite,
+          typeof RoutinePause,
+          typeof RoutineResume,
+          typeof RoutineRun,
+        ],
         undefined
       >
     >
@@ -41,6 +52,8 @@ export type HiveConfig = {
   /** No usable Access grant in the shared credentials file: show the Login button. */
   loginRequired: boolean;
   connection: "connected" | "reconnecting";
+  /** Dev only (`HIVE_OPEN_BOT`, unpackaged app): the Bot whose panel opens at start, for screenshots. */
+  openBot?: string;
 };
 
 export type ExecutorProvider = "fake" | "claude" | "codex";

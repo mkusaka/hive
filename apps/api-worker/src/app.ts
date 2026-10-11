@@ -442,7 +442,9 @@ export const createApp = ({
       }),
     ),
   );
-  app.get("/v1/routines", async (c) => c.json(await listRoutines(c.env.DB, workspaceParam(c))));
+  app.get("/v1/routines", async (c) =>
+    c.json(await listRoutines(c.env.DB, workspaceParam(c), c.req.query("botId"))),
+  );
   app.get("/v1/subscriptions", async (c) =>
     c.json(await listSubscriptions(c.env.DB, workspaceParam(c))),
   );

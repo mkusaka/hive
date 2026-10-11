@@ -41,7 +41,15 @@ describe("sync controller", () => {
       "/v1/sync/changes?workspaceId=ws-1&cursor=H0",
       "/v1/sync/changes?workspaceId=ws-1&cursor=C1",
     ]);
-    expect(h.refetched[1]).toEqual(["approvals", "bots", "devices", "inbox", "jobs", "messages"]);
+    expect(h.refetched[1]).toEqual([
+      "approvals",
+      "bots",
+      "channels",
+      "devices",
+      "inbox",
+      "jobs",
+      "messages",
+    ]);
     expect(h.statuses.at(-1)).toEqual({ cursor: "C2", unsynced: 0, error: null });
   });
 

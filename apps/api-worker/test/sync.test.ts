@@ -224,16 +224,32 @@ describe("bootstrap lists", () => {
     const s = await setup();
     const q = `workspaceId=${s.workspaceId}`;
     const get = async (path: string) => (await s.user.get(path)).json<Json>();
+    expect(await get(`/v1/channels?${q}`)).toEqual({
+      channels: [expect.objectContaining({ id: s.channelId, lastMessage: null })],
+    });
     const first = await (await s.user.command(s.send())).json<Json>();
     const { messageId, jobId } = await queuedJob(s);
+    const { userId } = await (await s.user.me()).json<{ userId: string }>();
 
-    expect(await get(`/v1/channels?${q}`)).toEqual({
-      channels: [expect.objectContaining({ id: s.channelId, name: "dev", role: "owner" })],
-    });
+    const { channels } = await get(`/v1/channels?${q}`);
+    expect(channels).toEqual([
+      expect.objectContaining({
+        id: s.channelId,
+        name: "dev",
+        role: "owner",
+        lastMessage: {
+          body: "check PR #123",
+          createdAt: expect.any(String),
+          actorId: expect.any(String),
+        },
+      }),
+    ]);
     expect(await get(`/v1/bots?${q}`)).toEqual({
       bots: [
         expect.objectContaining({
           id: s.botId,
+          actorId: expect.any(String),
+          instructions: expect.any(String),
           placementPolicy: expect.objectContaining({ mode: "any" }),
         }),
       ],
@@ -245,6 +261,14 @@ describe("bootstrap lists", () => {
     expect(jobs).toEqual([expect.objectContaining({ id: jobId, state: "queued" })]);
     const { messages } = await get(`/v1/channels/${s.channelId}/messages?${q}`);
     expect((messages as Json[]).map((m) => m.id)).toEqual([messageId, first.messageId]);
+    // The latest message is the user's own: its actor resolves to the caller's user id.
+    expect(messages).toEqual([
+      expect.objectContaining({
+        userId,
+        actorId: ((channels as Json[])[0]!.lastMessage as Json).actorId,
+      }),
+      expect.objectContaining({ userId }),
+    ]);
 
     const other = await outsider(s.workspaceId);
     expect(await (await other.get(`/v1/channels?${q}`)).json()).toEqual({ channels: [] });

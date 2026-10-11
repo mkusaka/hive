@@ -116,6 +116,31 @@ describe("IPC handlers", () => {
     expect(requests.map((r) => r.path)).toEqual([path, "/v1/commands"]);
   });
 
+  it("posts routine pause / resume / run and rejects other routine commands", async () => {
+    const { h, requests } = setup();
+    const accepted = await Promise.all(
+      ["routine.pause", "routine.resume", "routine.run"].map((type) =>
+        h.command({ ...envelope, command: { type, routineId: "r-1" } }),
+      ),
+    );
+    expect(accepted.map((r) => r.ok)).toEqual([true, true, true]);
+    const rejected = await Promise.all(
+      [
+        { type: "routine.pause", routineId: "" },
+        { type: "routine.run", routineId: "r-1", extra: 1 },
+        { type: "routine.create", botId: "bot-1", name: "x" },
+      ].map((command) => h.command({ ...envelope, command })),
+    );
+    for (const result of rejected) {
+      expect(result).toMatchObject({ ok: false, error: { code: "INVALID_ARGS" } });
+    }
+    expect(requests.map((r) => (r.body as { command: { type: string } }).command.type)).toEqual([
+      "routine.pause",
+      "routine.resume",
+      "routine.run",
+    ]);
+  });
+
   it("posts a valid agent.send envelope", async () => {
     const { h, requests } = setup();
     expect((await h.command(envelope)).ok).toBe(true);

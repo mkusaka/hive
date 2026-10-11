@@ -149,6 +149,18 @@ describe("routines", () => {
     expect(await occurrences()).toEqual([]);
   });
 
+  it("lists routines filtered by botId", async () => {
+    const { s, routineId } = await withRoutine();
+    const list = async (botId: string) =>
+      (
+        await (
+          await s.user.get(`/v1/routines?workspaceId=${s.workspaceId}&botId=${botId}`)
+        ).json<{ routines: { id: string }[] }>()
+      ).routines.map((r) => r.id);
+    expect(await list(s.botId)).toEqual([routineId]);
+    expect(await list("other-bot")).toEqual([]);
+  });
+
   it("routine.run creates an occurrence and Job at now through the same path; a replay creates nothing", async () => {
     const { s, routineId, occurrences } = await withRoutine();
     const request = envelope(s.workspaceId, { type: "routine.run", routineId });

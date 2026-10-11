@@ -52,6 +52,9 @@ describe("captureEnv", () => {
       }),
     ).toEqual({ PATH: "/usr/bin", HOME: "/Users/u", CLAUDE_CODE_OAUTH_TOKEN: "tok" });
   });
+  it("deduplicates PATH entries so repeated `bun run` starts render the same plist", () => {
+    expect(captureEnv({ PATH: "/a/.bin:/usr/bin:/a/.bin:/b" }).PATH).toBe("/a/.bin:/usr/bin:/b");
+  });
 });
 
 describe("renderPlist", () => {
