@@ -1,4 +1,4 @@
-// Channel topic (`channel.update`) and the members list (UI-03).
+// Channel topic (`channel.update`) and the members list (UI-03, strict since DM-01).
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { envelope, type Json, login, setup } from "./helpers.ts";
@@ -68,7 +68,7 @@ describe("channels", () => {
     expect(forbidden.status).toBe(403);
   });
 
-  it("lists members and actors that posted (role null), for members only", async () => {
+  it("lists members only (a Bot that posted is not one), for members only", async () => {
     const s = await setup();
     const bot = await db
       .prepare("SELECT actor_id FROM bots WHERE id = ?")
@@ -84,10 +84,6 @@ describe("channels", () => {
     const path = `/v1/channels/${s.channelId}/members?workspaceId=${s.workspaceId}`;
     const members = async () =>
       (await (await s.user.get(path)).json<{ members: Json[] }>()).members;
-    expect(await members()).toEqual([
-      expect.objectContaining({ kind: "user", role: "owner", botId: null }),
-    ]);
-
     await db
       .prepare(
         `INSERT INTO messages (id, workspace_id, conversation_id, seq, actor_id, client_message_id, body)
@@ -96,8 +92,7 @@ describe("channels", () => {
       .bind(crypto.randomUUID(), s.workspaceId, conversationId, bot!.actor_id, crypto.randomUUID())
       .run();
     expect(await members()).toEqual([
-      expect.objectContaining({ kind: "user", role: "owner" }),
-      expect.objectContaining({ kind: "bot", role: null, botId: s.botId, name: "coder" }),
+      expect.objectContaining({ kind: "user", role: "owner", botId: null }),
     ]);
     const other = await outsider(s.workspaceId);
     expect((await other.get(path)).status).toBe(404);

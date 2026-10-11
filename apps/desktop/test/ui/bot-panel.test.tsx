@@ -2,17 +2,24 @@
 import { screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { renderApp, sidebar } from "./fakeHive.ts";
+import { dms } from "./fixtures.ts";
 
-/** Opens coder's panel from its sidebar blob. */
+/** Opens coder's DM from its sidebar blob, then its panel from the DM header. */
 const openCoder = async () => {
-  const app = renderApp();
+  const app = renderApp({ get: { "/v1/dms": { dms } } });
   await app.user.click(await (await sidebar()).findByRole("button", { name: "coder" }));
+  const head = within(await waitForHead(app.container));
+  await app.user.click(head.getByRole("button", { name: "coder" }));
   const panel = within(app.container.querySelector<HTMLElement>(".panel")!);
   return { ...app, panel };
 };
+const waitForHead = async (container: HTMLElement) => {
+  await screen.findByPlaceholderText("Message coder");
+  return container.querySelector<HTMLElement>(".chat-head")!;
+};
 
 describe("bot panel", () => {
-  it("opens on the blob with instructions, tool policy and its routines", async () => {
+  it("opens from the DM header with instructions, tool policy and its routines", async () => {
     const { panel, hive } = await openCoder();
     expect(panel.getByRole("heading", { name: "coder" })).toBeTruthy();
     expect(panel.getByText("Write small diffs.")).toBeTruthy();

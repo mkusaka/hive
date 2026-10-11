@@ -22,6 +22,7 @@ export const App = () => {
   const [sync, setSync] = useState<SyncStatus>({ cursor: null, unsynced: 0, error: null });
 
   const [channels, setChannels] = useState<Row[]>([]);
+  const [dms, setDms] = useState<Row[]>([]);
   const [messages, setMessages] = useState<Row[]>([]);
   const [bots, setBots] = useState<Row[]>([]);
   const [inbox, setInbox] = useState<Row[]>([]);
@@ -29,6 +30,8 @@ export const App = () => {
   const [devices, setDevices] = useState<Row[]>([]);
   const [approvals, setApprovals] = useState<Row[]>([]);
   const [channelId, setChannelId] = useState("");
+  // The open DM's conversation id; it replaces the Channel in the conversation view while set.
+  const [dmId, setDmId] = useState<string | null>(null);
   const [botId, setBotId] = useState("");
   const [jobDetail, setJobDetail] = useState<Record<string, unknown> | null>(null);
   const [runId, setRunId] = useState("");
@@ -91,17 +94,18 @@ export const App = () => {
   };
 
   // Refetches run from sync callbacks, so they read the current selection through refs.
-  const selection = useRef({ channelId, botId, runId });
-  selection.current = { channelId, botId, runId };
+  const selection = useRef({ channelId, dmId, botId, runId });
+  selection.current = { channelId, dmId, botId, runId };
 
   const refetch = useCallback(async (keys: Set<ListKey>, ws: string) => {
-    const { channelId: ch, botId: bot, runId: inspected } = selection.current;
+    const { channelId: ch, dmId: dm, botId: bot, runId: inspected } = selection.current;
     const tasks: Promise<void>[] = [];
     if (keys.has("run") && inspected) tasks.push(inspect(inspected).then(setRun));
     const load = (key: ListKey, path: string | null, field: string, set: (rows: Row[]) => void) => {
       if (keys.has(key) && path) tasks.push(get(path).then((body) => set(body[field] as Row[])));
     };
     load("channels", inWorkspace("channels", ws), "channels", setChannels);
+    load("dms", inWorkspace("dms", ws), "dms", setDms);
     load("bots", inWorkspace("bots", ws), "bots", setBots);
     load("devices", inWorkspace("devices", ws), "devices", setDevices);
     load("jobs", inWorkspace("jobs", ws, { limit: "50" }), "jobs", setJobs);
@@ -112,9 +116,12 @@ export const App = () => {
       setApprovals,
     );
     // Newest first from the API, shown oldest first.
+    const conversation = dm
+      ? `conversations/${encodeURIComponent(dm)}`
+      : ch && `channels/${encodeURIComponent(ch)}`;
     load(
       "messages",
-      ch && inWorkspace(`channels/${encodeURIComponent(ch)}/messages`, ws),
+      conversation && inWorkspace(`${conversation}/messages`, ws),
       "messages",
       (rows) => setMessages(rows.toReversed()),
     );
@@ -213,6 +220,22 @@ export const App = () => {
       );
     });
   };
+  /** The Bot's DM: the listed one, else `dm.open` creates it (idempotent) and the list is re-read first. */
+  const openDm = async (id: string) => {
+    if (!config) return;
+    setView("channel");
+    const listed = dms.find((d) => d.botId === id);
+    if (listed) return setDmId(listed.id);
+    const res = await window.hive.api.command({
+      operationId: crypto.randomUUID(),
+      idempotencyKey: crypto.randomUUID(),
+      workspaceId: config.workspaceId,
+      command: { type: "dm.open", botId: id },
+    });
+    if (!res.ok) return setError(failure(res));
+    await refetch(new Set(["dms"]), config.workspaceId);
+    setDmId(String(res.value.conversationId));
+  };
   const refreshDevices = useCallback(() => {
     if (config) void refetch(new Set(["devices"]), config.workspaceId);
   }, [config, refetch]);
@@ -221,7 +244,7 @@ export const App = () => {
   useEffect(() => {
     if (config && !config.problem && !config.loginRequired && channelId)
       void refetch(new Set(["messages"]), config.workspaceId);
-  }, [config, channelId, refetch]);
+  }, [config, channelId, dmId, refetch]);
   useEffect(() => {
     if (config && !config.problem && !config.loginRequired && botId)
       void refetch(new Set(["inbox"]), config.workspaceId);
@@ -263,9 +286,14 @@ export const App = () => {
   const ws = config.workspaceId;
 
   const panelBotRow = panelBot ? bots.find((b) => b.id === panelBot) : undefined;
+  const dm = dmId ? dms.find((d) => d.id === dmId) : undefined;
   const channel = channels.find((c) => c.id === channelId);
   const botNames = new Map(bots.map((b) => [b.id, String(b.name)]));
-  const channelPanel = panel?.kind === "channel" && view === "channel" ? channel : undefined;
+  const channelPanel =
+    panel?.kind === "channel" && view === "channel" && !dmId ? channel : undefined;
+  const current = dmId
+    ? { kind: "dm" as const, id: dmId }
+    : { kind: "channel" as const, id: channelId };
 
   return (
     <div className={`app ${panelBotRow || channelPanel ? "with-panel" : ""}`}>
@@ -276,17 +304,18 @@ export const App = () => {
         collapsed={collapsed}
         toggleCollapsed={() => setCollapsed(!collapsed)}
         channels={channels}
+        dms={dms}
         bots={bots}
         names={botNames}
         view={view}
         setView={setView}
-        channelId={channelId}
+        current={current}
         openChannel={(id) => {
           setChannelId(id);
+          setDmId(null);
           setView("channel");
         }}
-        panelBot={panelBot}
-        openBot={openBot}
+        openDm={(id) => void openDm(id)}
         approvals={approvals.length}
       />
       <main>
@@ -294,7 +323,8 @@ export const App = () => {
         {view === "channel" && (
           <ChannelView
             ws={ws}
-            channel={channel}
+            channel={dmId ? dm : channel}
+            dm={dmId !== null}
             messages={messages}
             bots={bots}
             me={me}
@@ -303,10 +333,8 @@ export const App = () => {
               setPanel(channelPanel ? null : { kind: "channel", tab: "about" })
             }
             openChannelPanel={(tab) => setPanel({ kind: "channel", tab })}
-            starred={side.prefs.pinned.some((i) => i.kind === "channel" && i.id === channelId)}
-            toggleStar={() =>
-              updateSidebar(togglePin(side.prefs, { kind: "channel", id: channelId }))
-            }
+            starred={side.prefs.pinned.some((i) => i.kind === current.kind && i.id === current.id)}
+            toggleStar={() => updateSidebar(togglePin(side.prefs, current))}
           />
         )}
         {view === "inbox" && (
@@ -417,6 +445,7 @@ export const App = () => {
             ws={ws}
             openChannel={(id) => {
               setChannelId(id);
+              setDmId(null);
               setView("channel");
             }}
           />

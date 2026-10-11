@@ -51,6 +51,9 @@ export const userPrompt = ({
 }: LaunchContext["context"]) => {
   const parts: string[] = [];
   if (task) parts.push(`Task ${task.key}: ${task.title}\n${task.description}`.trim());
+  if (conversation?.counterpart) {
+    parts.push(`Direct message with user ${conversation.counterpart.name}.`);
+  }
   if (conversation?.recent.length) {
     const lines = conversation.recent.map((m) => `[${m.actorKind} ${m.actorId}] ${m.body}`);
     parts.push(`Recent conversation:\n${lines.join("\n")}`);

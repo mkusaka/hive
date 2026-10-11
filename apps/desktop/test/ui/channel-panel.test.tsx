@@ -40,10 +40,31 @@ describe("channel panel", () => {
     const { panel, user, container } = await openGeneral();
     await user.click(panel.getByRole("tab", { name: "Members" }));
     expect(await panel.findByText("Mina (you)")).toBeTruthy();
-    expect(panel.getByText("posted, not a member")).toBeTruthy();
-    await user.click(panel.getByRole("button", { name: /coder/ }));
+    await user.click(panel.getByRole("button", { name: "coder" }));
     const botPanel = within(container.querySelector<HTMLElement>(".panel")!);
     expect(await botPanel.findByText("Write small diffs.")).toBeTruthy();
+  });
+
+  it("Add bot lists non-member Bots and sends channel.join; a Bot's menu sends channel.leave", async () => {
+    const { panel, user, hive } = await openGeneral();
+    await user.click(panel.getByRole("tab", { name: "Members" }));
+    await user.click(await panel.findByRole("button", { name: "Add bot" }));
+    // The blob's letter, then the name.
+    expect(screen.getAllByRole("menuitem").map((b) => b.textContent)).toEqual(["R reviewer"]);
+    await user.click(screen.getByRole("menuitem", { name: /reviewer/ }));
+    await user.click(panel.getByRole("button", { name: "coder actions" }));
+    await user.click(screen.getByRole("menuitem", { name: "Remove from channel" }));
+    expect([...hive.sent("channel.join"), ...hive.sent("channel.leave")]).toEqual([
+      { workspaceId: "ws-1", command: { type: "channel.join", channelId: "ch-1", botId: "bot-2" } },
+      {
+        workspaceId: "ws-1",
+        command: { type: "channel.leave", channelId: "ch-1", botId: "bot-1" },
+      },
+    ]);
+    // Re-read after each change.
+    expect(
+      hive.calls.get.filter((p) => p.startsWith("/v1/channels/ch-1/members")).length,
+    ).toBeGreaterThanOrEqual(3);
   });
 
   it("creates a routine in the channel's conversation", async () => {

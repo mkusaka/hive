@@ -2,8 +2,11 @@
 import type {
   AgentSend,
   ApprovalResolve,
+  ChannelJoin,
+  ChannelLeave,
   ChannelUpdate,
   commandEnvelope,
+  DmOpen,
   JobCancel,
   MemoryWrite,
   MessagePost,
@@ -22,7 +25,7 @@ export type ApiResult =
   | { ok: true; value: Record<string, unknown> }
   | { ok: false; error: { code: string; message: string; body?: unknown } };
 
-/** The commands the UI sends today: message.post, agent.send, job.cancel, approval.resolve, memory.write, channel.update, the routine commands and sidebar.update. */
+/** The commands the UI sends today: message.post, agent.send, job.cancel, approval.resolve, memory.write, channel.update / join / leave, dm.open, the routine commands and sidebar.update. */
 export type UiCommand = v.InferInput<
   ReturnType<
     typeof commandEnvelope<
@@ -35,6 +38,9 @@ export type UiCommand = v.InferInput<
           typeof ApprovalResolve,
           typeof MemoryWrite,
           typeof ChannelUpdate,
+          typeof ChannelJoin,
+          typeof ChannelLeave,
+          typeof DmOpen,
           typeof RoutineCreate,
           typeof RoutineUpdate,
           typeof RoutineDelete,

@@ -1,5 +1,5 @@
 // The Slack-style sidebar (UI-04): workspace name, "Find a conversation…", the view rows, then Starred (pinned),
-// the user's groups, Channels, Bots and Hidden. Pinned / hidden / groups are the user's `sidebar_prefs` document on
+// the user's groups, Channels, Direct messages, Bots and Hidden. Pinned / hidden / groups are the user's `sidebar_prefs` document on
 // the server; section collapse is local (localStorage).
 import type { SidebarPrefs } from "@hive/contracts";
 import { useCallback, useRef, useState, type DragEvent, type ReactNode } from "react";
@@ -66,14 +66,17 @@ export const Sidebar = (props: {
   collapsed: boolean;
   toggleCollapsed: () => void;
   channels: Row[];
+  /** The user's DMs (`id` = conversation id, `botId`, `name` = the Bot's). */
+  dms: Row[];
   bots: Row[];
   names: Names;
   view: View;
   setView: (view: View) => void;
-  channelId: string;
+  /** The open conversation: a Channel or a DM. */
+  current: { kind: "channel" | "dm"; id: string };
   openChannel: (id: string) => void;
-  panelBot: string | null;
-  openBot: (id: string | null) => void;
+  /** Opens (or creates) the Bot's DM: a Bot or DM row was clicked. */
+  openDm: (botId: string) => void;
   approvals: number;
 }) => {
   const { prefs, collapsed } = props;
@@ -96,6 +99,7 @@ export const Sidebar = (props: {
 
   const rows = new Map<string, Row>([
     ...props.channels.map((c) => [`channel:${c.id}`, c] as const),
+    ...props.dms.map((d) => [`dm:${d.id}`, d] as const),
     ...props.bots.map((b) => [`bot:${b.id}`, b] as const),
   ]);
   const needle = query.trim().toLowerCase();
@@ -129,10 +133,14 @@ export const Sidebar = (props: {
     const row = rows.get(`${item.kind}:${item.id}`)!;
     const name = text(row.name);
     const label = item.kind === "channel" ? `# ${name}` : name;
+    const botId = item.kind === "dm" ? String(row.botId) : item.id;
+    const { current } = props;
+    const open = rows.get(`${current.kind}:${current.id}`);
     const active =
-      item.kind === "channel"
-        ? props.view === "channel" && item.id === props.channelId
-        : item.id === props.panelBot;
+      props.view === "channel" &&
+      (item.kind === "bot"
+        ? current.kind === "dm" && open?.botId === item.id
+        : item.kind === current.kind && item.id === current.id);
     const last = row.lastMessage as { body: string } | null | undefined;
     return (
       <li
@@ -151,16 +159,18 @@ export const Sidebar = (props: {
           {...(collapsed ? { "data-tip": label } : {})}
           {...(item.kind === "bot" ? { "aria-label": name } : {})}
           onClick={() =>
-            item.kind === "channel"
-              ? props.openChannel(item.id)
-              : props.openBot(item.id === props.panelBot ? null : item.id)
+            item.kind === "channel" ? props.openChannel(item.id) : props.openDm(botId)
           }
         >
-          <Avatar id={item.id} name={String(row.name)} size={collapsed ? 36 : 32} />
+          <Avatar
+            id={item.kind === "channel" ? item.id : botId}
+            name={String(row.name)}
+            size={collapsed ? 36 : 32}
+          />
           {!collapsed && (
             <span className="conv-text">
               <span className="ellipsis">{label}</span>
-              {item.kind === "channel" && (
+              {item.kind !== "bot" && (
                 <span className="preview ellipsis">
                   {last ? (
                     <Inlines
@@ -300,6 +310,7 @@ export const Sidebar = (props: {
           }),
         )}
         {section("channels", "Channels", loose("channel", props.channels))}
+        {section("dms", "Direct messages", loose("dm", props.dms))}
         {section("bots", "Bots", loose("bot", props.bots))}
         {!collapsed && section("hidden", `Hidden (${hidden.length})`, hidden, { fallback: true })}
       </div>

@@ -5,6 +5,7 @@ import type { ApiResult } from "../../shared/api.ts";
 /** `run`: the Run open in the Run Inspector (state, persistence, transcript). */
 export type ListKey =
   | "channels"
+  | "dms"
   | "messages"
   | "inbox"
   | "jobs"
@@ -15,6 +16,7 @@ export type ListKey =
   | "run";
 export const allLists: ListKey[] = [
   "channels",
+  "dms",
   "messages",
   "inbox",
   "jobs",
@@ -28,16 +30,16 @@ export const allLists: ListKey[] = [
 type Change = { scope: string; entityKind: string };
 
 /**
- * `channel:*` → messages / inbox and the channel list (its `lastMessage` previews); `workspace:*` → jobs / bots /
- * devices / approvals / sidebar (and the inspected Run for a `run` or `effect` row).
+ * `channel:*` (a DM's too) → messages / inbox and the channel and DM lists (their `lastMessage` previews);
+ * `workspace:*` → jobs / bots / devices / approvals / sidebar / DMs (and the inspected Run for a `run` or `effect` row).
  */
 export const refetchFor = (changes: Change[]) => {
   const keys = new Set<ListKey>();
   for (const { scope, entityKind } of changes) {
     if (scope.startsWith("channel:")) {
-      keys.add("messages").add("inbox").add("channels");
+      keys.add("messages").add("inbox").add("channels").add("dms");
     } else if (scope.startsWith("workspace:")) {
-      keys.add("jobs").add("bots").add("devices").add("approvals").add("sidebar");
+      keys.add("jobs").add("bots").add("devices").add("approvals").add("sidebar").add("dms");
       if (entityKind === "run" || entityKind === "effect") keys.add("run");
     }
   }

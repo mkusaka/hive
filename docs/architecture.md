@@ -434,6 +434,21 @@ Bot; no mention = only posted. A token naming no Bot of the Workspace, or `menti
 The run context renders tokens as `@<bot name>` (`@unknown` for a missing Bot). `agent.send` stays for the CLI,
 bot-to-bot and integrations.
 
+Implemented as (DM-01): Slack's two conversation kinds. **Channels** have members, and Bots are real members:
+`channel.join` / `channel.leave {channelId, botId}` (callers must be members; `channel` change row), and a
+`message.post` mentioning a non-member Bot adds it in the same batch (one `INSERT … SELECT FROM json_each`, one
+`channel` change row). Membership never routes: a member Bot wakes only when mentioned or sent to. **Direct messages**
+are `conversations.kind = 'dm'` with `dm_user_id` + `dm_bot_id` (migration 0021, partial UNIQUE on
+`(workspace_id, dm_user_id, dm_bot_id) WHERE kind = 'dm'`). Like a bot pair, a DM is backed by a member-less Channel
+row sharing its id `dm-<userId>-<botId>` (`channel_id` is NOT NULL and the table cannot be rebuilt on D1), so it is
+in no channel list, and lane, change scope (`channel:<id>`, added to its user's permitted scopes), search and reply
+gating work unchanged. `dm.open {botId}` is idempotent (deterministic id, `ON CONFLICT DO NOTHING`; `dm` change row
+in `workspace:<ws>`). `message.post {conversationId}` in a DM always delivers to the DM's Bot (one wake; a mention of
+another Bot is 422); `GET /v1/dms` and `GET /v1/conversations/:id/messages` are the DM user's only. The run context
+has `conversation.kind = 'dm'` and the user as `counterpart`; the executor posts the final text in a DM as in a
+Channel. Memory needs no new scope: the `channel` scope with the DM's id is the DM's memory (the Run's own channel,
+or a user who is the DM's user). Routines and subscriptions may target a DM conversation.
+
 ### 7.3 Concurrency (§10.3)
 
 - At most one external model turn per ProviderBinding. Background Runs may use separate Bindings per Task / lane.

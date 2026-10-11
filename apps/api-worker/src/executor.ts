@@ -567,7 +567,7 @@ export const getRunContext = async (
       item_id: string | null;
       conversation_id: string | null;
       channel_id: string | null;
-      conversation_kind: "channel" | "bot_pair" | null;
+      conversation_kind: "channel" | "bot_pair" | "dm" | null;
       message_id: string | null;
       message_kind: string | null;
       from_bot_id: string | null;
@@ -599,7 +599,7 @@ export const getRunContext = async (
         id: string;
         conversation_id: string | null;
         channel_id: string | null;
-        kind: "channel" | "bot_pair";
+        kind: "channel" | "bot_pair" | "dm";
         body: string;
       }>();
     batch = { id: row.inbox_batch_id, items: results.map(({ id, body }) => ({ id, body })) };
@@ -619,10 +619,23 @@ export const getRunContext = async (
       )
       .bind(workspaceId, row.conversation_id)
       .all<NonNullable<RunContext["conversation"]>["recent"][number]>();
+    // A DM's counterpart: its user's actor.
+    const counterpart =
+      row.conversation_kind === "dm"
+        ? await db
+            .prepare(
+              `SELECT a.id AS actorId, a.display_name AS name FROM conversations c
+                 JOIN actors a ON a.workspace_id = c.workspace_id AND a.user_id = c.dm_user_id
+                WHERE c.workspace_id = ? AND c.id = ?`,
+            )
+            .bind(workspaceId, row.conversation_id)
+            .first<{ actorId: string; name: string }>()
+        : null;
     conversation = {
       id: row.conversation_id,
       channelId: row.channel_id,
       kind: row.conversation_kind ?? "channel",
+      counterpart,
       recent: results,
     };
   }

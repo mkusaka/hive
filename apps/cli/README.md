@@ -18,6 +18,9 @@ hive device register --name <n> --os <os> --agent-version <v>
                                                        # prints the token once, stores it for `executor run`
 hive channel create --name <name>
 hive channel update <channel-id> --topic <text>     # members only; "" clears it
+hive channel join <channel-id> --bot <bot-id>       # add a Bot member (members only); channel leave removes it
+hive dm open <bot-id>                                 # {conversationId} of your DM with the Bot (created once)
+hive dm list                                          # your DMs with botId, name, lastMessage
 hive bot create --name <name> [--instructions <text> | --instructions-file <path|->]
                 [--tools <Tool=allow|ask|deny,...>] [--effects <slack.post|github.comment=allow|ask|deny,...>]
                 [--cwd-mode run_scratch|environment] [placement flags]
@@ -36,7 +39,7 @@ hive memory write --scope <workspace|channel:<id>|project:<id>|bot:<id>|task:<id
 hive memory list --scope <...>                         # live memories of the scope, newest first
 hive memory delete <memory-id> [--revision <n>]        # tombstone; a live memory is at revision 1
 hive agent send <bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]
-hive message post --channel <channel-id> --text <text> [--resolve-names]  # <@bot:ID> wakes that Bot; --resolve-names maps @name
+hive message post (--channel <channel-id> | --conversation <dm-id>) --text <text> [--resolve-names]  # <@bot:ID> wakes that Bot (a DM always wakes its Bot); --resolve-names maps @name
 hive event emit <type> [--data-file <path|->] [--subject <kind:id>]
 hive op get <operation-id>
 hive run get <run-id>                                  # state, persistence (pending|complete), transcript parts, git

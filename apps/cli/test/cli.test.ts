@@ -101,6 +101,19 @@ describe("argv → request", () => {
     ]);
   });
 
+  it("dm open, message post --conversation and channel join send their commands", async () => {
+    const h = harness(() => Response.json({ ok: true }));
+    expect(await h.hive("dm", "open", "b-1")).toBe(0);
+    expect(await h.hive("message", "post", "--conversation", "dm-1", "--text", "hi")).toBe(0);
+    expect(await h.hive("channel", "join", "ch-1", "--bot", "b-1")).toBe(0);
+    expect(await h.hive("message", "post", "--text", "hi")).not.toBe(0);
+    expect(h.calls.map((c) => (c.body as { command: unknown }).command)).toEqual([
+      { type: "dm.open", botId: "b-1" },
+      { type: "message.post", conversationId: "dm-1", text: "hi" },
+      { type: "channel.join", channelId: "ch-1", botId: "b-1" },
+    ]);
+  });
+
   it("agent send builds the command envelope with the Access assertion", async () => {
     const h = harness();
     const code = await h.hive(

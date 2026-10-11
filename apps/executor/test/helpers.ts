@@ -21,6 +21,7 @@ export const context: RunContext = {
     id: "conv-1",
     channelId: "chan-1",
     kind: "channel",
+    counterpart: null,
     recent: [{ actorKind: "user", actorId: "actor-1", body: "Say hello.", createdAt: "" }],
   },
   inboxItem: {

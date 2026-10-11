@@ -467,16 +467,30 @@ const specs: Record<string, Spec> = {
     },
   },
   "message post": {
-    usage: "--channel <channel-id> --text <text with <@bot:ID> tokens> [--resolve-names]",
-    options: { channel: str, text: str, "resolve-names": flag },
-    run: async (c) =>
+    usage:
+      "(--channel <channel-id> | --conversation <dm-conversation-id>) --text <text with <@bot:ID> tokens> [--resolve-names]",
+    options: { channel: str, conversation: str, text: str, "resolve-names": flag },
+    run: async (c) => {
+      const { channel, conversation } = c.values as { channel?: string; conversation?: string };
+      if ((channel === undefined) === (conversation === undefined))
+        throw invalid("exactly one of --channel / --conversation is required");
       c.print(
         await cmd.messagePost(c.client(), c.envelope(), {
-          channelId: need(c.values, "channel"),
+          target: channel ? { channelId: channel } : { conversationId: conversation! },
           text: need(c.values, "text"),
           resolveNames: c.values["resolve-names"] === true,
         }),
-      ),
+      );
+    },
+  },
+  "dm open": {
+    usage: "<bot-id>",
+    args: 1,
+    run: async (c) => c.print(await cmd.dmOpen(c.client(), c.envelope(), c.args[0]!)),
+  },
+  "dm list": {
+    usage: "",
+    run: async (c) => c.print(await cmd.listDms(c.client(), c.workspace())),
   },
   "event emit": {
     usage: "<type> [--data-file <path|->] [--subject <kind:id>]",
@@ -556,6 +570,36 @@ const specs: Record<string, Spec> = {
     run: async (c) =>
       c.print(
         await cmd.channelUpdate(c.client(), c.envelope(), c.args[0]!, need(c.values, "topic")),
+      ),
+  },
+  "channel join": {
+    usage: "<channel-id> --bot <bot-id>",
+    args: 1,
+    options: { bot: str },
+    run: async (c) =>
+      c.print(
+        await cmd.channelMembership(
+          c.client(),
+          c.envelope(),
+          "channel.join",
+          c.args[0]!,
+          need(c.values, "bot"),
+        ),
+      ),
+  },
+  "channel leave": {
+    usage: "<channel-id> --bot <bot-id>",
+    args: 1,
+    options: { bot: str },
+    run: async (c) =>
+      c.print(
+        await cmd.channelMembership(
+          c.client(),
+          c.envelope(),
+          "channel.leave",
+          c.args[0]!,
+          need(c.values, "bot"),
+        ),
       ),
   },
   "channel list": {

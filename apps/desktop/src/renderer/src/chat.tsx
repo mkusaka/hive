@@ -1,4 +1,5 @@
 // The Channel conversation: header (star, name pill, topic, member count, "…"), day sections with sticky date pills, Markdown bubbles and the composer (message.post with @mentions).
+// A DM uses the same view: its header is the Bot (opens the Bot panel) and every message goes to that Bot.
 /* oxlint-disable no-await-in-loop */
 import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { type Inline, parseMarkdown } from "./format.ts";
@@ -93,7 +94,9 @@ const withTokens = (draft: string, picked: Names) =>
 
 export const ChannelView = (props: {
   ws: string;
+  /** The Channel, or with `dm` the DM row (`id` = conversation id, `botId`, `name`). */
   channel: Row | undefined;
+  dm: boolean;
   messages: Row[];
   bots: Row[];
   me: string | null;
@@ -127,7 +130,9 @@ export const ChannelView = (props: {
   const botByActor = new Map(props.bots.map((b) => [String(b.actorId), b]));
   const names: Names = new Map(props.bots.map((b) => [b.id, String(b.name)]));
   // The `@prefix` right before the caret opens the popup.
-  const typed = dismissed === draft ? null : /(?:^|\s)@([^\s@]*)$/.exec(draft.slice(0, caret));
+  // No popup in a DM: its Bot is the recipient.
+  const typed =
+    props.dm || dismissed === draft ? null : /(?:^|\s)@([^\s@]*)$/.exec(draft.slice(0, caret));
   const query = typed?.[1]?.toLowerCase() ?? "";
   const matches = typed
     ? props.bots.filter((b) => String(b.name).toLowerCase().startsWith(query))
@@ -163,7 +168,7 @@ export const ChannelView = (props: {
       workspaceId: props.ws,
       command: {
         type: "message.post",
-        channelId: props.channel.id,
+        ...(props.dm ? { conversationId: props.channel.id } : { channelId: props.channel.id }),
         text: withTokens(draft, picked.current),
       },
     });
@@ -185,40 +190,52 @@ export const ChannelView = (props: {
 
   if (!props.channel) return <div className="empty">No channel yet.</div>;
   const name = text(props.channel.name);
+  const title = props.dm ? name : `#${name}`;
   const memberCount = Number(props.channel.memberCount ?? 0);
+  const dmBot = String(props.channel.botId);
   return (
     <div className="chat">
       <header className="chat-head">
         <button
           className={`icon star ${props.starred ? "starred" : ""}`}
-          aria-label={props.starred ? `Unstar #${name}` : `Star #${name}`}
+          aria-label={props.starred ? `Unstar ${title}` : `Star ${title}`}
           aria-pressed={props.starred}
           onClick={props.toggleStar}
         >
           <Icon name="star" />
         </button>
-        <div className="head-name">
-          <button className="pill" onClick={props.toggleChannelPanel}>
-            <span className="hash">#</span> {name}
-          </button>
-          {props.channel.topic ? (
-            <span className="topic-line ellipsis">{text(props.channel.topic)}</span>
-          ) : null}
-        </div>
-        <button
-          className="members-button"
-          aria-label={`${memberCount} ${memberCount === 1 ? "member" : "members"}`}
-          onClick={() => props.openChannelPanel("members")}
-        >
-          <Icon name="users" /> {memberCount}
-        </button>
-        <button
-          className="icon"
-          aria-label="Channel details"
-          onClick={() => props.openChannelPanel("about")}
-        >
-          <Icon name="more" />
-        </button>
+        {props.dm ? (
+          <div className="head-name">
+            <button className="pill" onClick={() => props.openBot(dmBot)}>
+              <Avatar id={dmBot} name={name} size={20} /> {name}
+            </button>
+          </div>
+        ) : (
+          <>
+            <div className="head-name">
+              <button className="pill" onClick={props.toggleChannelPanel}>
+                <span className="hash">#</span> {name}
+              </button>
+              {props.channel.topic ? (
+                <span className="topic-line ellipsis">{text(props.channel.topic)}</span>
+              ) : null}
+            </div>
+            <button
+              className="members-button"
+              aria-label={`${memberCount} ${memberCount === 1 ? "member" : "members"}`}
+              onClick={() => props.openChannelPanel("members")}
+            >
+              <Icon name="users" /> {memberCount}
+            </button>
+            <button
+              className="icon"
+              aria-label="Channel details"
+              onClick={() => props.openChannelPanel("about")}
+            >
+              <Icon name="more" />
+            </button>
+          </>
+        )}
       </header>
       <div className="scroll">
         <p className="subtitle">
@@ -329,7 +346,7 @@ export const ChannelView = (props: {
               void send();
             }
           }}
-          placeholder={`Message #${text(props.channel.name)}`}
+          placeholder={`Message ${title}`}
           aria-label="Message"
         />
         <button className="send" aria-label="Send" disabled={!draft.trim()}>

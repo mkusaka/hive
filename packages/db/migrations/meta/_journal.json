@@ -148,6 +148,13 @@
       "when": 1791737465173,
       "tag": "0020_sidebar_prefs",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1791738920087,
+      "tag": "0021_direct_messages",
+      "breakpoints": true
     }
   ]
 }

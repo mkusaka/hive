@@ -169,10 +169,7 @@ export const getSidebar = async (db: D1Database, workspaceId: string, userId: st
   };
 };
 
-/**
- * The Channel's members (role `owner` / `member`) and the actors that posted in it without being members (role null,
- * e.g. a Bot replying through its Inbox). Bots carry `botId` and their current name. Callers must be members.
- */
+/** The Channel's members (role `owner` / `member`); Bots carry `botId` and their current name. Callers must be members. */
 export const listChannelMembers = async (
   db: D1Database,
   input: { workspaceId: string; userId: string; channelId: string },
@@ -190,19 +187,33 @@ export const listChannelMembers = async (
     .prepare(
       `SELECT a.id AS actorId, a.kind, COALESCE(b.name, a.display_name) AS name, a.user_id AS userId,
               b.id AS botId, m.role
-         FROM actors a
-         LEFT JOIN channel_members m
-           ON m.workspace_id = a.workspace_id AND m.channel_id = ? AND m.actor_id = a.id
+         FROM channel_members m
+         JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
          LEFT JOIN bots b ON b.workspace_id = a.workspace_id AND b.actor_id = a.id
-        WHERE a.workspace_id = ? AND (m.actor_id IS NOT NULL OR EXISTS (
-                SELECT 1 FROM messages msg JOIN conversations c
-                    ON c.workspace_id = msg.workspace_id AND c.id = msg.conversation_id
-                 WHERE msg.workspace_id = a.workspace_id AND msg.actor_id = a.id AND c.channel_id = ?))
-        ORDER BY m.role IS NULL, a.kind DESC, name LIMIT 500`,
+        WHERE m.workspace_id = ? AND m.channel_id = ?
+        ORDER BY a.kind DESC, name LIMIT 500`,
     )
-    .bind(input.channelId, input.workspaceId, input.channelId)
+    .bind(input.workspaceId, input.channelId)
     .all();
   return { members: results };
+};
+
+/** The caller's DMs by Bot name: `id` = `conversationId`, the Bot (`botId`, `name`) and `lastMessage` like a channel. */
+export const listDms = async (db: D1Database, workspaceId: string, userId: string) => {
+  const { results } = await db
+    .prepare(
+      `SELECT c.id, c.id AS conversationId, b.id AS botId, b.name, c.created_at AS createdAt,
+              (SELECT json_object('body', lm.body, 'createdAt', lm.created_at, 'actorId', lm.actor_id)
+                 FROM messages lm WHERE lm.workspace_id = c.workspace_id AND lm.conversation_id = c.id
+                ORDER BY lm.seq DESC LIMIT 1) AS lastMessage
+         FROM conversations c JOIN bots b ON b.workspace_id = c.workspace_id AND b.id = c.dm_bot_id
+        WHERE c.workspace_id = ? AND c.kind = 'dm' AND c.dm_user_id = ?
+        ORDER BY b.name LIMIT 500`,
+    )
+    .bind(workspaceId, userId)
+    .all<{ lastMessage: string | null }>();
+  for (const dm of results) dm.lastMessage = dm.lastMessage && JSON.parse(dm.lastMessage);
+  return { dms: results };
 };
 
 export const listBots = async (db: D1Database, workspaceId: string) => {
@@ -305,31 +316,44 @@ export const listJobs = async (
   return { jobs: results };
 };
 
-/** Newest first, from the channel's main conversation; channel membership required (404 otherwise). */
+/**
+ * Newest first, from a channel's main conversation (`channelId`, members only) or a DM (`conversationId`, its user
+ * only); 404 otherwise.
+ */
 export const listMessages = async (
   db: D1Database,
-  input: { workspaceId: string; userId: string; channelId: string; limit: number },
+  input: { workspaceId: string; userId: string; limit: number } & (
+    | { channelId: string }
+    | { conversationId: string }
+  ),
 ) => {
-  const member = await db
-    .prepare(
-      `SELECT 1 FROM channel_members m
-         JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-        WHERE m.workspace_id = ? AND m.channel_id = ? AND a.user_id = ?`,
-    )
-    .bind(input.workspaceId, input.channelId, input.userId)
-    .first();
-  if (!member) throw notFound("channel");
+  const conversation = await (
+    "channelId" in input
+      ? db
+          .prepare(
+            `SELECT c.id FROM conversations c
+             JOIN channel_members m ON m.workspace_id = c.workspace_id AND m.channel_id = c.channel_id
+             JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+            WHERE c.workspace_id = ? AND c.channel_id = ? AND a.user_id = ?`,
+          )
+          .bind(input.workspaceId, input.channelId, input.userId)
+      : db
+          .prepare(
+            "SELECT id FROM conversations WHERE workspace_id = ? AND id = ? AND kind = 'dm' AND dm_user_id = ?",
+          )
+          .bind(input.workspaceId, input.conversationId, input.userId)
+  ).first<{ id: string }>();
+  if (!conversation) throw notFound("channelId" in input ? "channel" : "conversation");
   const { results } = await db
     .prepare(
       `SELECT m.id, m.conversation_id AS conversationId, m.seq, m.actor_id AS actorId, a.user_id AS userId, m.body,
               m.created_at AS createdAt
          FROM messages m
          LEFT JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-         JOIN conversations c ON c.workspace_id = m.workspace_id AND c.id = m.conversation_id
-        WHERE c.workspace_id = ? AND c.channel_id = ?
+        WHERE m.workspace_id = ? AND m.conversation_id = ?
         ORDER BY m.seq DESC LIMIT ?`,
     )
-    .bind(input.workspaceId, input.channelId, input.limit)
+    .bind(input.workspaceId, conversation.id, input.limit)
     .all();
   return { messages: results };
 };

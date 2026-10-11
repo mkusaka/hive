@@ -9,11 +9,14 @@ import {
   BotCreate,
   BotUpdate,
   ChannelCreate,
+  ChannelJoin,
+  ChannelLeave,
   ChannelUpdate,
   commandEnvelope,
   DeviceEnvironmentRegister,
   DeviceRegister,
   DeviceRevoke,
+  DmOpen,
   EffectPrepare,
   EffectResolve,
   EventEmit,
@@ -90,6 +93,9 @@ export const CommandEnvelope = commandEnvelope(
     DeviceEnvironmentRegister,
     ChannelCreate,
     ChannelUpdate,
+    ChannelJoin,
+    ChannelLeave,
+    DmOpen,
     BotCreate,
     BotUpdate,
     AgentSend,
@@ -388,6 +394,87 @@ const channelUpdate: Handler<v.InferOutput<typeof ChannelUpdate>> = async (db, u
   );
 };
 
+/** The Bot's actor; 404 when the Workspace has no such Bot. */
+const botActorId = async (db: D1Database, workspaceId: string, botId: string) => {
+  const bot = await db
+    .prepare("SELECT actor_id FROM bots WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, botId)
+    .first<{ actor_id: string }>();
+  if (!bot) throw new HttpError("NOT_FOUND", "bot not found");
+  return bot.actor_id;
+};
+
+/** channel.join / channel.leave: a member adds or removes a Bot. Joining twice or leaving as a non-member is a no-op. */
+const channelMembership =
+  (join: boolean): Handler<v.InferOutput<typeof ChannelJoin | typeof ChannelLeave>> =>
+  async (db, user, env) => {
+    const { workspaceId, command } = env;
+    await channelMember(db, workspaceId, command.channelId, user.userId);
+    const actorId = await botActorId(db, workspaceId, command.botId);
+    return receipt(
+      db,
+      user.userId,
+      env,
+      [
+        join
+          ? db
+              .prepare(
+                `INSERT INTO channel_members (workspace_id, channel_id, actor_id, role) VALUES (?, ?, ?, 'member')
+                 ON CONFLICT DO NOTHING`,
+              )
+              .bind(workspaceId, command.channelId, actorId)
+          : db
+              .prepare(
+                "DELETE FROM channel_members WHERE workspace_id = ? AND channel_id = ? AND actor_id = ?",
+              )
+              .bind(workspaceId, command.channelId, actorId),
+      ],
+      {
+        operationId: env.operationId,
+        status: "accepted",
+        channelId: command.channelId,
+        botId: command.botId,
+      },
+      [
+        {
+          entityKind: "channel",
+          entityId: command.channelId,
+          scope: `channel:${command.channelId}`,
+        },
+      ],
+    );
+  };
+
+/** A DM and its member-less backing Channel share this id (schema.ts); deterministic, so concurrent opens agree. */
+const dmId = (userId: string, botId: string) => `dm-${userId}-${botId}`;
+
+/** Idempotent: the caller's DM with the Bot, created on first open. */
+const dmOpen: Handler<v.InferOutput<typeof DmOpen>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  await botActorId(db, workspaceId, command.botId);
+  const conversationId = dmId(user.userId, command.botId);
+  return receipt(
+    db,
+    user.userId,
+    env,
+    [
+      db
+        .prepare(
+          "INSERT INTO channels (id, workspace_id, name) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(conversationId, workspaceId, conversationId),
+      db
+        .prepare(
+          `INSERT INTO conversations (id, workspace_id, channel_id, kind, dm_user_id, dm_bot_id)
+           VALUES (?, ?, ?, 'dm', ?, ?) ON CONFLICT DO NOTHING`,
+        )
+        .bind(conversationId, workspaceId, conversationId, user.userId, command.botId),
+    ],
+    { operationId: env.operationId, status: "accepted", conversationId },
+    [{ entityKind: "dm", entityId: conversationId, scope: `workspace:${workspaceId}` }],
+  );
+};
+
 const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env) => {
   const { workspaceId, command } = env;
   const actorId = crypto.randomUUID();
@@ -667,13 +754,39 @@ const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env
   );
 };
 
+/** The caller's DM (participant-only, 404 otherwise): its backing Channel, Bot and the caller's actor. */
+const dmParticipant = async (
+  db: D1Database,
+  workspaceId: string,
+  conversationId: string,
+  userId: string,
+) => {
+  const dm = await db
+    .prepare(
+      `SELECT c.id AS conversation_id, c.channel_id, c.dm_bot_id, a.id AS actor_id FROM conversations c
+         JOIN actors a ON a.workspace_id = c.workspace_id AND a.user_id = c.dm_user_id
+        WHERE c.workspace_id = ? AND c.id = ? AND c.kind = 'dm' AND c.dm_user_id = ?`,
+    )
+    .bind(workspaceId, conversationId, userId)
+    .first<{ conversation_id: string; channel_id: string; dm_bot_id: string; actor_id: string }>();
+  if (!dm) throw new HttpError("NOT_FOUND", "conversation not found");
+  return dm;
+};
+
 /**
- * One channel message; each Bot mentioned by a `<@bot:ID>` token gets the delivery of a waking `agent.send` request.
- * A token naming no Bot of the Workspace, or `mentions` differing from the tokens, is 422.
+ * One message. In a Channel, each Bot mentioned by a `<@bot:ID>` token gets the delivery of a waking `agent.send`
+ * request and joins the Channel when it is not a member. In a DM the DM's Bot is the one recipient; a mention of
+ * another Bot is 422. A token naming no Bot of the Workspace, or `mentions` differing from the tokens, is 422.
  */
 const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user, env) => {
   const { workspaceId, command } = env;
-  const member = await channelMember(db, workspaceId, command.channelId, user.userId);
+  const where = command.conversationId
+    ? await dmParticipant(db, workspaceId, command.conversationId, user.userId)
+    : {
+        ...(await channelMember(db, workspaceId, command.channelId!, user.userId)),
+        channel_id: command.channelId!,
+        dm_bot_id: null,
+      };
   const botIds = mentionedBotIds(command.text);
   if (
     command.mentions &&
@@ -682,22 +795,31 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
   ) {
     throw new HttpError("INVALID_INPUT", "mentions must equal the <@bot:ID> tokens in text");
   }
-  if (botIds.length > 0) {
+  let joining: string[] = [];
+  if (where.dm_bot_id) {
+    if (botIds.some((id) => id !== where.dm_bot_id)) {
+      throw new HttpError("INVALID_INPUT", "a DM can only mention its own bot");
+    }
+  } else if (botIds.length > 0) {
     const { results } = await db
       .prepare(
-        `SELECT id FROM bots WHERE workspace_id = ? AND id IN (${botIds.map(() => "?").join(", ")})`,
+        `SELECT b.id, b.actor_id, EXISTS (SELECT 1 FROM channel_members m WHERE m.workspace_id = b.workspace_id
+                  AND m.channel_id = ? AND m.actor_id = b.actor_id) AS member
+           FROM bots b WHERE b.workspace_id = ? AND b.id IN (${botIds.map(() => "?").join(", ")})`,
       )
-      .bind(workspaceId, ...botIds)
-      .all<{ id: string }>();
+      .bind(where.channel_id, workspaceId, ...botIds)
+      .all<{ id: string; actor_id: string; member: number }>();
     const unknown = botIds.filter((id) => !results.some((r) => r.id === id));
     if (unknown.length > 0) {
       throw new HttpError("INVALID_INPUT", `unknown bot in mention: ${unknown.join(", ")}`);
     }
+    joining = results.filter((r) => !r.member).map((r) => r.actor_id);
   }
 
   const receivedAt = new Date().toISOString();
   const messageId = crypto.randomUUID();
-  const deliveries = botIds.map((botId) => ({ botId, inboxItemId: crypto.randomUUID() }));
+  const recipients = where.dm_bot_id ? [where.dm_bot_id] : botIds;
+  const deliveries = recipients.map((botId) => ({ botId, inboxItemId: crypto.randomUUID() }));
   const response: MessagePostAccepted = {
     operationId: env.operationId,
     status: "accepted",
@@ -705,7 +827,7 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
     inboxItemIds: deliveries.map((d) => d.inboxItemId),
     receivedAt,
   };
-  const scope = `channel:${command.channelId}`;
+  const scope = `channel:${where.channel_id}`;
   return receipt(
     db,
     user.userId,
@@ -714,8 +836,8 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
       insertMessage(db, {
         id: messageId,
         workspaceId,
-        conversationId: member.conversation_id,
-        actorId: member.actor_id,
+        conversationId: where.conversation_id,
+        actorId: where.actor_id,
         clientMessageId: env.idempotencyKey,
         body: command.text,
       }),
@@ -724,20 +846,31 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
           userId: user.userId,
           messageId,
           botId: d.botId,
-          channelId: command.channelId,
-          conversationId: member.conversation_id,
+          channelId: where.channel_id,
+          conversationId: where.conversation_id,
           kind: "request",
           delivery: "wake",
           inboxItemId: d.inboxItemId,
           receivedAt,
         }),
       ),
+      ...(joining.length > 0
+        ? [
+            db
+              .prepare(
+                `INSERT INTO channel_members (workspace_id, channel_id, actor_id, role)
+                 SELECT ?, ?, value, 'member' FROM json_each(?) WHERE true ON CONFLICT DO NOTHING`,
+              )
+              .bind(workspaceId, where.channel_id, JSON.stringify(joining)),
+          ]
+        : []),
       indexLater(db, workspaceId, "message", messageId),
     ],
     response,
     [
       { entityKind: "message", entityId: messageId, scope },
       ...deliveries.map((d) => ({ entityKind: "inbox_item", entityId: d.inboxItemId, scope })),
+      ...(joining.length > 0 ? [{ entityKind: "channel", entityId: where.channel_id, scope }] : []),
     ],
   );
 };
@@ -1512,7 +1645,7 @@ const snapshotSubscription = (db: D1Database, id: string) =>
     .bind(id);
 
 /**
- * The destination Conversation must be in the Workspace and the caller a member of its Channel (forwarding into a
+ * The destination Conversation must be in the Workspace and the caller a member of its Channel or the DM's user (forwarding into a
  * Channel needs access to it, §17.1); a Project / Task must exist.
  */
 const checkDestination = async (
@@ -1523,10 +1656,10 @@ const checkDestination = async (
 ) => {
   const conversation = await db
     .prepare(
-      `SELECT EXISTS (SELECT 1 FROM channel_members m JOIN actors a
+      `SELECT (c.kind = 'dm' AND c.dm_user_id = ?1) OR EXISTS (SELECT 1 FROM channel_members m JOIN actors a
                 ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-             WHERE m.workspace_id = c.workspace_id AND m.channel_id = c.channel_id AND a.user_id = ?) AS member
-         FROM conversations c WHERE c.workspace_id = ? AND c.id = ?`,
+             WHERE m.workspace_id = c.workspace_id AND m.channel_id = c.channel_id AND a.user_id = ?1) AS member
+         FROM conversations c WHERE c.workspace_id = ?2 AND c.id = ?3`,
     )
     .bind(userId, workspaceId, destination.conversationId)
     .first<{ member: number }>();
@@ -2365,7 +2498,10 @@ const memoryWrite = async (
     : run;
 };
 
-/** A user may write to the Workspace, a Channel they are a member of, or an existing Project / Bot / Task. */
+/**
+ * A user may write to the Workspace, a Channel they are a member of (or their DM: `channel` scope with the DM's id), or
+ * an existing Project / Bot / Task.
+ */
 const userMayUseMemoryScope = async (
   db: D1Database,
   user: User,
@@ -2382,7 +2518,9 @@ const userMayUseMemoryScope = async (
       ? await db
           .prepare(
             `SELECT 1 FROM channel_members m JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-              WHERE m.workspace_id = ? AND m.channel_id = ? AND a.user_id = ?`,
+              WHERE m.workspace_id = ?1 AND m.channel_id = ?2 AND a.user_id = ?3
+             UNION ALL
+             SELECT 1 FROM conversations WHERE workspace_id = ?1 AND channel_id = ?2 AND kind = 'dm' AND dm_user_id = ?3`,
           )
           .bind(workspaceId, scope.id, user.userId)
           .first()
@@ -2581,6 +2719,9 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "device.revoke": deviceRevoke,
   "channel.create": channelCreate,
   "channel.update": channelUpdate,
+  "channel.join": channelMembership(true),
+  "channel.leave": channelMembership(false),
+  "dm.open": dmOpen,
   "bot.create": botCreate,
   "bot.update": botUpdate,
   "device.environment.register": deviceEnvironmentRegister,

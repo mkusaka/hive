@@ -46,6 +46,7 @@ describe("sync controller", () => {
       "bots",
       "channels",
       "devices",
+      "dms",
       "inbox",
       "jobs",
       "messages",
@@ -63,7 +64,7 @@ describe("sync controller", () => {
     await h.sync.pull();
     await h.sync.hint();
     await h.sync.pull();
-    expect(h.refetched.slice(1)).toEqual([["channels", "inbox", "messages"]]);
+    expect(h.refetched.slice(1)).toEqual([["channels", "dms", "inbox", "messages"]]);
   });
 
   it("refetches the inspected Run for a run change row", async () => {
@@ -73,7 +74,15 @@ describe("sync controller", () => {
     ]);
     await h.sync.pull();
     await h.sync.hint();
-    expect(h.refetched[1]).toEqual(["approvals", "bots", "devices", "jobs", "run", "sidebar"]);
+    expect(h.refetched[1]).toEqual([
+      "approvals",
+      "bots",
+      "devices",
+      "dms",
+      "jobs",
+      "run",
+      "sidebar",
+    ]);
   });
 
   it("re-bootstraps on 410 CURSOR_EXPIRED", async () => {

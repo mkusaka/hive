@@ -988,6 +988,11 @@ button.small {
   gap: 8px;
   padding: 6px 4px;
 }
+.member-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
 
 /* Channel panel: About, user avatars, header topic */
 .about {

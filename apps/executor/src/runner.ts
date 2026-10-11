@@ -149,9 +149,9 @@ const execute = async (
   const outcome =
     exit.code !== 0 || cancelled ? "failed" : exit.waitingFor ? "waiting" : "succeeded";
   const conversation = ctx.context.conversation;
-  // A Bot answers a bot request with its reply tool, so the final text is posted only in a Channel.
+  // A Bot answers a bot request with its reply tool, so the final text is posted only in a Channel or a DM.
   const reply =
-    outcome === "succeeded" && exit.replyText && conversation?.kind === "channel"
+    outcome === "succeeded" && exit.replyText && conversation && conversation.kind !== "bot_pair"
       ? { reply: { conversationId: conversation.id, text: exit.replyText } }
       : {};
   if (!stale) {

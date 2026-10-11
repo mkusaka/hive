@@ -159,9 +159,16 @@ export const BotPanel = (props: {
 
 /**
  * Channel details, like Slack's: About (name, topic edited inline, created date), Members (`GET
- * /v1/channels/:id/members`: members and actors that posted) and Routines (each with its assigned Bot).
+ * /v1/channels/:id/members`, "Add bot" → channel.join, a Bot's row menu → channel.leave) and Routines (each with its
+ * assigned Bot).
  */
 export type ChannelTab = "about" | "members" | "routines";
+
+/** Where a menu opened from a button goes: under it. */
+const below = (e: { currentTarget: Element }) => {
+  const box = e.currentTarget.getBoundingClientRect();
+  return { x: box.left, y: box.bottom + 4 };
+};
 
 /** `tab` is App state: the header's member count opens Members, its "…" About. */
 export const ChannelPanel = (props: {
@@ -179,15 +186,30 @@ export const ChannelPanel = (props: {
   const { tab, setTab } = props;
   const [members, setMembers] = useState<Row[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // "Add bot" picker, or a Bot member's row menu.
+  const [menu, setMenu] = useState<{ x: number; y: number; botId?: string } | null>(null);
+  const closeMenu = useCallback(() => setMenu(null), []);
   const { ws, channel } = props;
   const conversationId = String(channel.conversationId);
-  useEffect(() => {
-    setError(null);
-    if (tab === "members")
+  const loadMembers = useCallback(
+    () =>
       void window.hive.api
         .get(inWorkspace(`channels/${encodeURIComponent(channel.id)}/members`, ws))
-        .then((res) => (res.ok ? setMembers(res.value.members as Row[]) : setError(failure(res))));
-  }, [tab, ws, channel.id]);
+        .then((res) => (res.ok ? setMembers(res.value.members as Row[]) : setError(failure(res)))),
+    [ws, channel.id],
+  );
+  useEffect(() => {
+    setError(null);
+    if (tab === "members") loadMembers();
+  }, [tab, loadMembers]);
+  const membership = async (type: "channel.join" | "channel.leave", botId: string) => {
+    setMenu(null);
+    const res = await command(ws, { type, channelId: channel.id, botId });
+    if (!res.ok) return setError(failure(res));
+    setError(null);
+    loadMembers();
+    props.refreshChannels();
+  };
   const saveTopic = async (topic: string) => {
     const res = await command(ws, { type: "channel.update", channelId: channel.id, topic });
     if (!res.ok) return setError(failure(res));
@@ -223,18 +245,29 @@ export const ChannelPanel = (props: {
       )}
       {tab === "members" && (
         <div className="card">
+          <button className="member" onClick={(e) => setMenu(below(e))}>
+            <Icon name="users" /> Add bot
+          </button>
           {members.map((m) => {
             const label =
               m.userId && m.userId === props.me ? `${text(m.name)} (you)` : text(m.name);
             return m.botId ? (
-              <button
-                key={m.actorId as string}
-                className="inline-bot member"
-                onClick={() => props.openBot(String(m.botId))}
-              >
-                <Avatar id={String(m.botId)} name={String(m.name)} size={28} /> {label}
-                {m.role === null && <span className="meta">posted, not a member</span>}
-              </button>
+              <div key={m.actorId as string} className="member-row">
+                <button
+                  className="inline-bot member"
+                  onClick={() => props.openBot(String(m.botId))}
+                >
+                  <Avatar id={String(m.botId)} name={String(m.name)} size={28} /> {label}
+                </button>
+                <button
+                  className="icon"
+                  aria-label={`${label} actions`}
+                  aria-haspopup="menu"
+                  onClick={(e) => setMenu({ ...below(e), botId: String(m.botId) })}
+                >
+                  <Icon name="more" />
+                </button>
+              </div>
             ) : (
               <div key={m.actorId as string} className="member">
                 <Avatar id={String(m.actorId)} name={String(m.name)} size={28} plain /> {label}
@@ -242,6 +275,30 @@ export const ChannelPanel = (props: {
               </div>
             );
           })}
+          {menu && (
+            <Menu x={menu.x} y={menu.y} close={closeMenu}>
+              {menu.botId ? (
+                <button
+                  role="menuitem"
+                  onClick={() => void membership("channel.leave", menu.botId!)}
+                >
+                  <Icon name="trash" /> Remove from channel
+                </button>
+              ) : (
+                props.bots
+                  .filter((b) => !members.some((m) => m.botId === b.id))
+                  .map((b) => (
+                    <button
+                      key={b.id}
+                      role="menuitem"
+                      onClick={() => void membership("channel.join", b.id)}
+                    >
+                      <Avatar id={b.id} name={String(b.name)} size={20} /> {text(b.name)}
+                    </button>
+                  ))
+              )}
+            </Menu>
+          )}
         </div>
       )}
       {tab === "routines" && (

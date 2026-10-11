@@ -99,6 +99,20 @@ export const ChannelUpdate = v.strictObject({
   channelId: ChannelId,
   topic: v.pipe(v.string(), v.maxLength(250)),
 });
+/** Adds a Bot to the Channel (members only). Membership never routes: a member Bot wakes only when mentioned. */
+export const ChannelJoin = v.strictObject({
+  type: v.literal("channel.join"),
+  channelId: ChannelId,
+  botId: BotId,
+});
+/** Removes a Bot from the Channel (members only). */
+export const ChannelLeave = v.strictObject({
+  type: v.literal("channel.leave"),
+  channelId: ChannelId,
+  botId: BotId,
+});
+/** The caller's direct messages with the Bot: the existing conversation, or a new one. */
+export const DmOpen = v.strictObject({ type: v.literal("dm.open"), botId: BotId });
 
 const DeviceIds = v.optional(v.array(DeviceId), []);
 
@@ -223,14 +237,22 @@ export const renderMentions = (text: string, names: ReadonlyMap<string, string>)
 
 /**
  * A user's Channel message (docs/architecture.md §7.2). Every Bot mentioned with a token gets the Inbox item + Job that
- * `agent.send` with `request` / `wake` gives; no mention = only posted. `mentions`, when given, must equal the tokens.
+ * `agent.send` with `request` / `wake` gives (and joins the Channel); no mention = only posted. `mentions`, when given,
+ * must equal the tokens. With `conversationId` (a DM) instead of `channelId`, the DM's Bot is always the recipient.
  */
-export const MessagePost = v.strictObject({
-  type: v.literal("message.post"),
-  channelId: ChannelId,
-  text: MessageText,
-  mentions: v.optional(v.array(BotId)),
-});
+export const MessagePost = v.pipe(
+  v.strictObject({
+    type: v.literal("message.post"),
+    channelId: v.optional(ChannelId),
+    conversationId: v.optional(v.pipe(v.string(), v.minLength(1))),
+    text: MessageText,
+    mentions: v.optional(v.array(BotId)),
+  }),
+  v.check(
+    (c) => (c.channelId === undefined) !== (c.conversationId === undefined),
+    "exactly one of channelId / conversationId is required",
+  ),
+);
 
 // --------------------------------------------- Run commands (docs/architecture.md §8, §18.2)
 // `POST /v1/run/commands` with a Run capability: the sender is the Run's Bot, never a declared one.
@@ -804,7 +826,8 @@ export const MemoryDelete = v.strictObject({
 // ------------------------------------------------- Sidebar (UI-04)
 
 const SidebarItem = v.strictObject({
-  kind: v.picklist(["channel", "bot"]),
+  /** `dm`: the DM's conversation id. */
+  kind: v.picklist(["channel", "bot", "dm"]),
   id: v.pipe(v.string(), v.minLength(1), v.maxLength(200)),
 });
 /**
@@ -918,7 +941,9 @@ export type RunContext = {
   conversation: {
     id: string;
     channelId: string;
-    kind: "channel" | "bot_pair";
+    kind: "channel" | "bot_pair" | "dm";
+    /** A DM's user, the Bot's counterpart; null otherwise. */
+    counterpart: { actorId: string; name: string } | null;
     /** The last 20 messages, oldest first. */
     recent: { actorKind: string; actorId: string; body: string; createdAt: string }[];
   } | null;

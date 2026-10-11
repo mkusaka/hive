@@ -40,6 +40,7 @@ import {
   listApprovals,
   listChannels,
   listDevices,
+  listDms,
   listInbox,
   listJobs,
   listMessages,
@@ -414,6 +415,19 @@ export const createApp = ({
         workspaceId: workspaceParam(c),
         userId: user(c).userId,
         channelId: c.req.param("id"),
+        limit: limitParam(c, 50, 200),
+      }),
+    ),
+  );
+  app.get("/v1/dms", async (c) =>
+    c.json(await listDms(c.env.DB, workspaceParam(c), user(c).userId)),
+  );
+  app.get("/v1/conversations/:id/messages", async (c) =>
+    c.json(
+      await listMessages(c.env.DB, {
+        workspaceId: workspaceParam(c),
+        userId: user(c).userId,
+        conversationId: c.req.param("id"),
         limit: limitParam(c, 50, 200),
       }),
     ),

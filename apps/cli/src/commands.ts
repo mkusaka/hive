@@ -21,6 +21,15 @@ export const channelCreate = (c: Client, e: Envelope, name: string) =>
 /** An empty topic clears it. */
 export const channelUpdate = (c: Client, e: Envelope, channelId: string, topic: string) =>
   c.command(e, { type: "channel.update", channelId, topic });
+export const channelMembership = (
+  c: Client,
+  e: Envelope,
+  type: "channel.join" | "channel.leave",
+  channelId: string,
+  botId: string,
+) => c.command(e, { type, channelId, botId });
+export const dmOpen = (c: Client, e: Envelope, botId: string) =>
+  c.command(e, { type: "dm.open", botId });
 
 /** `toolPolicy` / `placementPolicy`: @hive/contracts ToolPolicy / PlacementPolicy (§10.2). */
 export const botCreate = (
@@ -142,7 +151,11 @@ export const agentSend = (
 export const messagePost = async (
   c: Client,
   e: Envelope,
-  input: { channelId: string; text: string; resolveNames: boolean },
+  input: {
+    target: { channelId: string } | { conversationId: string };
+    text: string;
+    resolveNames: boolean;
+  },
 ) => {
   let text = input.text;
   if (input.resolveNames) {
@@ -150,7 +163,7 @@ export const messagePost = async (
     for (const bot of bots.toSorted((a, b) => b.name.length - a.name.length))
       text = text.replaceAll(`@${bot.name}`, mentionToken(bot.id));
   }
-  return c.command(e, { type: "message.post", channelId: input.channelId, text });
+  return c.command(e, { type: "message.post", ...input.target, text });
 };
 
 export const eventEmit = (
@@ -185,6 +198,7 @@ const inWorkspace = (resource: string, workspaceId: string, query: Record<string
 export const listChannels = (c: Client, workspaceId: string) =>
   c.get(inWorkspace("channels", workspaceId));
 export const listBots = (c: Client, workspaceId: string) => c.get(inWorkspace("bots", workspaceId));
+export const listDms = (c: Client, workspaceId: string) => c.get(inWorkspace("dms", workspaceId));
 /** Newest first (`limit` default 50). */
 export const listMessages = (c: Client, workspaceId: string, channelId: string) =>
   c.get(inWorkspace(`channels/${encodeURIComponent(channelId)}/messages`, workspaceId));

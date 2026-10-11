@@ -53,6 +53,18 @@ export const bots = [
   },
 ];
 
+/** `GET /v1/dms`: the user's DM with coder (not in the default routes). */
+export const dms = [
+  {
+    id: "dm-1",
+    conversationId: "dm-1",
+    botId: "bot-1",
+    name: "coder",
+    createdAt: "2026-10-03T09:00:00.000Z",
+    lastMessage: { body: "dm ok", createdAt: "2026-10-11T12:00:00.000Z", actorId: "actor-bot-1" },
+  },
+];
+
 /** Newest first, as the API returns them. */
 export const messages = [
   {
@@ -106,6 +118,7 @@ export const routes = (): Routes => ({
   "/v1/sync/changes": { changes: [], cursor: "H0", hasMore: false },
   "/v1/me": { userId: me },
   "/v1/channels": { channels },
+  "/v1/dms": { dms: [] },
   "/v1/bots": { bots },
   "/v1/sidebar": {
     workspaceName: "acme",
@@ -178,7 +191,7 @@ export const routes = (): Routes => ({
         name: "coder",
         userId: null,
         botId: "bot-1",
-        role: null,
+        role: "member",
       },
     ],
   },

@@ -229,10 +229,12 @@ export const channelMembers = sqliteTable(
 );
 
 /**
- * current state. A Channel's one main conversation, or (`kind = 'bot_pair'`) the private conversation of two Bots
- * (docs/architecture.md §8.1). A bot pair is backed by a Channel row without members, so it is in no user's channel
- * list; both rows use the id `botpair:<botId>:<botId>` (sorted) and are created by the first message. Not a nullable
- * `channel_id`: rebuilding this table fails on D1 once messages reference it (FKs cannot be switched off).
+ * current state. A Channel's one main conversation, (`kind = 'bot_pair'`) the private conversation of two Bots
+ * (docs/architecture.md §8.1), or (`kind = 'dm'`) a user's direct messages with one Bot (`dm_user_id`, `dm_bot_id`).
+ * A bot pair or a DM is backed by a Channel row without members, so it is in no user's channel list; both rows share
+ * one id: `botpair:<botId>:<botId>` (sorted), created by the first message, or `dm-<userId>-<botId>`, created by
+ * `dm.open`. Not a nullable `channel_id`: rebuilding this table fails on D1 once messages reference it (FKs cannot be
+ * switched off).
  */
 export const conversations = sqliteTable(
   "conversations",
@@ -240,13 +242,19 @@ export const conversations = sqliteTable(
     id: text("id").primaryKey(),
     workspaceId: workspaceId(),
     channelId: text("channel_id").notNull(),
-    // `channel` | `bot_pair`. No CHECK: added by ALTER TABLE.
+    // `channel` | `bot_pair` | `dm`. No CHECK: added by ALTER TABLE.
     kind: text("kind").notNull().default("channel"),
+    // A DM's user (users.id) and Bot (bots.id). No FK: added by ALTER TABLE.
+    dmUserId: text("dm_user_id"),
+    dmBotId: text("dm_bot_id"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
   (t) => [
     scoped(t),
+    uniqueIndex("conversations_dm")
+      .on(t.workspaceId, t.dmUserId, t.dmBotId)
+      .where(sql`${t.kind} = 'dm'`),
     foreignKey({
       columns: [t.workspaceId, t.channelId],
       foreignColumns: [channels.workspaceId, channels.id],

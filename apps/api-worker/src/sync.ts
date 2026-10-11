@@ -47,7 +47,8 @@ export const headCursor = async (db: D1Database, workspaceId: string) => {
 };
 
 /**
- * A user: `workspace:<id>` plus `channel:<id>` for every channel their actor is a member of. A Run: `workspace:<id>`,
+ * A user: `workspace:<id>` plus `channel:<id>` for every channel their actor is a member of and every DM's backing
+ * Channel. A Run: `workspace:<id>`,
  * its Conversation's Channel and its own `bot:<id>` / `task:<id>` (search only: change rows never carry those).
  */
 export const permittedScopes = async (
@@ -67,7 +68,9 @@ export const permittedScopes = async (
     .prepare(
       `SELECT m.channel_id FROM channel_members m
          JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
-        WHERE m.workspace_id = ? AND a.user_id = ?`,
+        WHERE m.workspace_id = ?1 AND a.user_id = ?2
+       UNION ALL
+       SELECT channel_id FROM conversations WHERE workspace_id = ?1 AND kind = 'dm' AND dm_user_id = ?2`,
     )
     .bind(workspaceId, principal.userId)
     .all<{ channel_id: string }>();
