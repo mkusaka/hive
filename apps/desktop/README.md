@@ -117,6 +117,19 @@ Accepted is not started: the Job id appears only after the outbox pump ran (`hiv
 "Unsynced hints" counts `sync.changed` hints whose changes have not been fetched yet; it stays above zero while
 pulls fail.
 
+## Routine triggers (ROUTINE-02)
+
+The Channel routine editor offers **Repeat (cron)**, **Once**, **Webhook** and **When an event matches**.
+Webhook rows read "When a webhook fires"; the editor shows the API hook URL and **Rotate secret**.
+Creation and rotation show a copyable secret only in the current editor; closing it drops the value, and
+reopening cannot retrieve it. The renderer never saves it in localStorage or the credentials file.
+External callers sign raw JSON with HMAC-SHA256 (API README); the hook path bypasses Access only on the custom domain.
+
+Event rows read "When <type> events match". The editor accepts an event type prefix and optional JSON of the
+existing Subscription filter AST, validated with the contract before submission. Routines carry `inputText`,
+Conversation and Task instead of forwarding only raw events as Subscriptions do. Switching trigger kinds uses
+`routine.update` with the current revision; a conflict reloads rather than overwriting another edit.
+
 ## Security model (§21, S24)
 
 - `BrowserWindow` with `contextIsolation: true`, `sandbox: true`, `nodeIntegration: false`. The preload is built as
@@ -133,19 +146,19 @@ img-src 'self'`. `'unsafe-inline'` styles are for Vite's dev-time `<style>` inje
 
 ## IPC surface (`src/shared/api.ts`)
 
-| `window.hive`       | Channel                | Validation / behavior                                                                                                                                                                                                                                       |
-| ------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `api.get(path)`     | `hive:api.get`         | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, the query also allows URLSearchParams' `+` and `*`, no `..` anywhere                                                                                                                                |
-| `api.command(env)`  | `hive:api.command`     | `commandEnvelope(variant [MessagePost, AgentSend, JobCancel, ApprovalResolve, MemoryWrite, ChannelUpdate, RoutineCreate, RoutineUpdate, RoutineDelete, RoutinePause, RoutineResume, RoutineRun, SidebarUpdate, WorkspaceCreate])`: only these command types |
-| `getConfig()`       | `hive:config`          | `{apiUrl, workspaceId, problem, loginRequired, deviceRegistered, workspaces, hostname, defaultApiUrl, connection}`; no secrets                                                                                                                              |
-| `onRealtime(cb)`    | `hive:realtime`        | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                                                                                                                                                                 |
-| `executor.status()` | `hive:executor.status` | launchd state, pid, last exit code, installed provider / concurrency / argv, plist and log paths, `registered`; never the plist's env values                                                                                                                |
-| `executor.start(o)` | `hive:executor.start`  | `{provider: fake\|claude\|codex, concurrency: 1..64}` (strict); installs or replaces the service; `UNAUTHENTICATED` without a device token                                                                                                                  |
-| `executor.stop()`   | `hive:executor.stop`   | `launchctl bootout` only; the plist stays                                                                                                                                                                                                                   |
-| `setConfig(patch)`  | `hive:config.set`      | `{apiUrl?: https URL or http://localhost, workspaceId?: 1..200 chars}` (strict, not empty); merged into the credentials file                                                                                                                                |
-| `login()`           | `hive:login`           | the CLI's browser login; `{ok: true}` or `{ok: false, message}`                                                                                                                                                                                             |
-| `logout()`          | `hive:logout`          | `hive logout` (drops the OAuth grant only)                                                                                                                                                                                                                  |
-| `registerDevice(i)` | `hive:device.register` | `{name: 1..200 chars}` (strict); `hive device register --name --os <platform> --agent-version <app version>`, then the service reconcile; never returns the token                                                                                           |
+| `window.hive`       | Channel                | Validation / behavior                                                                                                                                                                                                                                                            |
+| ------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `api.get(path)`     | `hive:api.get`         | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, the query also allows URLSearchParams' `+` and `*`, no `..` anywhere                                                                                                                                                     |
+| `api.command(env)`  | `hive:api.command`     | `commandEnvelope(variant [MessagePost, AgentSend, JobCancel, ApprovalResolve, MemoryWrite, ChannelUpdate, RoutineCreate, RoutineUpdate, RoutineDelete, RoutinePause, RoutineResume, RoutineRun, RoutineRotateSecret, SidebarUpdate, WorkspaceCreate])`: only these command types |
+| `getConfig()`       | `hive:config`          | `{apiUrl, workspaceId, problem, loginRequired, deviceRegistered, workspaces, hostname, defaultApiUrl, connection}`; no secrets                                                                                                                                                   |
+| `onRealtime(cb)`    | `hive:realtime`        | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                                                                                                                                                                                      |
+| `executor.status()` | `hive:executor.status` | launchd state, pid, last exit code, installed provider / concurrency / argv, plist and log paths, `registered`; never the plist's env values                                                                                                                                     |
+| `executor.start(o)` | `hive:executor.start`  | `{provider: fake\|claude\|codex, concurrency: 1..64}` (strict); installs or replaces the service; `UNAUTHENTICATED` without a device token                                                                                                                                       |
+| `executor.stop()`   | `hive:executor.stop`   | `launchctl bootout` only; the plist stays                                                                                                                                                                                                                                        |
+| `setConfig(patch)`  | `hive:config.set`      | `{apiUrl?: https URL or http://localhost, workspaceId?: 1..200 chars}` (strict, not empty); merged into the credentials file                                                                                                                                                     |
+| `login()`           | `hive:login`           | the CLI's browser login; `{ok: true}` or `{ok: false, message}`                                                                                                                                                                                                                  |
+| `logout()`          | `hive:logout`          | `hive logout` (drops the OAuth grant only)                                                                                                                                                                                                                                       |
+| `registerDevice(i)` | `hive:device.register` | `{name: 1..200 chars}` (strict); `hive device register --name --os <platform> --agent-version <app version>`, then the service reconcile; never returns the token                                                                                                                |
 
 `api.*` never rejects: it resolves to `{ok: true, value}` or `{ok: false, error: {code, message, body?}}`, where
 `code` is the `ApiError` code (e.g. `CURSOR_EXPIRED`), `INVALID_ARGS` for rejected arguments, or a CLI client code

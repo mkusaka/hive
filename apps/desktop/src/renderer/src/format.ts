@@ -1,7 +1,7 @@
 // Pure formatting for the chat UI: a small safe Markdown subset (as data, rendered by React without HTML), Routine
 // schedule lines and avatar colors.
+import type { FilterExpression } from "@hive/contracts";
 import type { JSONContent } from "@tiptap/core";
-
 export type Inline =
   | { kind: "text" | "bold" | "italic" | "code"; text: string }
   | { kind: "link"; text: string; url: string }
@@ -109,7 +109,9 @@ export const toMarkdown = (doc: JSONContent) =>
 
 export type Schedule =
   | { kind: "cron"; expr: string; timezone: string }
-  | { kind: "once"; at: string };
+  | { kind: "once"; at: string }
+  | { kind: "webhook" }
+  | { kind: "event"; filter: FilterExpression };
 
 const int = (s: string | undefined) => (s !== undefined && /^\d+$/.test(s) ? Number(s) : null);
 const clock = (hour: number, minute: number) =>
@@ -119,7 +121,28 @@ const clock = (hour: number, minute: number) =>
  * A human line for the common cron shapes (weekdays / daily at a time, every N minutes, hourly at a minute; times in
  * the Routine's own zone), else the raw expression; `once` in `timeZone` (default: this machine's).
  */
+const eventTypePrefix = (filter: FilterExpression): string | undefined => {
+  if (
+    (filter.op === "prefix" || filter.op === "eq") &&
+    filter.field === "type" &&
+    typeof filter.value === "string"
+  )
+    return filter.value;
+  if (filter.op === "and") {
+    for (const node of filter.nodes) {
+      const type = eventTypePrefix(node);
+      if (type) return type;
+    }
+  }
+  return undefined;
+};
+
 export const scheduleLine = (schedule: Schedule, timeZone?: string) => {
+  if (schedule.kind === "webhook") return "When a webhook fires";
+  if (schedule.kind === "event") {
+    const type = eventTypePrefix(schedule.filter);
+    return type ? `When ${type} events match` : "When events match";
+  }
   if (schedule.kind === "once") {
     const at = new Date(schedule.at);
     const date = at.toLocaleDateString("en-US", { month: "long", day: "numeric", timeZone });

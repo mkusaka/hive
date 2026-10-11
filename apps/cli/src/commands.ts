@@ -333,8 +333,10 @@ export const routineCreate = (
   input: {
     botId: string;
     name: string;
-    cron: string;
-    timezone: string;
+    schedule:
+      | { kind: "cron"; expr: string; timezone: string }
+      | { kind: "webhook" }
+      | { kind: "event"; filter: Json };
     inputText: string;
     conversationId?: string;
     misfire?: string;
@@ -344,11 +346,13 @@ export const routineCreate = (
     type: "routine.create",
     botId: input.botId,
     name: input.name,
-    schedule: { kind: "cron", expr: input.cron, timezone: input.timezone },
+    schedule: input.schedule,
     inputText: input.inputText,
     conversationId: input.conversationId,
     misfire: input.misfire,
   });
+export const routineRotateSecret = (c: Client, e: Envelope, routineId: string) =>
+  c.command(e, { type: "routine.rotate_secret", routineId });
 export const listRoutines = (c: Client, workspaceId: string) =>
   c.get(inWorkspace("routines", workspaceId));
 /** `routine.run` / `routine.pause` / `routine.resume` / `routine.delete`. */

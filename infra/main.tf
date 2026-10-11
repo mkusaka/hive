@@ -79,3 +79,19 @@ resource "cloudflare_zero_trust_access_application" "api" {
     }
   }
 }
+
+# Routine webhook callers authenticate with X-Hive-Signature, not Access. A more specific hostname/path
+# application takes precedence over the API hostname application; no other API path is bypassed.
+resource "cloudflare_zero_trust_access_application" "routine_hooks" {
+  account_id           = var.account_id
+  name                 = "hive routine hooks"
+  type                 = "self_hosted"
+  app_launcher_visible = false
+  destinations         = [{ type = "public", uri = "${var.api_hostname}/v1/hooks/routines/*" }]
+  policies = [{
+    name       = "Signed routine webhooks"
+    decision   = "bypass"
+    precedence = 1
+    include    = [{ everyone = {} }]
+  }]
+}

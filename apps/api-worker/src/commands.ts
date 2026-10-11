@@ -37,6 +37,7 @@ import {
   RoutineDelete,
   RoutinePause,
   RoutineResume,
+  RoutineRotateSecret,
   RoutineRun,
   type RoutineSchedule,
   type ToolPolicy,
@@ -123,6 +124,7 @@ export const CommandEnvelope = commandEnvelope(
     RoutinePause,
     RoutineResume,
     RoutineRun,
+    RoutineRotateSecret,
     RoutineDelete,
     ApprovalResolve,
     MemoryWrite,
@@ -2122,6 +2124,9 @@ const routineChange = (workspaceId: string, id: string, revision?: number): Chan
   scope: `workspace:${workspaceId}`,
 });
 
+const routineHookPath = (routineId: string) => `/v1/hooks/routines/${routineId}`;
+const newRoutineWebhookSecret = () => `hive_routine_${newDeviceSecret()}`;
+
 /** The Conversation (if any) must be one whose Channel the caller is a member of; a Task must exist. */
 const routineCreate: Handler<v.InferOutput<typeof RoutineCreate>> = async (db, user, env) => {
   const { workspaceId, command } = env;
@@ -2139,17 +2144,19 @@ const routineCreate: Handler<v.InferOutput<typeof RoutineCreate>> = async (db, u
     await loadTask(db, workspaceId, command.taskId);
   }
   const routineId = crypto.randomUUID();
+  const secret = command.schedule.kind === "webhook" ? newRoutineWebhookSecret() : null;
   const nextFireAt = firstFireAt(command.schedule, Date.now());
-  return receipt(
+  const result = await receipt(
     db,
     user.userId,
     env,
     [
       db
         .prepare(
-          `INSERT INTO routines (id, workspace_id, bot_id, name, conversation_id, task_id, input_text, schedule, misfire,
-             next_fire_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO routines
+             (id, workspace_id, bot_id, name, conversation_id, task_id, input_text, schedule, webhook_secret_hash,
+              misfire, next_fire_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .bind(
           routineId,
@@ -2160,13 +2167,25 @@ const routineCreate: Handler<v.InferOutput<typeof RoutineCreate>> = async (db, u
           command.taskId ?? null,
           command.inputText,
           JSON.stringify(command.schedule),
+          secret === null ? null : await hashSecret(secret),
           command.misfire,
           nextFireAt,
         ),
     ],
-    { operationId: env.operationId, status: "accepted", routineId, revision: 1, nextFireAt },
+    // The receipt keeps a redacted response: an idempotent retry cannot recover the secret.
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      routineId,
+      revision: 1,
+      nextFireAt,
+      hookPath: secret === null ? null : routineHookPath(routineId),
+      secret: null as string | null,
+    },
     [routineChange(workspaceId, routineId, 1)],
   );
+  if (secret === null || result.replayed) return result;
+  return { ...result, response: { ...result.response, secret } };
 };
 
 const staleRoutine = (revision: number) =>
@@ -2181,7 +2200,12 @@ const staleRoutine = (revision: number) =>
 const routineUpdate: Handler<v.InferOutput<typeof RoutineUpdate>> = async (db, user, env) => {
   const { workspaceId, command } = env;
   const current = await loadRoutine(db, workspaceId, command.routineId);
+  const currentSchedule = JSON.parse(current.schedule) as RoutineSchedule;
   const schedule = command.schedule;
+  const secret =
+    schedule?.kind === "webhook" && currentSchedule.kind !== "webhook"
+      ? newRoutineWebhookSecret()
+      : null;
   const nextFireAt = schedule ? firstFireAt(schedule, Date.now()) : current.next_fire_at;
   const [setGuard, clearGuard] = guard(db);
   const run = receipt(
@@ -2193,6 +2217,7 @@ const routineUpdate: Handler<v.InferOutput<typeof RoutineUpdate>> = async (db, u
         .prepare(
           `UPDATE routines SET name = COALESCE(?, name), input_text = COALESCE(?, input_text),
              misfire = COALESCE(?, misfire), schedule = COALESCE(?, schedule),
+             webhook_secret_hash = CASE WHEN ? THEN ? WHEN ? THEN NULL ELSE webhook_secret_hash END,
              schedule_revision = schedule_revision + ?, next_fire_at = ?, revision = revision + 1, updated_at = ?
             WHERE workspace_id = ? AND id = ? AND revision = ?`,
         )
@@ -2201,6 +2226,9 @@ const routineUpdate: Handler<v.InferOutput<typeof RoutineUpdate>> = async (db, u
           command.inputText ?? null,
           command.misfire ?? null,
           schedule ? JSON.stringify(schedule) : null,
+          secret !== null ? 1 : 0,
+          secret === null ? null : await hashSecret(secret),
+          schedule !== undefined && schedule.kind !== "webhook" ? 1 : 0,
           schedule ? 1 : 0,
           nextFireAt,
           new Date().toISOString(),
@@ -2217,13 +2245,20 @@ const routineUpdate: Handler<v.InferOutput<typeof RoutineUpdate>> = async (db, u
       routineId: command.routineId,
       revision: command.expectedRevision + 1,
       nextFireAt,
+      hookPath:
+        (schedule === undefined ? currentSchedule.kind : schedule.kind) === "webhook"
+          ? routineHookPath(command.routineId)
+          : null,
+      secret: null as string | null,
     },
     [routineChange(workspaceId, command.routineId, command.expectedRevision + 1)],
   );
-  return explainFailure(run, async () => {
+  const result = await explainFailure(run, async () => {
     const row = await loadRoutine(db, workspaceId, command.routineId);
     return row.revision === command.expectedRevision ? null : staleRoutine(row.revision);
   });
+  if (secret === null || result.replayed) return result;
+  return { ...result, response: { ...result.response, secret } };
 };
 
 /** Stops new occurrences. Pausing a paused Routine changes nothing. */
@@ -2274,7 +2309,9 @@ const routineRun: Handler<v.InferOutput<typeof RoutineRun>> = async (db, user, e
   const { workspaceId, command } = env;
   const routine = await loadRoutine(db, workspaceId, command.routineId);
   const scheduledAt = new Date().toISOString();
-  const occurrence = occurrenceStatements(db, routine, scheduledAt);
+  const occurrence = occurrenceStatements(db, routine, scheduledAt, {
+    occurrenceKey: `manual:${env.operationId}`,
+  });
   return receipt(
     db,
     user.userId,
@@ -2292,6 +2329,58 @@ const routineRun: Handler<v.InferOutput<typeof RoutineRun>> = async (db, user, e
   );
 };
 
+/** Replaces the hash only; the displayed secret never reaches the operation receipt. */
+const routineRotateSecret: Handler<v.InferOutput<typeof RoutineRotateSecret>> = async (
+  db,
+  user,
+  env,
+) => {
+  const { workspaceId, command } = env;
+  const current = await loadRoutine(db, workspaceId, command.routineId);
+  if ((JSON.parse(current.schedule) as RoutineSchedule).kind !== "webhook") {
+    throw new HttpError("INVALID_INPUT", "routine is not a webhook");
+  }
+  const secret = newRoutineWebhookSecret();
+  const [setGuard, clearGuard] = guard(db);
+  const run = receipt(
+    db,
+    user.userId,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE routines SET webhook_secret_hash = ?, revision = revision + 1, updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND revision = ?
+              AND json_extract(schedule, '$.kind') = 'webhook'`,
+        )
+        .bind(
+          await hashSecret(secret),
+          new Date().toISOString(),
+          workspaceId,
+          command.routineId,
+          current.revision,
+        ),
+      setGuard,
+      clearGuard,
+    ],
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      routineId: command.routineId,
+      revision: current.revision + 1,
+      hookPath: routineHookPath(command.routineId),
+      secret: null as string | null,
+    },
+    [routineChange(workspaceId, command.routineId, current.revision + 1)],
+  );
+  const result = await explainFailure(run, async () => {
+    const row = await loadRoutine(db, workspaceId, command.routineId);
+    return row.revision === current.revision ? null : staleRoutine(row.revision);
+  });
+  if (result.replayed) return result;
+  return { ...result, response: { ...result.response, secret } };
+};
+
 /** Deletes the Routine and its occurrences in one batch; Jobs it created stay (they do not reference the Routine). */
 const routineDelete: Handler<v.InferOutput<typeof RoutineDelete>> = async (db, user, env) => {
   const { workspaceId, command } = env;
@@ -2301,6 +2390,12 @@ const routineDelete: Handler<v.InferOutput<typeof RoutineDelete>> = async (db, u
     user.userId,
     env,
     [
+      db
+        .prepare("DELETE FROM routine_webhook_deliveries WHERE routine_id = ?")
+        .bind(command.routineId),
+      db
+        .prepare("DELETE FROM routine_webhook_rate_limits WHERE routine_id = ?")
+        .bind(command.routineId),
       db
         .prepare("DELETE FROM routine_occurrences WHERE workspace_id = ? AND routine_id = ?")
         .bind(workspaceId, command.routineId),
@@ -2803,6 +2898,7 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "routine.pause": routinePause,
   "routine.resume": routineResume,
   "routine.run": routineRun,
+  "routine.rotate_secret": routineRotateSecret,
   "routine.delete": routineDelete,
   "approval.resolve": approvalResolve,
   "memory.write": userMemoryWrite,

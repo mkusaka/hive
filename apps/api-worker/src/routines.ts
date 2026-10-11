@@ -26,14 +26,33 @@ export const routineFrom = `routines r
 type Change = Omit<Parameters<typeof appendChange>[1], "workspaceId">;
 
 /**
- * One `created` occurrence: a `routine.fired` Event (never routed; it carries `inputText` for the run context), the
- * Inbox item (lane = the Conversation, else `routine:<id>`; purpose `routine`) and its queued Job
- * (`trigger_key = inbox:<item>`, like every Inbox-triggered Job). UNIQUE (routine, schedule_revision, scheduled_at)
- * makes a second occurrence fail the batch (AT-31).
+ * One Routine occurrence. A skipped one records only its durable history; a created one also writes the `routine.fired`
+ * Event, Inbox item and queued Job. The occurrence key is the timer instant for scheduled work and a source identity
+ * for immediate triggers, so AT-31 stays durable without collapsing a webhook burst that shares one millisecond.
  */
-export const occurrenceStatements = (db: D1Database, r: RoutineRow, scheduledAt: string) => {
+export const occurrenceStatements = (
+  db: D1Database,
+  r: RoutineRow,
+  scheduledAt: string,
+  input: { occurrenceKey?: string; payload?: unknown; skipped?: boolean } = {},
+) => {
   const workspaceId = r.workspace_id;
   const [occurrenceId, eventId, inboxItemId, jobId] = [1, 2, 3, 4].map(() => crypto.randomUUID());
+  const occurrenceKey = input.occurrenceKey ?? scheduledAt;
+  if (input.skipped) {
+    return {
+      statements: [
+        insertOccurrence(db, r, scheduledAt, null, occurrenceId, occurrenceKey, input.payload),
+      ],
+      changes: [] as Change[],
+      occurrenceId: occurrenceId!,
+      jobId: null,
+    };
+  }
+  const inputText =
+    input.payload === undefined
+      ? r.input_text
+      : `${r.input_text}\n\n\`\`\`json\n${JSON.stringify(input.payload, null, 2)}\n\`\`\``;
   const scope = r.channel_id ? `channel:${r.channel_id}` : `workspace:${workspaceId}`;
   const statements = [
     insertEvent(db, {
@@ -46,7 +65,13 @@ export const occurrenceStatements = (db: D1Database, r: RoutineRow, scheduledAt:
       actorId: `routine:${r.id}`,
       subjectKind: "routine",
       subjectId: r.id,
-      data: { routineId: r.id, occurrenceId, scheduledAt, inputText: r.input_text },
+      data: {
+        routineId: r.id,
+        occurrenceId,
+        scheduledAt,
+        inputText,
+        ...(input.payload === undefined ? {} : { payload: input.payload }),
+      },
       correlationId: occurrenceId!,
       occurredAt: scheduledAt,
       receivedAt: new Date().toISOString(),
@@ -68,7 +93,7 @@ export const occurrenceStatements = (db: D1Database, r: RoutineRow, scheduledAt:
       triggerKey: `inbox:${inboxItemId}`,
       taskId: r.task_id ?? undefined,
     }),
-    insertOccurrence(db, r, scheduledAt, jobId!, occurrenceId),
+    insertOccurrence(db, r, scheduledAt, jobId!, occurrenceId, occurrenceKey, input.payload),
   ];
   const changes: Change[] = [
     { entityKind: "inbox_item", entityId: inboxItemId!, scope },
@@ -83,11 +108,14 @@ const insertOccurrence = (
   scheduledAt: string,
   jobId: string | null,
   id: string = crypto.randomUUID(),
+  occurrenceKey: string = scheduledAt,
+  payload?: unknown,
 ) =>
   db
     .prepare(
-      `INSERT INTO routine_occurrences (id, workspace_id, routine_id, schedule_revision, scheduled_at, state, job_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO routine_occurrences
+         (id, workspace_id, routine_id, schedule_revision, scheduled_at, occurrence_key, payload, state, job_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       id,
@@ -95,13 +123,15 @@ const insertOccurrence = (
       r.id,
       r.schedule_revision,
       scheduledAt,
+      occurrenceKey,
+      payload === undefined ? null : JSON.stringify(payload),
       jobId ? "created" : "skipped",
       jobId,
     );
 
 const iso = (ms: number) => new Date(ms).toISOString();
 /** `skip`: an occurrence later than this is not run. */
-const skipGraceMs = 5 * 60_000;
+export const routineSkipGraceMs = 5 * 60_000;
 const maxRecorded = 50;
 const maxMissed = 1440;
 
@@ -113,6 +143,7 @@ const maxMissed = 1440;
 const dueTimes = (schedule: RoutineSchedule, nextFireAt: string, now: number) => {
   const due = [nextFireAt];
   if (schedule.kind === "once") return { due, next: null };
+  if (schedule.kind !== "cron") return { due: [], next: null };
   const cron = parseCron(schedule.expr);
   for (let t = Date.parse(nextFireAt); ;) {
     const n = nextCron(cron, schedule.timezone, t);
@@ -172,7 +203,7 @@ const fireRoutine = async (
   const run =
     r.misfire === "coalesce"
       ? fresh.slice(-1)
-      : fresh.filter((at) => now - Date.parse(at) <= skipGraceMs);
+      : fresh.filter((at) => now - Date.parse(at) <= routineSkipGraceMs);
   const created = run.map((at) => occurrenceStatements(db, r, at));
   const [setGuard, clearGuard] = guard(db);
   try {

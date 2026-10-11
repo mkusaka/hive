@@ -159,7 +159,7 @@ another Workspace cannot be linked.
 | Knowledge      | memories, memory_revisions, context_snapshots, source_refs              | original source, ACL inheritance, memory version                 |
 | Search         | search_documents, search_document_scopes, search_fts                    | source ID + chunk + revision, FTS rowid                          |
 | Objects        | artifacts, artifact_links, transcript_streams, transcript_parts         | transcript stream + part_seq UNIQUE, object hash                 |
-| Automation     | routines, routine_occurrences, integration_installations, external_refs | routine version + scheduled_at UNIQUE                            |
+| Automation     | routines, routine_occurrences, integration_installations, external_refs | routine version + occurrence_key UNIQUE                          |
 | Infrastructure | operation_receipts, change_log, outbox, audit_log                       | operation key UNIQUE, outbox lease, change cursor                |
 
 Migrations are split per feature; tables are not all introduced at once. Schema comments classify each table as
@@ -1018,6 +1018,27 @@ type Subscription = {
   are skipped by default, repeated local times run once; if both are configured to run, each UTC occurrence is
   identified separately.
 - Routines never call a model directly; they create Events / Jobs. Manual runs use the same Job contract.
+
+Implemented as (ROUTINE-02): one Routine model has `cron`, `once`, `webhook` and `event` triggers in `schedule`.
+Webhook creation and `routine.rotate_secret` disclose a per-routine secret once; receipts and list responses never
+retain it. The secret encodes 32 random bytes with a prefix making it longer than HMAC-SHA256's 64-byte key block.
+Only SHA-256(secret), the equivalent normalized HMAC key, is stored. Callers sign the raw body with the displayed
+secret: `X-Hive-Signature: sha256=<hex HMAC-SHA256>`, `POST /v1/hooks/routines/:routineId`. That path bypasses Access
+on the API custom domain (infra/README.md), but the Worker still verifies the signature. JSON is at most 64 KiB;
+disabled Routines return 409, invalid signatures 401, and the per-routine 60/minute budget returns 429.
+An optional `X-Hive-Delivery` dedupes within that Routine for seven days. The occurrence's `payload` reaches the
+Run's inbox text as fenced JSON after `inputText`.
+
+An `event` trigger contains the existing Subscription filter AST. The same event router evaluates it for
+`event.emit` and normalized integration events and creates occurrences through the Routine's normal Inbox / Job
+path, with dedupe, enabled and misfire rules intact. Unlike a Subscription, which routes raw events, a Routine
+carries its Bot instructions (`inputText`), Conversation and Task. Users still emit only `custom.*` events.
+`routine.update` can replace a trigger kind and bumps `schedule_revision`; `routine.run` remains manual.
+Occurrence identity is a timed UTC instant, `event:<eventId>`, a manual command operation id, or a fresh webhook id.
+Webhook delivery receipts expire after seven days without making occurrence history reusable. Event `skip` drops
+work routed more than five minutes after receipt; `coalesce` processes the matching event despite routing delay.
+Desktop editors expose all four triggers, one-time copyable webhook secrets and a validated event filter.
+CLI creation supports `--webhook` / `--event-filter <json>`; `routine rotate-secret <id>` reissues the secret.
 
 Implemented as (UI-03): the desktop presents Routines per Channel. The Channel panel lists the Routines whose
 Conversation is the Channel's (`GET /v1/routines?conversationId=`), each with its assigned Bot, and creates new ones

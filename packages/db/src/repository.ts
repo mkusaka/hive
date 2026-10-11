@@ -1267,6 +1267,8 @@ export const routeToRecipients = async (
     eventId: string;
     correlationId?: string;
     recipients: Omit<Recipient, "workspaceId">[];
+    /** Other work owned by the same event-router receipt, such as Routine occurrences. */
+    additionalStatements?: D1PreparedStatement[];
   },
 ): Promise<
   { routed: false } | { routed: true; deliveries: { deliveryId: string; jobId: string | null }[] }
@@ -1288,7 +1290,10 @@ export const routeToRecipients = async (
       deliveries[i]!.jobId,
     ),
   );
-  const routed = await routeOnce(db, input.workspaceId, input.eventId, statements);
+  const routed = await routeOnce(db, input.workspaceId, input.eventId, [
+    ...statements,
+    ...(input.additionalStatements ?? []),
+  ]);
   return routed ? { routed: true, deliveries } : { routed: false };
 };
 

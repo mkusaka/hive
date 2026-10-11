@@ -2,6 +2,7 @@
 // by main.ts, so tests drive `run` with fakes.
 import { fileURLToPath } from "node:url";
 import { type ParseArgsOptionsConfig, parseArgs } from "node:util";
+import { FilterExpression, parse } from "@hive/contracts";
 import { parseConcurrency } from "@hive/executor/capabilities";
 import {
   type CloudClient,
@@ -847,18 +848,56 @@ const specs: Record<string, Spec> = {
   },
   "routine create": {
     usage:
-      '--bot <bot-id> --name <name> --cron "<m h dom mon dow>" --input <text> [--tz <zone>] [--channel <channel-id>] [--misfire skip|coalesce]',
-    options: { bot: str, name: str, cron: str, input: str, tz: str, channel: str, misfire: str },
+      '--bot <bot-id> --name <name> (--cron "<m h dom mon dow>" | --webhook | --event-filter <json>) --input <text> [--tz <zone>] [--channel <channel-id>] [--misfire skip|coalesce]',
+    options: {
+      bot: str,
+      name: str,
+      cron: str,
+      webhook: flag,
+      "event-filter": str,
+      input: str,
+      tz: str,
+      channel: str,
+      misfire: str,
+    },
     run: async (c) => {
+      const { cron, webhook, "event-filter": eventFilter } = c.values;
+      if (
+        [cron, webhook || undefined, eventFilter].filter((value) => value !== undefined).length !==
+        1
+      )
+        throw invalid("exactly one of --cron, --webhook, --event-filter is required");
+      let schedule:
+        | { kind: "cron"; expr: string; timezone: string }
+        | { kind: "webhook" }
+        | { kind: "event"; filter: cmd.Json };
+      if (webhook) {
+        schedule = { kind: "webhook" };
+      } else if (eventFilter !== undefined) {
+        let filter: unknown;
+        try {
+          filter = JSON.parse(eventFilter as string);
+        } catch {
+          throw invalid("--event-filter must contain valid JSON");
+        }
+        const parsed = parse(FilterExpression, filter);
+        if (!parsed.ok) throw invalid("--event-filter must be a valid filter expression");
+        schedule = { kind: "event", filter: parsed.value as cmd.Json };
+      } else {
+        schedule = {
+          kind: "cron",
+          expr: need(c.values, "cron"),
+          // Default: this machine's zone.
+          timezone:
+            (c.values.tz as string | undefined) ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
+        };
+      }
       const channel = c.values.channel as string | undefined;
       c.print(
         await cmd.routineCreate(c.client(), c.envelope(), {
           botId: need(c.values, "bot"),
           name: need(c.values, "name"),
-          cron: need(c.values, "cron"),
-          // Default: this machine's zone.
-          timezone:
-            (c.values.tz as string | undefined) ?? Intl.DateTimeFormat().resolvedOptions().timeZone,
+          schedule,
           inputText: need(c.values, "input"),
           conversationId:
             channel && (await cmd.findConversation(c.client(), c.workspace(), channel)),
@@ -870,6 +909,11 @@ const specs: Record<string, Spec> = {
   "routine list": {
     usage: "",
     run: async (c) => c.print(await cmd.listRoutines(c.client(), c.workspace())),
+  },
+  "routine rotate-secret": {
+    usage: "<routine-id>",
+    args: 1,
+    run: async (c) => c.print(await cmd.routineRotateSecret(c.client(), c.envelope(), c.args[0]!)),
   },
   ...Object.fromEntries(
     (["run", "pause", "resume", "delete"] as const).map((action) => [

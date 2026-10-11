@@ -501,17 +501,22 @@ export const RoutineSchedule = v.variant("kind", [
     timezone: v.pipe(v.string(), v.check(isTimeZone, "unknown IANA timezone")),
   }),
   v.strictObject({ kind: v.literal("once"), at: Timestamp }),
+  v.strictObject({ kind: v.literal("webhook") }),
+  v.strictObject({ kind: v.literal("event"), filter: FilterExpression }),
 ]);
 export type RoutineSchedule = v.InferOutput<typeof RoutineSchedule>;
 
 /**
- * `next_fire_at` when a schedule is set or resumed at `now` (ms): a `once` keeps its `at` even if past (it fires on the
- * next tick, subject to misfire); a cron gets its first occurrence after `now`. Null when none is left.
+ * `next_fire_at` when a timed schedule is set or resumed at `now` (ms): a `once` keeps its `at` even if past (it fires
+ * on the next tick, subject to misfire); a cron gets its first occurrence after `now`. Non-timed triggers have none.
  */
 export const firstFireAt = (schedule: RoutineSchedule, now: number) => {
   if (schedule.kind === "once") return new Date(schedule.at).toISOString();
-  const at = nextCron(parseCron(schedule.expr), schedule.timezone, now);
-  return at === null ? null : new Date(at).toISOString();
+  if (schedule.kind === "cron") {
+    const at = nextCron(parseCron(schedule.expr), schedule.timezone, now);
+    return at === null ? null : new Date(at).toISOString();
+  }
+  return null;
 };
 
 const RoutineSpec = {
@@ -554,6 +559,11 @@ export const RoutineResume = v.strictObject({
 });
 /** Manual run: an occurrence at now through the same Inbox item + Job path; the schedule is not advanced. */
 export const RoutineRun = v.strictObject({ type: v.literal("routine.run"), routineId: RoutineId });
+/** Replaces a webhook secret; the new secret is returned once and is never stored in an operation receipt. */
+export const RoutineRotateSecret = v.strictObject({
+  type: v.literal("routine.rotate_secret"),
+  routineId: RoutineId,
+});
 /** Deletes the Routine and its occurrence history; Jobs it already created stay. */
 export const RoutineDelete = v.strictObject({
   type: v.literal("routine.delete"),

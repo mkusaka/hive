@@ -28,6 +28,7 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/devices?workspaceId=`                                  | Access assertion (user)           | Devices of the Workspace, no credentials (max 500)                                                                                                                                             |
 | `GET /v1/jobs?limit=&state=`                                    | Access assertion (user)           | Newest-first Jobs (limit 1..200, default 50), optionally of one state                                                                                                                          |
 | `GET /v1/routines?workspaceId=`                                 | Access assertion (user)           | Routines of the Workspace with their schedule (max 500), optionally of one `botId` / `conversationId`; see Routines below                                                                      |
+| `POST /v1/hooks/routines/:routineId`                            | `X-Hive-Signature` (HMAC-SHA256)  | Public signed Routine webhook; JSON ≤ 64 KiB, optional `X-Hive-Delivery` dedupe for seven days, 60/minute/routine                                                                              |
 | `GET /v1/projects?workspaceId=`                                 | Access assertion (user)           | Projects of the Workspace (max 500)                                                                                                                                                            |
 | `GET /v1/tasks?workspaceId=&projectKey=&status=`                | Access assertion (user)           | Tasks with computed `display` and `prerequisites` (max 500); see Work below                                                                                                                    |
 | `GET /v1/tasks/:id`                                             | Access assertion (user)           | A Task with prerequisites, dependents, Results, Jobs and the `git` rollup of its Runs                                                                                                          |
@@ -218,10 +219,12 @@ docs/architecture.md §17.2. A Routine (`routines`) names a Bot, input text, an 
 target) and Task, a schedule and a misfire policy. It creates Inbox items and Jobs; it never calls a model.
 
 - **Schedule.** `{kind: "cron", expr, timezone}` (5 fields, numbers / `*` / lists / ranges / steps, an IANA zone;
-  `@hive/contracts` `cron.ts`) or `{kind: "once", at}`. `next_fire_at` is the next UTC occurrence. A local time in a
-  DST gap is skipped; a repeated local time fires once.
+  `@hive/contracts` `cron.ts`), `{kind: "once", at}`, `{kind: "webhook"}` or
+  `{kind: "event", filter}` (the Subscription filter AST). Only timed triggers have `next_fire_at`.
+  A local time in a DST gap is skipped; a repeated local time fires once.
 - **Tick** (pump, `fireDueRoutines`): every enabled Routine with `next_fire_at <= now` gets, in one guarded batch,
-  its occurrences (`routine_occurrences`, UNIQUE (routine, schedule_revision, scheduled_at)), each with a
+  its occurrences (`routine_occurrences`, UNIQUE (routine, schedule_revision, occurrence_key); timed keys are
+  `scheduled_at`), each with a
   `routine.fired` Event (source `routine`, never routed), an Inbox item (purpose `routine`, lane = Conversation or
   `routine:<id>`) and a queued Job (`trigger_key = inbox:<item>`, like every Inbox-triggered Job, so the run context
   and result settle the item; the body is the input text), and `next_fire_at` advanced by a CAS on
@@ -234,6 +237,26 @@ schedule?, inputText?, misfire?}` (revision CAS; a new schedule bumps `schedule_
   `routine.pause`, `routine.resume` (restarts from now, no catch-up), `routine.run` (manual: an occurrence at now
   through the same statements; the schedule is not advanced) and `routine.delete` (the Routine and its occurrences in
   one batch; Jobs it created stay; 404 when missing).
+- **Webhook (ROUTINE-02).** Creation, switching to a webhook trigger, and
+  `routine.rotate_secret {routineId}` return a `secret` once and `hookPath`. Resolve the path against the API URL.
+  List responses and operation receipts never disclose the secret; retrying a creation/rotation receipt cannot
+  recover it. Sign the exact POST bytes using the displayed secret as the HMAC-SHA256 key and send
+  `X-Hive-Signature: sha256=<lowercase hex>`. The secret is a prefixed encoding of 32 random bytes, longer than
+  HMAC-SHA256's 64-byte block; its stored SHA-256 digest is the equivalent normalized HMAC key, not plaintext.
+  Rotate to invalidate the old key. Auth does not use Access: deploy the custom-domain path bypass in
+  `infra/README.md`. Disabled Routines return 409, bad signatures 401, oversized bodies 413 and the per-routine
+  budget 429. Optional `X-Hive-Delivery` dedupes per Routine for seven days. JSON is stored as occurrence `payload`
+  and appended to the Run's inbox text as a fenced JSON block after `inputText`.
+- **Event (ROUTINE-02).** The existing event router evaluates enabled Routine filters as well as Subscriptions
+  for `event.emit` and normalized integration events. An occurrence uses the same Inbox / Job path and dedupe /
+  misfire rules. A Routine supplies `inputText`, Conversation and Task; a Subscription routes raw events.
+  For example, `{kind: "event", filter: {op: "eq", field: "type", value: "custom.demo.ping"}}`.
+  Users still emit only `custom.*`; changing trigger kinds through `routine.update` bumps `schedule_revision`.
+  Event occurrence keys are `event:<eventId>`: retries collapse, but distinct events sharing a timestamp do not.
+  `skip` records events routed more than five minutes after `received_at` as skipped; `coalesce` processes the
+  matched event even after that delay. Webhook delivery ids may be reused after seven days because expiry applies
+  to the delivery receipt, not the permanent occurrence history. Acceptance is fenced in the same D1 batch against
+  pause, trigger replacement and secret rotation.
 
 ## Work
 
@@ -404,7 +427,7 @@ WebSocket Hibernation API. It holds connections only, never state (ADR-04); ever
 
 - `agent.message.sent`: one batch writes the consumer receipt, an `event_deliveries` row, links the existing
   inbox item to it and, for `wake`, inserts a `queued` Job with trigger key `inbox:<inboxItemId>`.
-- Any other event: Subscription routing (see Subscriptions above); no match writes only the consumer receipt.
+- Any other event: Subscription and event Routine routing (see above); no match writes only the consumer receipt.
 - Then due Inbox batches are sealed into one Job each, due Routines fire, expired leases are recovered and Jobs of
   offline devices are parked (see Recovery and Routines), timed-out approvals expire and delegations are closed (see
   Work). The response is `{processed, dead, sealed, routineJobs, expired, parked, approvalsExpired, delegations}`; the
