@@ -9,6 +9,7 @@ export const memoryJournal = (entries: JournalEntry[] = []) => ({
 });
 
 export const context: RunContext = {
+  jobKind: "normal",
   bot: {
     id: "bot-1",
     name: "coder",
@@ -39,6 +40,9 @@ export const context: RunContext = {
   replies: [],
   memories: [],
   related: [],
+  summary: null,
+  summarization: null,
+  consolidation: null,
   previousProviderSessionId: null,
   delegation: null,
 };
@@ -124,6 +128,7 @@ export const fakeCloud = (overrides: Partial<CloudClient> = {}) => {
         id: "job-1",
         botId: "bot-1",
         revision: 1,
+        jobKind: "normal",
         inboxItemId: "inbox-1",
         placement: {} as never,
         createdAt: "",

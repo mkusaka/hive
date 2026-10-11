@@ -47,7 +47,11 @@ hive status                                           # sync, outbox, search, Jo
 hive search <query> [--kinds message,task,memory,run] # GET /v1/search; 1-2 characters take the bounded short path
 hive memory write --scope <workspace|channel:<id>|project:<id>|bot:<id>|task:<id>> (--content <text> | --file <path|->)
 hive memory list --scope <...>                         # live memories of the scope, newest first
-hive memory delete <memory-id> [--revision <n>]        # tombstone; a live memory is at revision 1
+hive memory delete <memory-id> [--revision <n>]        # tombstone at the supplied revision (default 1)
+hive memory consolidate --bot <bot-id> [--channel <channel-id>]  # queues a consolidation Job
+hive memory promote <memory-id>                        # copies a proposed Memory to workspace scope
+hive conversation summarize <conversation-id>          # queues a summary Job
+hive conversation summary <conversation-id>            # latest summary and coverage
 hive agent send <bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]
 hive message post (--channel <channel-id> | --conversation <dm-id>) [--thread-of <message-id>] [--reply-to <message-id>] --text <text> [--attach <path>...] [--resolve-names]  # in a channel every non-viewer member Bot wakes; <@bot:ID> / <@everyone> / --reply-to on a Bot's message narrow or widen it (a DM always wakes its Bot); --thread-of replies in that message's thread (non-viewer member Bots already in it wake too); --resolve-names maps @name, @everyone / @all
 hive attachment get <attachment-id> --out <path>         # downloads an attachment you may read
@@ -144,7 +148,8 @@ a fresh UUID per invocation).
   `--environment <name> --cwd-mode environment` then runs in that checkout on devices that registered the name.
 - **`search`** and **`memory`** follow `apps/api-worker/README.md`, Search and memory. The dispatcher matches
   three-word commands first, then two-word commands, then one-word commands. `memory delete` defaults `--revision`
-  to 1 because a memory's content never changes (corrections supersede it); a deleted one is 422 (exit 2).
+  to 1; pass the current revision after promotion changes proposal metadata. Corrections supersede immutable content;
+  a deleted memory is 422 (exit 2).
 - **`effect resolve`** is manual recovery of an `unknown` effect (`--succeeded` / `--failed`) or a re-send of an
   `unknown` or performed `failed` one (`--retry`); see `apps/api-worker/README.md`, External effects. `--tools`,
   `--effects`, and `--manage` each replace or merge only their own part of the Bot policy; the other parts are kept.

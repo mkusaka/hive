@@ -189,7 +189,142 @@ export const indexSource = async (
  * Who may read which documents. `scopes` are exact ACL scopes; `allBotsAndTasks` (users) adds every `bot:` / `task:`
  * scope of the Workspace, since Bots and Tasks are Workspace-visible to members.
  */
-export type SearchAccess = { workspaceId: string; scopes: string[]; allBotsAndTasks: boolean };
+export type SearchAccess = {
+  workspaceId: string;
+  scopes: string[];
+  allBotsAndTasks: boolean;
+  userId?: string;
+  botId?: string;
+  /** An ordinary Run's explicit delivery grants access to its Job's conversation, even before the Bot joins. */
+  jobId?: string;
+};
+
+const sqlString = (value: string) => `'${value.replaceAll("'", "''")}'`;
+
+/** Threads inherit their parent's ACL; backing Channels never make DMs or bot pairs public. */
+export const conversationReadableSql = (access: SearchAccess) => {
+  const actor = access.userId
+    ? `p.kind = 'dm' AND p.dm_user_id = ${sqlString(access.userId)}`
+    : access.botId
+      ? `p.kind = 'dm' AND p.dm_bot_id = ${sqlString(access.botId)}`
+      : "0";
+  const channelMember = access.userId
+    ? `a.user_id = ${sqlString(access.userId)}`
+    : access.botId
+      ? `a.id = (SELECT actor_id FROM bots WHERE workspace_id = p.workspace_id AND id = ${sqlString(access.botId)})`
+      : "0";
+  const pair = access.botId
+    ? `OR (p.kind = 'bot_pair' AND (p.id LIKE 'botpair:' || ${sqlString(access.botId)} || ':%'
+          OR p.id LIKE 'botpair:%:' || ${sqlString(access.botId)}))`
+    : "";
+  const delivery =
+    access.botId && access.jobId
+      ? `OR (p.kind = 'channel' AND EXISTS (
+        SELECT 1 FROM jobs j
+        LEFT JOIN inbox_items i ON i.workspace_id = j.workspace_id
+          AND ('inbox:' || i.id = j.trigger_key OR i.batch_id = j.inbox_batch_id)
+        LEFT JOIN delegations d ON d.workspace_id = j.workspace_id AND d.id = j.delegation_id
+        JOIN conversations delivered ON delivered.workspace_id = j.workspace_id
+          AND delivered.id = COALESCE(j.conversation_id, i.conversation_id, d.conversation_id)
+        WHERE j.workspace_id = p.workspace_id AND j.id = ${sqlString(access.jobId)}
+          AND j.bot_id = ${sqlString(access.botId)} AND j.job_kind = 'normal'
+          AND COALESCE(delivered.parent_conversation_id, delivered.id) = p.id))`
+      : "";
+  return `EXISTS (SELECT 1 FROM conversations p
+    WHERE p.workspace_id = c.workspace_id AND p.id = COALESCE(c.parent_conversation_id, c.id)
+      AND 'channel:' || p.channel_id IN (SELECT value FROM json_each(${sqlString(JSON.stringify(access.scopes))}))
+      AND ((${actor}) ${pair} ${delivery} OR (p.kind = 'channel' AND EXISTS (
+        SELECT 1 FROM channel_members cm JOIN actors a ON a.workspace_id = cm.workspace_id AND a.id = cm.actor_id
+        WHERE cm.workspace_id = p.workspace_id AND cm.channel_id = p.channel_id AND ${channelMember}))))`;
+};
+
+const memoryLineageSql = `WITH RECURSIVE lineage(id) AS (
+  SELECT m.id
+  UNION SELECT ref.value FROM lineage l JOIN memories src ON src.id = l.id AND src.workspace_id = m.workspace_id
+    JOIN json_each(src.merged_from_ids) ref
+  UNION SELECT src.supersedes_id FROM lineage l JOIN memories src ON src.id = l.id AND src.workspace_id = m.workspace_id
+    WHERE src.supersedes_id IS NOT NULL
+)`;
+
+/** Include inherited provenance and pre-DREAM explicit Run sources, even after their memories are tombstoned. */
+const memorySourceConversationsSql = `${memoryLineageSql}
+  SELECT ref.value AS conversationId FROM lineage l
+    JOIN memories src ON src.id = l.id AND src.workspace_id = m.workspace_id
+    JOIN json_each(src.source_conversation_ids) ref
+  UNION SELECT c.id FROM lineage l JOIN memories src ON src.id = l.id AND src.workspace_id = m.workspace_id
+    JOIN runs r ON src.source_kind = 'bot' AND r.workspace_id = src.workspace_id AND r.id = src.source_id
+    JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
+    LEFT JOIN inbox_items i ON i.workspace_id = j.workspace_id AND ('inbox:' || i.id = j.trigger_key OR i.batch_id = j.inbox_batch_id)
+    LEFT JOIN delegations d ON d.workspace_id = j.workspace_id AND d.id = j.delegation_id
+    JOIN conversations c ON c.workspace_id = j.workspace_id AND c.id = COALESCE(j.conversation_id, i.conversation_id, d.conversation_id)
+  UNION SELECT c.id FROM lineage l JOIN memories src ON src.id = l.id AND src.workspace_id = m.workspace_id
+    JOIN conversations c ON c.workspace_id = src.workspace_id AND c.channel_id = src.scope_id
+    WHERE src.scope_kind = 'channel' AND c.kind != 'thread'`;
+
+export const memoryReadableSql = (access: SearchAccess) => `NOT EXISTS (
+  ${memoryLineageSql}
+  SELECT 1 FROM lineage l LEFT JOIN memories src ON src.id = l.id AND src.workspace_id = m.workspace_id
+  WHERE src.id IS NULL OR NOT (
+    ${access.allBotsAndTasks ? "src.scope_kind IN ('bot', 'task', 'project', 'workspace') OR" : ""}
+    CASE WHEN src.scope_kind = 'project' THEN 'workspace:' || src.workspace_id
+      ELSE src.scope_kind || ':' || src.scope_id END
+      IN (SELECT value FROM json_each(${sqlString(JSON.stringify(access.scopes))}))))
+  AND NOT EXISTS (SELECT 1 FROM (${memorySourceConversationsSql}) refs
+    LEFT JOIN conversations c ON c.workspace_id = m.workspace_id AND c.id = refs.conversationId
+    WHERE c.id IS NULL OR NOT (${conversationReadableSql(access)}))`;
+
+export const memoryProvenance = async (db: D1Database, workspaceId: string, memoryId: string) => {
+  const row = await db
+    .prepare(
+      `SELECT (SELECT json_group_array(conversationId) FROM (${memorySourceConversationsSql})) AS sources
+      FROM memories m WHERE m.workspace_id = ? AND m.id = ?`,
+    )
+    .bind(workspaceId, memoryId)
+    .first<{ sources: string }>();
+  return row ? (JSON.parse(row.sources) as string[]) : [];
+};
+
+/** A Bot maintenance Run may read its own private lanes and Channels where the Bot remains a member. */
+export const botSearchAccess = async (
+  db: D1Database,
+  workspaceId: string,
+  botId: string,
+): Promise<SearchAccess> => {
+  const { results } = await db
+    .prepare(
+      `SELECT c.channel_id FROM conversations c WHERE c.workspace_id = ? AND c.kind != 'thread'
+      AND ((c.kind = 'dm' AND c.dm_bot_id = ?)
+        OR (c.kind = 'bot_pair' AND (c.id LIKE 'botpair:' || ? || ':%' OR c.id LIKE 'botpair:%:' || ?))
+        OR (c.kind = 'channel' AND EXISTS (SELECT 1 FROM channel_members cm JOIN bots b
+          ON b.workspace_id = cm.workspace_id AND b.actor_id = cm.actor_id
+          WHERE cm.workspace_id = c.workspace_id AND cm.channel_id = c.channel_id AND b.id = ?)))`,
+    )
+    .bind(workspaceId, botId, botId, botId, botId)
+    .all<{ channel_id: string }>();
+  return {
+    workspaceId,
+    botId,
+    allBotsAndTasks: false,
+    scopes: [
+      `workspace:${workspaceId}`,
+      `bot:${botId}`,
+      ...results.map((r) => `channel:${r.channel_id}`),
+    ],
+  };
+};
+
+/** Evaluated inside write batches as well as on reads, so a membership change cannot race a side effect. */
+export const sourcesReadableSql = (
+  access: SearchAccess,
+  conversations: string[],
+  memories: string[] = [],
+) => `
+  NOT EXISTS (SELECT 1 FROM json_each(${sqlString(JSON.stringify(conversations))}) ref
+    LEFT JOIN conversations c ON c.workspace_id = ${sqlString(access.workspaceId)} AND c.id = ref.value
+    WHERE c.id IS NULL OR NOT (${conversationReadableSql(access)}))
+  AND NOT EXISTS (SELECT 1 FROM json_each(${sqlString(JSON.stringify(memories))}) ref
+    LEFT JOIN memories m ON m.workspace_id = ${sqlString(access.workspaceId)} AND m.id = ref.value
+    WHERE m.id IS NULL OR NOT (${memoryReadableSql(access)}))`;
 
 export const searchAccess = async (
   db: D1Database,
@@ -199,6 +334,9 @@ export const searchAccess = async (
   workspaceId,
   scopes: await permittedScopes(db, workspaceId, principal),
   allBotsAndTasks: principal.kind === "user",
+  ...(principal.kind === "user"
+    ? { userId: principal.userId }
+    : { botId: principal.botId, jobId: principal.jobId }),
 });
 
 const permitted = `(d.scope IN (SELECT value FROM json_each(?)) OR (? AND (d.scope LIKE 'bot:%' OR d.scope LIKE 'task:%')))`;
@@ -257,7 +395,12 @@ export const searchDocuments = async (
     access.allBotsAndTasks ? 1 : 0,
   ];
   const where = `d.workspace_id = ? AND d.deleted_at IS NULL AND d.source_kind IN (SELECT value FROM json_each(?))
-    AND ${permitted} AND NOT (d.source_kind = 'message' AND d.source_id = ?)`;
+    AND ${permitted} AND NOT (d.source_kind = 'message' AND d.source_id = ?)
+    AND (d.source_kind != 'memory' OR EXISTS (SELECT 1 FROM memories m
+      WHERE m.workspace_id = d.workspace_id AND m.id = d.source_id AND m.deleted_at IS NULL AND ${memoryReadableSql(access)}))
+    AND (d.source_kind != 'message' OR EXISTS (SELECT 1 FROM messages sm JOIN conversations c
+      ON c.workspace_id = sm.workspace_id AND c.id = sm.conversation_id
+      WHERE sm.workspace_id = d.workspace_id AND sm.id = d.source_id AND ${conversationReadableSql(access)}))`;
   const exclude = input.excludeMessageId ?? "";
   if (input.match === undefined && codePoints(input.q).length < 3) {
     // Trigram MATCH needs 3 characters (§14.1). Short queries scan only the 200 newest permitted documents: a
@@ -380,7 +523,7 @@ export const rebuildSearch = async (db: D1Database, workspaceId: string) => {
 export const listMemories = async (
   db: D1Database,
   access: SearchAccess,
-  input: { scopeKind?: string; scopeId?: string },
+  input: { scopeKind?: string; scopeId?: string; source?: string },
 ) => {
   const { scopeKind } = input;
   const scopeId = scopeKind === "workspace" ? access.workspaceId : input.scopeId;
@@ -390,14 +533,26 @@ export const listMemories = async (
   if (scopeKind === "channel" && !access.scopes.includes(`channel:${scopeId}`)) {
     throw new HttpError("FORBIDDEN", "not a member of this channel");
   }
+  if (input.source && input.source !== "explicit" && input.source !== "consolidation") {
+    throw new HttpError("INVALID_INPUT", "source must be explicit or consolidation");
+  }
   const { results } = await db
     .prepare(
       `SELECT id, scope_kind AS scopeKind, scope_id AS scopeId, content, source_kind AS sourceKind,
-              source_id AS sourceId, revision, supersedes_id AS supersedesId, created_at AS createdAt
-         FROM memories WHERE workspace_id = ? AND scope_kind = ? AND scope_id = ? AND deleted_at IS NULL
+              source_id AS sourceId, source, merged_from_ids AS mergedFromIds,
+              source_conversation_ids AS sourceConversationIds, proposed_scope AS proposedScope, revision,
+              supersedes_id AS supersedesId, created_at AS createdAt
+         FROM memories m WHERE workspace_id = ? AND scope_kind = ? AND scope_id = ? AND deleted_at IS NULL
+           AND (? IS NULL OR source = ?) AND ${memoryReadableSql(access)}
         ORDER BY created_at DESC, id DESC LIMIT 200`,
     )
-    .bind(access.workspaceId, scopeKind, scopeId)
+    .bind(access.workspaceId, scopeKind, scopeId, input.source ?? null, input.source ?? null)
     .all<Memory>();
+  await Promise.all(
+    results.map(async (memory) => {
+      memory.mergedFromIds = JSON.parse(memory.mergedFromIds as unknown as string);
+      memory.sourceConversationIds = await memoryProvenance(db, access.workspaceId, memory.id);
+    }),
+  );
   return { memories: results };
 };

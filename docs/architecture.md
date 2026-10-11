@@ -945,6 +945,37 @@ with revision CAS. The Desktop Details editor and `hive bot skill add / remove` 
 - If revoked or re-scoped confidential data is already in a provider context, rebuild a ContextEpoch from only the
   new permitted scope. Removing it from search does not erase it from an old context.
 
+Implemented as (DREAM-01): maintenance work is an HTTPS-claimed Local Executor Job with `jobKind` `summarize`
+or `consolidate`; the Worker schedules, fences and stores it, never calls a model, and maintenance Runs never
+post conversation replies.
+
+- A summary records its conversation, optional Bot view, sequence coverage, revision, producing Run and
+  text of at most 8 KiB. Pinned facts preserve unresolved requests, decisions, prohibitions, in-progress Tasks
+  and references with source message IDs. Repeated facts with the same kind and text union their source IDs,
+  preserving prior evidence without duplicating pins. Summarization consumes the selected range and previous summary.
+  Automatic triggers use the unsummarized message threshold or context truncation; one summarize Job is active
+  per conversation. `conversation.summarize` requests the same work manually.
+- Normal context places the latest covering summary and pinned facts before recent messages, whose window starts
+  after `covers_to_seq`; current Task state remains authoritative. The durable ContextSnapshot records the
+  summary ID, selected messages, memory revisions and truncation rather than rewriting provider history.
+  Ordinary Runs retain the current-conversation access granted by explicit Job delivery; maintenance inputs
+  still require the Bot's current source access.
+- Consolidation reads one Bot or Channel scope's memories and permitted recent summaries. Writes carry
+  `source: consolidation`, merged memory IDs and inherited conversation provenance. Deletes and supersession
+  require the exact revisions this Run read; concurrent changes fail instead of deleting unseen knowledge.
+  Structured model output is validated completely before any maintenance command is submitted.
+- Workspace promotion is never automatic. A Bot memory may propose `proposedScope: workspace`; a human's
+  `memory.promote` copies it only after checking all source conversations, rejecting unreadable private sources
+  (AT-33). Dismiss tombstones the proposal using its revision.
+- Each Bot has an enabled system Routine with empty input and `jobKind: consolidate`, scheduled nightly at
+  03:00 in the Workspace timezone (UTC initially). Bot Details pauses/resumes it; `memory.consolidate` is manual.
+  Library exposes consolidated provenance, source filters and proposal actions; Channel About exposes coverage
+  and Summarize now. CLI exposes consolidation, promotion and conversation summary commands.
+- Claude uses fixed, no-native-tool maintenance prompts and SDK-enforced draft-7 JSON schemas generated from
+  the local validators. Only structured output is accepted, not assistant prose or fenced JSON; byte bounds,
+  source access and revisions are still checked locally. Codex maintenance is explicitly unsupported rather
+  than falling through to normal tool-enabled execution.
+
 ## 14. Search (§17)
 
 FTS5 lives in D1. Local FTS is only an optional offline cache. PC1 and PC2 query the same Search API [S07].
@@ -1039,6 +1070,10 @@ notification → batch in the Task lane → refetch current PR HEAD and reviews 
   user ID references in accessible message events, never by name string matching or stripping all `<@...>`.
 - What Slack delivers depends on scopes, installation, channel membership and workspace policy [S20]. Private
   channels need proper membership; creating a Subscription grants no visibility.
+
+Implemented as (DREAM-01): Slack-derived conversation messages use the same summary coverage and memory
+consolidation rules in §13.6. Pinned facts retain source message IDs; derived memories retain their source
+conversation restrictions, and a Subscription or summary never grants wider read or promotion rights.
 
 ### 16.2 Thread / channel watching (§19.2)
 

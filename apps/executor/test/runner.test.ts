@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { fakeAdapter } from "../src/adapters/fake.ts";
 import { fileJournal } from "../src/journal.ts";
 import { type AgentAdapter, type JournalEntry, reconcile, runOnce } from "../src/runner.ts";
-import { fakeCloud, memoryJournal, stale } from "./helpers.ts";
+import { context, fakeCloud, fakeRunApi, memoryJournal, stale } from "./helpers.ts";
 
 describe("runOnce", () => {
   it("claims, journals the intent before starting, renews the lease and submits the result", async () => {
@@ -116,6 +116,149 @@ describe("runOnce", () => {
     expect(stops).toEqual(["cancelled"]);
     expect(result?.state).toBe("failed");
     expect(submitted).toEqual([expect.objectContaining({ state: "failed", error: "cancelled" })]);
+  });
+
+  it("writes a validated summary without posting a conversation reply", async () => {
+    const { api, calls } = fakeRunApi();
+    const summaryContext = {
+      ...context,
+      jobKind: "summarize" as const,
+      summarization: {
+        conversationId: "conv-1",
+        botId: "bot-1",
+        coversFromSeq: 1,
+        coversToSeq: 2,
+        messages: [],
+        previousSummary: null,
+      },
+    };
+    const { cloud, submitted } = fakeCloud({
+      claim: async () => ({
+        runId: "run-1",
+        executionId: "exec-1",
+        executionGeneration: 1,
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        capability: { token: "cap-1", expiresAt: "" },
+        job: { id: "job-1", botId: "bot-1", inboxItemId: "inbox-1", placement: {} as never },
+      }),
+      getRunContext: async () => summaryContext,
+      forRun: () => api,
+    });
+    const adapter: AgentAdapter = {
+      start: async () => ({
+        requestStop: async () => {},
+        waitForExit: async () => ({
+          code: 0,
+          reason: "exited",
+          summary: "claude: summary ready",
+          replyText: "must not be posted",
+          summaryOutput: {
+            text: "The deploy window is Friday.",
+            pinnedFacts: [
+              { kind: "decision", text: "Deploy Friday.", sourceMessageIds: ["msg-1"] },
+            ],
+          },
+        }),
+      }),
+    };
+
+    expect(await runOnce({ cloud, journal: memoryJournal(), adapter })).toMatchObject({
+      state: "succeeded",
+    });
+    expect(calls).toEqual([
+      {
+        type: "summary.write",
+        conversationId: "conv-1",
+        coversFromSeq: 1,
+        coversToSeq: 2,
+        text: "The deploy window is Friday.",
+        pinnedFacts: [{ kind: "decision", text: "Deploy Friday.", sourceMessageIds: ["msg-1"] }],
+      },
+    ]);
+    expect(submitted).toEqual([
+      expect.objectContaining({ state: "succeeded", summary: "claude: summary ready" }),
+    ]);
+    expect(submitted[0]).not.toHaveProperty("reply");
+  });
+
+  it("applies a validated consolidation plan through only guarded memory commands", async () => {
+    const { api, calls } = fakeRunApi();
+    const consolidationContext = {
+      ...context,
+      jobKind: "consolidate" as const,
+      consolidation: {
+        scopeKind: "bot" as const,
+        scopeId: "bot-1",
+        memories: [
+          {
+            id: "memory-1",
+            scopeKind: "bot" as const,
+            scopeId: "bot-1",
+            content: "Friday deploy.",
+            sourceKind: "bot" as const,
+            sourceId: "run-old",
+            source: "explicit" as const,
+            mergedFromIds: [],
+            sourceConversationIds: ["conv-1"],
+            proposedScope: null,
+            revision: 1,
+            supersedesId: null,
+            createdAt: "",
+          },
+        ],
+        summaries: [],
+      },
+    };
+    const { cloud } = fakeCloud({
+      claim: async () => ({
+        runId: "run-1",
+        executionId: "exec-1",
+        executionGeneration: 1,
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+        capability: { token: "cap-1", expiresAt: "" },
+        job: { id: "job-1", botId: "bot-1", inboxItemId: null, placement: {} as never },
+      }),
+      getRunContext: async () => consolidationContext,
+      forRun: () => api,
+    });
+    const adapter: AgentAdapter = {
+      start: async () => ({
+        requestStop: async () => {},
+        waitForExit: async () => ({
+          code: 0,
+          reason: "exited",
+          summary: "claude: consolidation ready",
+          consolidationPlan: {
+            writes: [
+              {
+                content: "Deploy Friday at 15:00.",
+                mergedFrom: [{ id: "memory-1", revision: 1 }],
+                sourceConversationIds: ["conv-1"],
+                proposedScope: "workspace",
+              },
+            ],
+            deletes: [{ id: "memory-1", revision: 1 }],
+          },
+        }),
+      }),
+    };
+
+    expect(await runOnce({ cloud, journal: memoryJournal(), adapter })).toMatchObject({
+      state: "succeeded",
+    });
+    expect(calls).toEqual([
+      {
+        type: "memory.write",
+        scopeKind: "bot",
+        scopeId: "bot-1",
+        content: "Deploy Friday at 15:00.",
+        source: "consolidation",
+        mergedFrom: [{ id: "memory-1", revision: 1 }],
+        sourceConversationIds: ["conv-1"],
+        proposedScope: "workspace",
+      },
+      { type: "memory.delete", memoryId: "memory-1", expectedRevision: 1 },
+    ]);
   });
 });
 

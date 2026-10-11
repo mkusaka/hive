@@ -114,13 +114,13 @@ describe("routines", () => {
     expect(inbox.items).toEqual([
       expect.objectContaining({ purpose: "routine", lane: conversationId, conversationId }),
     ]);
-    const [routine] = (
+    const routine = (
       await (
         await s.user.get(`/v1/routines?workspaceId=${s.workspaceId}`)
       ).json<{
         routines: Json[];
       }>()
-    ).routines;
+    ).routines.find((row) => row.id === routineId);
     expect(routine).toMatchObject({
       id: routineId,
       enabled: true,
@@ -199,7 +199,7 @@ describe("routines", () => {
           await s.user.get(`/v1/routines?workspaceId=${s.workspaceId}&botId=${botId}`)
         ).json<{ routines: { id: string }[] }>()
       ).routines.map((r) => r.id);
-    expect(await list(s.botId)).toEqual([routineId]);
+    expect(await list(s.botId)).toContain(routineId);
     expect(await list("other-bot")).toEqual([]);
   });
 

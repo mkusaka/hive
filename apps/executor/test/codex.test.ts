@@ -120,6 +120,29 @@ describe("codexAdapter", () => {
     expect(lines.at(-1)).toMatchObject({ dir: "in", msg: { method: "turn/completed" } });
   });
 
+  it("fails maintenance jobs explicitly before starting an app-server", async () => {
+    const { calls, agent } = await start("happy", {
+      context: {
+        ...context,
+        jobKind: "summarize",
+        summarization: {
+          conversationId: "conv-1",
+          botId: "bot-1",
+          coversFromSeq: 1,
+          coversToSeq: 1,
+          messages: [],
+          previousSummary: null,
+        },
+      },
+    });
+    expect(await agent.waitForExit()).toEqual({
+      code: 1,
+      reason: "unsupported job kind: summarize",
+      summary: "codex: maintenance jobs are unsupported",
+    });
+    expect(calls).toEqual([]);
+  });
+
   it("reuses a transcript that already holds turn/completed without spawning", async () => {
     const { dir } = await start("happy").then(async (s) => (await s.agent.waitForExit(), s));
     const { calls, fn } = fakeSpawn("crash");

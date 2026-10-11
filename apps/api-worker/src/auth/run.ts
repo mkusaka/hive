@@ -77,7 +77,7 @@ export const authenticateRun = async (request: Request, env: Bindings): Promise<
        LEFT JOIN inbox_items i ON i.workspace_id = j.workspace_id AND 'inbox:' || i.id = j.trigger_key
        LEFT JOIN delegations d ON d.workspace_id = j.workspace_id AND d.id = j.delegation_id
        LEFT JOIN conversations cv ON cv.workspace_id = j.workspace_id
-                                 AND cv.id = COALESCE(i.conversation_id, d.conversation_id)
+                                 AND cv.id = COALESCE(j.conversation_id, i.conversation_id, d.conversation_id)
        LEFT JOIN tasks t ON t.workspace_id = j.workspace_id AND t.id = j.task_id
       WHERE c.run_id = ? AND c.revoked_at IS NULL AND c.expires_at > ?
         AND r.execution_generation = c.execution_generation

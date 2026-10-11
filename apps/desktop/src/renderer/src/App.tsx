@@ -1279,6 +1279,7 @@ const SearchView = (props: { ws: string; openChannel: (channelId: string) => voi
 /** Memories of one scope (§13.6), newest first, and a form that writes one. */
 const MemoryView = (props: { ws: string; channels: Row[]; bots: Row[] }) => {
   const [scope, setScope] = useState(`workspace:${props.ws}`);
+  const [source, setSource] = useState<"all" | "explicit" | "consolidation">("all");
   const [memories, setMemories] = useState<Row[]>([]);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -1288,12 +1289,16 @@ const MemoryView = (props: { ws: string; channels: Row[]; bots: Row[] }) => {
   ];
   const load = useCallback(async () => {
     const res = await window.hive.api.get(
-      inWorkspace("memories", props.ws, { scopeKind, scopeId }),
+      inWorkspace("memories", props.ws, {
+        scopeKind,
+        scopeId,
+        ...(source === "all" ? {} : { source }),
+      }),
     );
     if (!res.ok) return setError(failure(res));
     setError(null);
     setMemories(res.value.memories as Row[]);
-  }, [props.ws, scopeKind, scopeId]);
+  }, [props.ws, scopeKind, scopeId, source]);
   useEffect(() => void load(), [load]);
   const write = async () => {
     const res = await window.hive.api.command({
@@ -1327,6 +1332,15 @@ const MemoryView = (props: { ws: string; channels: Row[]; bots: Row[] }) => {
               bot {text(b.name)}
             </option>
           ))}
+        </select>
+        <select
+          value={source}
+          onChange={(e) => setSource(e.target.value as typeof source)}
+          aria-label="Memory source"
+        >
+          <option value="all">All sources</option>
+          <option value="explicit">Explicit</option>
+          <option value="consolidation">Consolidated</option>
         </select>
       </h2>
       {error && <p className="error">{error}</p>}

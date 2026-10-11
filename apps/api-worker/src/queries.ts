@@ -11,6 +11,7 @@ import { HttpError } from "./errors.ts";
 import { placementDevices } from "./executor.ts";
 import { deviceReasons } from "./placement.ts";
 import { headCursor, permittedScopes } from "./sync.ts";
+import { conversationReadableSql, searchAccess } from "./search.ts";
 
 const notFound = (what: string) => new HttpError("NOT_FOUND", `${what} not found`);
 const placeholders = (ids: string[]) => ids.map(() => "?").join(", ");
@@ -99,7 +100,7 @@ export const getJob = async (db: D1Database, wsIds: string[], id: string) => {
   if (wsIds.length === 0) throw notFound("job");
   const job = await db
     .prepare(
-      `SELECT id, workspace_id AS workspaceId, bot_id AS botId, task_id AS taskId, state, revision,
+      `SELECT id, workspace_id AS workspaceId, bot_id AS botId, job_kind AS jobKind, conversation_id AS conversationId, task_id AS taskId, state, revision,
               trigger_key AS triggerKey, placement, cancel_requested_at AS cancelRequestedAt,
               created_at AS createdAt, updated_at AS updatedAt
          FROM jobs WHERE id = ? AND workspace_id IN (${placeholders(wsIds)})`,
@@ -374,7 +375,7 @@ export const listJobs = async (
   }
   const { results } = await db
     .prepare(
-      `SELECT id, bot_id AS botId, task_id AS taskId, state, revision, trigger_key AS triggerKey,
+      `SELECT id, bot_id AS botId, job_kind AS jobKind, conversation_id AS conversationId, task_id AS taskId, state, revision, trigger_key AS triggerKey,
               cancel_requested_at AS cancelRequestedAt, created_at AS createdAt, updated_at AS updatedAt,
               (SELECT outcome FROM runs r WHERE r.workspace_id = jobs.workspace_id AND r.job_id = jobs.id
                 ORDER BY r.execution_generation DESC LIMIT 1) AS outcome
@@ -756,7 +757,7 @@ export const listRoutines = async (
   const { results } = await db
     .prepare(
       `SELECT id, bot_id AS botId, name, conversation_id AS conversationId, task_id AS taskId, input_text AS inputText,
-              schedule, schedule_revision AS scheduleRevision, misfire, next_fire_at AS nextFireAt, enabled, revision,
+              job_kind AS jobKind, schedule, schedule_revision AS scheduleRevision, misfire, next_fire_at AS nextFireAt, enabled, revision,
               CASE WHEN json_extract(schedule, '$.kind') = 'webhook'
                    THEN '/v1/hooks/routines/' || id ELSE NULL END AS hookPath,
               created_at AS createdAt, updated_at AS updatedAt
@@ -770,6 +771,39 @@ export const listRoutines = async (
     r.enabled = r.enabled === 1;
   }
   return { routines: results };
+};
+
+export const getConversationSummary = async (
+  db: D1Database,
+  workspaceId: string,
+  conversationId: string,
+  userId: string,
+) => {
+  const access = await searchAccess(db, workspaceId, {
+    kind: "user",
+    userId,
+    workspaceIds: [workspaceId],
+  });
+  if (
+    !(await db
+      .prepare(
+        `SELECT 1 FROM conversations c WHERE c.workspace_id = ? AND c.id = ? AND ${conversationReadableSql(access)}`,
+      )
+      .bind(workspaceId, conversationId)
+      .first())
+  )
+    throw notFound("conversation");
+  const summary = await db
+    .prepare(
+      `SELECT id, conversation_id AS conversationId, bot_id AS botId, covers_from_seq AS coversFromSeq,
+      covers_to_seq AS coversToSeq, text, pinned_facts AS pinnedFacts, revision, created_by_run_id AS createdByRunId,
+      created_at AS createdAt FROM conversation_summaries WHERE workspace_id = ? AND conversation_id = ?
+      ORDER BY covers_to_seq DESC, created_at DESC, id DESC LIMIT 1`,
+    )
+    .bind(workspaceId, conversationId)
+    .first<Record<string, unknown>>();
+  if (summary) summary.pinnedFacts = JSON.parse(summary.pinnedFacts as string);
+  return { summary: summary ?? null };
 };
 
 const approvalStates = ["pending", "approved", "denied", "expired"];

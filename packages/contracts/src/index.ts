@@ -989,6 +989,13 @@ export const MemoryWrite = v.strictObject({
     v.check((s) => utf8Bytes(s) <= 16 * 1024, "content must be at most 16 KiB"),
   ),
   supersedesId: v.optional(v.pipe(v.string(), v.minLength(1))),
+  source: v.optional(v.picklist(["consolidation"])),
+  mergedFrom: v.optional(
+    v.array(v.strictObject({ id: v.pipe(v.string(), v.minLength(1)), revision: Revision })),
+  ),
+  sourceConversationIds: v.optional(v.array(v.pipe(v.string(), v.minLength(1)))),
+  proposedScope: v.optional(v.literal("workspace")),
+  expectedSupersedesRevision: v.optional(Revision),
 });
 
 /** Tombstone; a memory's content never changes, so a live memory is at revision 1 unless superseded. */
@@ -996,6 +1003,45 @@ export const MemoryDelete = v.strictObject({
   type: v.literal("memory.delete"),
   memoryId: v.pipe(v.string(), v.minLength(1)),
   expectedRevision: Revision,
+});
+
+const PinnedFact = v.strictObject({
+  kind: v.picklist([
+    "unresolved_request",
+    "decision",
+    "prohibition",
+    "in_progress_task",
+    "reference",
+  ]),
+  text: v.pipe(v.string(), v.minLength(1), v.maxLength(4096)),
+  sourceMessageIds: v.array(v.pipe(v.string(), v.minLength(1))),
+});
+
+export const SummaryWrite = v.strictObject({
+  type: v.literal("summary.write"),
+  conversationId: v.pipe(v.string(), v.minLength(1)),
+  coversFromSeq: v.pipe(v.number(), v.integer(), v.minValue(1)),
+  coversToSeq: v.pipe(v.number(), v.integer(), v.minValue(1)),
+  text: v.pipe(
+    v.string(),
+    v.minLength(1),
+    v.check((s) => utf8Bytes(s) <= 8 * 1024, "text must be at most 8 KiB"),
+  ),
+  pinnedFacts: v.array(PinnedFact),
+});
+
+export const ConversationSummarize = v.strictObject({
+  type: v.literal("conversation.summarize"),
+  conversationId: v.pipe(v.string(), v.minLength(1)),
+});
+export const MemoryConsolidate = v.strictObject({
+  type: v.literal("memory.consolidate"),
+  botId: BotId,
+  channelId: v.optional(ChannelId),
+});
+export const MemoryPromote = v.strictObject({
+  type: v.literal("memory.promote"),
+  memoryId: v.pipe(v.string(), v.minLength(1)),
 });
 
 // ------------------------------------------------- Sidebar (UI-04)
@@ -1036,6 +1082,10 @@ export type Memory = {
   content: string;
   sourceKind: "user" | "bot" | "system";
   sourceId: string;
+  source: "explicit" | "consolidation";
+  mergedFromIds: string[];
+  sourceConversationIds: string[];
+  proposedScope: "workspace" | null;
   revision: number;
   supersedesId: string | null;
   createdAt: string;
@@ -1073,6 +1123,8 @@ export const RunCommand = v.variant("type", [
   TaskComplete,
   TaskDelegate,
   MemoryWrite,
+  MemoryDelete,
+  SummaryWrite,
   EffectPrepare,
   SubscriptionCreate,
   SubscriptionUpdate,
@@ -1085,6 +1137,9 @@ export const RunCommand = v.variant("type", [
   ChannelCreate,
   BotCreate,
 ]);
+
+export const jobKinds = ["normal", "summarize", "consolidate"] as const;
+export type JobKind = (typeof jobKinds)[number];
 export type RunCommand = v.InferInput<typeof RunCommand>;
 
 export type JobClaimed = {
@@ -1110,6 +1165,7 @@ export type QueuedJob = {
   id: string;
   botId: string;
   revision: number;
+  jobKind: JobKind;
   inboxItemId: string | null;
   placement: PlacementPolicy;
   createdAt: string;
@@ -1126,9 +1182,44 @@ export type GroupMessage = Speaker & {
   replyTo: (Speaker & { quote: string }) | null;
 };
 
+export type ConversationSummary = {
+  id: string;
+  conversationId: string;
+  botId: string | null;
+  coversFromSeq: number;
+  coversToSeq: number;
+  text: string;
+  pinnedFacts: {
+    kind: "unresolved_request" | "decision" | "prohibition" | "in_progress_task" | "reference";
+    text: string;
+    sourceMessageIds: string[];
+  }[];
+  revision: number;
+  createdByRunId: string;
+  createdAt: string;
+};
+
+/** Immutable read set stored on the Run, together with the exact context returned to its executor. */
+export type ContextSnapshot = {
+  context: RunContext;
+  summaryId: string | null;
+  truncated: boolean;
+  messageIds: string[];
+  selectedMessageIds: string[];
+  selectedRange: { conversationId: string; coversFromSeq: number; coversToSeq: number } | null;
+  memoryRevisions: { id: string; revision: number }[];
+  botRevision: number;
+  taskScopeRevision: number | null;
+  taskRevision: number | null;
+  sourceAclEpoch: number;
+  sourceConversationIds: string[];
+  tokenEstimate: number;
+};
+
 /** `GET /v1/executor/runs/:id`: the device's own Run, for reconcile after a restart. */
 /** `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=`: what the adapter builds its prompt from. */
 export type RunContext = {
+  jobKind: JobKind;
   bot: {
     id: string;
     name: string;
@@ -1137,6 +1228,7 @@ export type RunContext = {
     /** Always an array from the Worker; optional for stored contexts created before PERM-01. */
     skills?: BotSkill[];
   };
+  /** The Job's placement `environmentId` (an environment name), or null. */
   environment: string | null;
   task: { id: string; key: string; title: string; description: string } | null;
   conversation: {
@@ -1178,9 +1270,37 @@ export type RunContext = {
     createdAt: string;
   }[];
   /** Up to 20 live memories of the Bot, the Task and the Conversation's Channel, newest first, at most 8 KiB. */
-  memories: { id: string; scopeKind: string; content: string; createdAt: string }[];
+  memories: {
+    id: string;
+    scopeKind: string;
+    content: string;
+    revision: number;
+    createdAt: string;
+  }[];
   /** Up to 5 search hits for the trigger item's body (never the trigger message itself). */
   related: { sourceKind: SearchKind; sourceId: string; title: string; snippet: string }[];
+  summary: ConversationSummary | null;
+  summarization: {
+    conversationId: string;
+    botId: string | null;
+    coversFromSeq: number;
+    coversToSeq: number;
+    messages: {
+      id: string;
+      seq: number;
+      actorKind: string;
+      actorId: string;
+      body: string;
+      createdAt: string;
+    }[];
+    previousSummary: ConversationSummary | null;
+  } | null;
+  consolidation: {
+    scopeKind: "bot" | "channel";
+    scopeId: string;
+    memories: Memory[];
+    summaries: ConversationSummary[];
+  } | null;
   /** The native session of the latest earlier Run of this Job that reported one: what a successor resumes (§13.3). */
   previousProviderSessionId: string | null;
   /** Set when this Job works a task.delegate (§8.1); task writes need `mode: write`. */

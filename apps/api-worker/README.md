@@ -39,7 +39,6 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/approvals?workspaceId=&state=`                          | Access assertion (user)           | Newest-first approvals (max 100), optionally one state; see Tools and approvals                                                                                                                |
 | `GET /v1/effects?workspaceId=&state=&runId=`                     | Access assertion (user)           | Newest-first external effects (max 200), optionally one state / Run; see External effects                                                                                                      |
 | `GET /v1/search?workspaceId=&q=&kinds=&limit=&cursor=`           | Access assertion (user)           | Full-text search over permitted scopes (limit 1..100, default 20); see Search and memory                                                                                                       |
-| `GET /v1/memories?workspaceId=&scopeKind=&scopeId=`              | Access assertion (user)           | Live memories of one scope, newest first (max 200; channel needs membership)                                                                                                                   |
 | `POST /v1/admin/search/rebuild?workspaceId=`                     | Access assertion (user, owner)    | Drops the Workspace's search documents and re-enqueues every source (AT-38)                                                                                                                    |
 | `GET /v1/sync/changes?cursor=`                                   | Access assertion (user)           | Permitted changes after the cursor (limit 1..500, default 100); see Sync below                                                                                                                 |
 | `GET /v1/realtime?workspaceId=`                                  | Access assertion, or device token | WebSocket upgrade to the Workspace's Realtime DO; see Realtime below                                                                                                                           |
@@ -69,6 +68,8 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `POST /v1/attachments/:id/complete`                              | Access assertion (user)           | Marks an uploaded attachment ready and returns its summary                                                                                                                                     |
 | `GET /v1/attachments/:id`                                        | Access assertion (reader)         | Streams a ready attachment for a participant of its Channel, DM or thread parent                                                                                                               |
 | `GET /v1/run/attachments/:id`                                    | `X-Hive-Token: cap.<run>.<s>`     | Streams a ready attachment from the Run's trigger conversation (including its thread parent)                                                                                                   |
+| `GET /v1/memories?workspaceId=&scopeKind=&scopeId=&source=`      | Access assertion (user)           | Live memories of one scope, newest first (max 200; `source=explicit\|consolidation`; channel needs membership)                                                                                 |
+| `GET /v1/conversations/:id/summary?workspaceId=`                 | Access assertion (user)           | Latest readable conversation summary and coverage, or `{summary:null}`                                                                                                                         |
 
 **`X-Hive-Token`.** Device tokens and Run capabilities travel in `X-Hive-Token`, because behind Cloudflare Access
 with Managed OAuth `Authorization: Bearer` belongs to Access (it would try to resolve the token as its own OAuth
@@ -592,7 +593,7 @@ approvalId}`. `request_digest` = SHA-256 of `{kind, integrationId, request}`; UN
 
 ## Search and memory
 
-D1 FTS5 search projection and explicit Memory (docs/architecture.md §13.5, §13.6, §14; SEARCH-01).
+D1 FTS5 search projection, explicit Memory, conversation summaries and consolidation (docs/architecture.md §13.5, §13.6, §14; SEARCH-01, DREAM-01).
 
 - **Indexing.** The batch that writes a message (`agent.send`, the Bot reply of `run.result.submit`, run
   `agent.send` / `agent.reply`), a Task (`task.create`, every Task CAS, `job.start`) or a memory enqueues
@@ -623,11 +624,43 @@ D1 FTS5 search projection and explicit Memory (docs/architecture.md §13.5, §13
   the old memory in the same batch.
 - **`memory.delete {memoryId, expectedRevision}`** (user, same scope rule): revision CAS to a tombstone (409
   `stale_revision`, 422 `deleted`), with its revision copy and `search.index` row. Content never changes, so a
-  live memory is at revision 1.
+  content remains immutable; deleting, superseding or clearing a promoted proposal advances its revision.
 - **Run context.** `memories`: up to 20 live memories of the Bot, the Task and the Conversation's channel, newest
   first, cut at 8 KiB. `related`: up to 5 hits for the trigger item's body within the Run's scopes, never the
   trigger message: its words of 3+ characters (split on whitespace and punctuation, at most 8) each quoted and
   ORed; a body without such a word gets none.
+- **Context snapshots.** The first context read freezes the complete context in `runs.context_snapshot` with input
+  message ids, the selected summary range, summary id, memory ids/revisions, Bot config revision, current Task
+  revision/scope revision, source conversations, Workspace ACL epoch, truncation and a token estimate. Later reads
+  return that snapshot after rechecking source access. Claim and context reads enforce the Bot's conversation ACL.
+  Memory listing, search and context injection also check inherited sources, including transitive merged memories,
+  explicit Run provenance, private DMs, threads and bot pairs.
+- **Summaries.** `conversation.summarize {conversationId}` returns the existing active summary Job or creates one.
+  The pump triggers after the unsummarized span exceeds 10 messages; a truncated normal context also triggers.
+  Automatic and manual requests share one active Job per conversation. Each Job selects at most 100 unsummarized
+  messages, with a trigger bounded to that selected end. The summarize context includes `previousSummary` and the
+  new range. `summary.write` accepts only that exact range and pinned sources from the selection or prior pinned
+  facts, fences the active Run and writes once per Run. Stored coverage accumulates from the previous summary,
+  preserving prior pinned facts. Normal context includes the latest summary and recent messages after its coverage.
+  `GET /v1/conversations/:id/summary` returns the latest readable summary or null. Maintenance Runs cannot reply.
+- **Consolidation.** `memory.consolidate {botId, channelId?}` creates a new occurrence for each accepted manual
+  command; a receipt replays that occurrence, and an active scope Job is shared with manual/nightly triggers.
+  Channel Jobs carry their target Conversation and explicit consolidation scope. Bot Jobs read only the Bot's
+  accessible lanes and Channels; Channel Jobs read their Channel. Context includes scope memories and recent
+  summaries. Every write has `source: consolidation`, verified merged memory ids and inherited source conversations.
+  Merged, deleted and superseded revisions must be in the persisted read set. The Run fence, ACL and every affected
+  memory revision are guarded in the same D1 batch. Caller provenance cannot drop inherited restrictions.
+- **Promotion.** Only Bot-scope memories may propose `proposedScope: workspace`. A human's
+  `memory.promote {memoryId}` checks the source memory, its transitive memory permissions and all source
+  conversation ACLs. It copies to Workspace scope and clears the proposal with revision, search and change rows in
+  one batch. An unreadable source is forbidden without returning its contents. `memory.delete {memoryId,
+expectedRevision}` dismisses a readable proposal. `GET /v1/memories` includes `source`, `mergedFromIds`,
+  `sourceConversationIds` and `proposedScope`, and accepts `source=explicit|consolidation`.
+- **Nightly schedule.** Every Bot has an enabled system Routine named `Nightly memory consolidation`, with empty
+  `inputText`, `jobKind: consolidate`, and cron `0 3 * * *` in the Workspace timezone (UTC by default). Migration
+  0035 creates these for existing Bots; Bot creation creates its Routine atomically. `GET /v1/routines?botId=`
+  includes `jobKind`; the existing `routine.pause {routineId}` / `routine.resume {routineId}` commands toggle it.
+  Resuming recalculates the next 03:00 occurrence; scheduling never re-enables a paused Routine.
 - **Rebuild** (`POST /v1/admin/search/rebuild`, Workspace owner, 403 otherwise): one batch deletes the Workspace's
   documents and enqueues a `search.index` row per message, Task and memory (`INSERT ... SELECT`); the pump indexes
   them 50 per pass. Other Workspaces are untouched (AT-38).
@@ -743,11 +776,11 @@ Raw provider transcripts in R2 with a D1 manifest (docs/architecture.md §3.3, �
   (and the Run `waiting_approval`) until the 10 min expiry.
 - **Search and memory.** G-06 is executed on miniflare only (2026-10-11): trigram tokenizer, Japanese substrings,
   external-content triggers, short-query fallback, ACL and rebuild; real D1 (tokenizer, triggers, export of the
-  virtual table) is pending. No NFKC projection, summaries / compaction jobs, memory promotion policy, extracted
-  memory candidates, `memory.propose` / `memory.promote`, index lag metrics, or `search_document_scopes` table (one
+  virtual table) is pending. No NFKC projection, confidence/valid-time memory metadata, separate extracted
+  memory candidates, index lag metrics, or `search_document_scopes` table (one
   scope per document). The cursor is an offset, so concurrent indexing can shift pages. Rebuild is one batch over
   the whole Workspace, and documents are one chunk per source. `related` uses a plain word split, so a Japanese
-  request without spaces is one phrase. Memory has no confidence / valid time / approval state yet. Bot and Task memories are
+  request without spaces is one phrase. Memory has no approval state yet. Bot and Task memories are
   Workspace-visible to users in search and `GET /v1/memories`, even when a Run wrote them from a private channel:
   §13.6 inheritance of the source's read restrictions waits for the promotion / ACL policy. Bot-pair messages are
   indexed under their `botpair:` channel, so users never find them in search although `GET /v1/bot-conversations`

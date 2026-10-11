@@ -111,6 +111,21 @@ export const routines = [
     misfire: "coalesce",
     enabled: true,
     revision: 3,
+    jobKind: "normal",
+  },
+  {
+    id: "rt-nightly",
+    botId: "bot-1",
+    name: "Nightly memory consolidation",
+    conversationId: "conv-1",
+    taskId: null,
+    inputText: "",
+    schedule: { kind: "cron", expr: "0 3 * * *", timezone: "UTC" },
+    scheduleRevision: 1,
+    misfire: "coalesce",
+    enabled: true,
+    revision: 1,
+    jobKind: "consolidate",
   },
 ];
 
@@ -178,6 +193,14 @@ export const routes = (): Routes => ({
         : [],
   }),
   "/v1/channels/ch-1/messages": { messages },
+  "/v1/conversations/conv-1/summary": {
+    summary: {
+      id: "summary-1",
+      text: "The deploy window is Friday at 15:00.",
+      coversFromSeq: 1,
+      coversToSeq: 12,
+    },
+  },
   "/v1/channels/ch-2/messages": {
     messages: [
       {
@@ -221,12 +244,38 @@ export const routes = (): Routes => ({
         (!q.get("conversationId") || r.conversationId === q.get("conversationId")),
     ),
   }),
-  "/v1/memories": (q) => ({
-    memories:
+  "/v1/memories": (q) => {
+    const memories =
       q.get("scopeKind") === "bot"
-        ? [{ id: "mem-2", content: "prefers bun", createdAt: "2026-10-10" }]
-        : [{ id: "mem-1", content: "deploys on Fridays are frozen", createdAt: "2026-10-09" }],
-  }),
+        ? [
+            {
+              id: "mem-2",
+              content: "prefers bun",
+              createdAt: "2026-10-10",
+              source: "explicit",
+              proposedScope: null,
+            },
+            {
+              id: "mem-3",
+              content: "deploys are frozen on Fridays",
+              createdAt: "2026-10-11",
+              source: "consolidation",
+              mergedFromIds: ["mem-1", "mem-2"],
+              proposedScope: "workspace",
+              revision: 2,
+            },
+          ]
+        : [
+            {
+              id: "mem-1",
+              content: "deploys on Fridays are frozen",
+              createdAt: "2026-10-09",
+              source: "explicit",
+            },
+          ];
+    const source = q.get("source");
+    return { memories: source ? memories.filter((memory) => memory.source === source) : memories };
+  },
   "/v1/search": (q) => ({
     indexedThrough: "2026-10-11T12:00:00.000Z",
     hits: [

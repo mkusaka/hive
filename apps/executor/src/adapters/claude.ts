@@ -22,7 +22,12 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { BotSkill } from "@hive/contracts";
 import { runCwd } from "../environments.ts";
-import type { AgentAdapter, LaunchContext, RunningAgent } from "../runner.ts";
+import {
+  maintenanceOutputSchemas,
+  parseConsolidationPlan,
+  parseSummaryOutput,
+} from "../maintenance.ts";
+import type { AgentAdapter, AgentExit, LaunchContext } from "../runner.ts";
 import { approvalGate, preToolUse, toolOptions, truncate } from "../toolPolicy.ts";
 import { hiveMcpServer, hiveTools, toolName, waitForReplyTool } from "../tools.ts";
 
@@ -30,25 +35,42 @@ export type QueryFn = (params: {
   prompt: string | AsyncIterable<SDKUserMessage>;
   options: Options;
 }) => AsyncIterable<SDKMessage>;
-type Exit = Awaited<ReturnType<RunningAgent["waitForExit"]>>;
 
 const kib8 = 8 * 1024;
 
-const skillsPrompt = (skills: BotSkill[]) =>
-  skills.length
-    ? `Skills:\n${skills.map((skill) => `- ${skill.name}: ${skill.description}`).join("\n")}\n\n` +
-      "Call hive_skill_use with a skill name to load its instructions."
-    : "";
-
-/** System prompt: who the Bot is plus its instructions and, for providers without native skills, skill discovery. */
-export const systemPrompt = ({ bot }: LaunchContext["context"], includeSkills = false) =>
-  [
-    `You are ${bot.name}, a bot in a hive workspace.`,
-    bot.instructions,
-    ...(includeSkills ? [skillsPrompt(bot.skills ?? [])] : []),
+/** System prompt for normal work, or the fixed no-tool maintenance output contract. */
+export const systemPrompt = (context: LaunchContext["context"], includeSkills = false) => {
+  if (context.jobKind === "summarize") {
+    return (
+      "Summarize the supplied hive conversation range. Do not use tools. Return only a JSON object with " +
+      "`text` and `pinnedFacts`. Each pinned fact has `kind` (unresolved_request, decision, prohibition, " +
+      "in_progress_task, or reference), `text`, and `sourceMessageIds`. Preserve only facts supported by the " +
+      "supplied messages."
+    );
+  }
+  if (context.jobKind === "consolidate") {
+    return (
+      "Consolidate the supplied hive memories and conversation summaries. Do not use native or external tools. " +
+      "Return only a JSON object with `writes` and `deletes`. Each write has `content`, `mergedFrom` " +
+      "([{id,revision}]), `sourceConversationIds`, optional `proposedScope` (workspace), and optional " +
+      "`supersedes` ({id,revision}); each delete has `id` and `revision`. Use only supplied memory revisions " +
+      "and conversation sources, preserve every inherited source conversation, and record contradictions rather " +
+      "than choosing the newest fact. Only a Bot-scope plan may propose reusable facts for workspace promotion; " +
+      "proposals remain in Bot scope and never share automatically."
+    );
+  }
+  const skills = context.bot.skills ?? [];
+  return [
+    `You are ${context.bot.name}, a bot in a hive workspace.`,
+    context.bot.instructions,
+    includeSkills && skills.length
+      ? `Skills:\n${skills.map((skill) => `- ${skill.name}: ${skill.description}`).join("\n")}\n\n` +
+        "Call hive_skill_use with a skill name to load its instructions."
+      : "",
   ]
     .filter(Boolean)
     .join("\n\n");
+};
 
 const nativeSkills = async (stateDir: string, runId: string, skills: BotSkill[]) => {
   const projectConfigRoot = join(stateDir, "runs", runId, "claude-config");
@@ -133,7 +155,7 @@ export const promptWithAttachments = async (
  * (naming the sending Bot), the batch's items or a Delegation's instructions, then replies to this Job's earlier
  * requests.
  */
-export const userPrompt = ({
+const normalUserPrompt = ({
   task,
   conversation,
   parentMessages,
@@ -146,6 +168,7 @@ export const userPrompt = ({
   related,
   attachments,
   delegation,
+  summary,
 }: LaunchContext["context"]) => {
   const parts: string[] = [];
   if (task) parts.push(`Task ${task.key}: ${task.title}\n${task.description}`.trim());
@@ -155,6 +178,14 @@ export const userPrompt = ({
   if (parentMessages.length) {
     parts.push(
       `Earlier in the channel, before this thread (read-only context):\n${parentMessages.map(promptLine).join("\n")}`,
+    );
+  }
+  if (summary) {
+    const facts = summary.pinnedFacts.map((fact) => `- (${fact.kind}) ${fact.text}`).join("\n");
+    parts.push(
+      `Conversation summary (through sequence ${summary.coversToSeq}):\n${summary.text}${
+        facts ? `\nPinned facts:\n${facts}` : ""
+      }`,
     );
   }
   if (conversation?.recent.length) {
@@ -221,14 +252,74 @@ export const userPrompt = ({
   return parts.join("\n\n");
 };
 
-const toExit = (result: SDKResultMessage): Exit => {
+/** A mode-specific prompt keeps maintenance input separate from conversational work. */
+export const userPrompt = (context: LaunchContext["context"]) => {
+  if (context.jobKind === "summarize") {
+    const source = context.summarization;
+    if (!source) return "No conversation range was supplied.";
+    const previous = source.previousSummary
+      ? [
+          `Previous summary (coverage ${source.previousSummary.coversFromSeq}-${source.previousSummary.coversToSeq}):`,
+          JSON.stringify({
+            text: source.previousSummary.text,
+            pinnedFacts: source.previousSummary.pinnedFacts,
+          }),
+          "",
+        ].join("\n")
+      : "";
+    const messages = source.messages
+      .map(
+        (message) =>
+          `[${message.seq} ${message.id} ${message.actorKind} ${message.actorId}] ${message.body}`,
+      )
+      .join("\n");
+    return `${previous}Conversation range ${source.coversFromSeq}-${source.coversToSeq}:\n${messages}`;
+  }
+  if (context.jobKind === "consolidate") {
+    const source = context.consolidation;
+    if (!source) return "No consolidation inputs were supplied.";
+    return [
+      `Scope: ${source.scopeKind} ${source.scopeId}`,
+      `Memories:\n${JSON.stringify(source.memories)}`,
+      `Conversation summaries:\n${JSON.stringify(source.summaries)}`,
+    ].join("\n\n");
+  }
+  return normalUserPrompt(context);
+};
+
+const toExit = (result: SDKResultMessage, context: LaunchContext["context"]): AgentExit => {
   if (result.subtype === "success" && !result.is_error) {
-    return {
-      code: 0,
-      reason: "exited",
-      summary: truncate(result.result, kib8),
-      replyText: result.result.slice(0, 64 * 1024),
-    };
+    try {
+      if (context.jobKind === "summarize") {
+        return {
+          code: 0,
+          reason: "exited",
+          summary: "claude: summary ready",
+          summaryOutput: parseSummaryOutput(result.structured_output, context),
+        };
+      }
+      if (context.jobKind === "consolidate") {
+        return {
+          code: 0,
+          reason: "exited",
+          summary: "claude: consolidation ready",
+          consolidationPlan: parseConsolidationPlan(result.structured_output, context),
+        };
+      }
+      return {
+        code: 0,
+        reason: "exited",
+        summary: truncate(result.result, kib8),
+        replyText: result.result.slice(0, 64 * 1024),
+      };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return {
+        code: 1,
+        reason: truncate(`invalid maintenance output: ${reason}`, kib8),
+        summary: "claude: invalid maintenance output",
+      };
+    }
   }
   const detail = result.subtype === "success" ? result.result : result.errors.join("; ");
   return {
@@ -285,7 +376,8 @@ export const claudeAdapter = ({
 
     const previous = await readTranscript(transcript);
     const done = previous.findLast((m): m is SDKResultMessage => m.type === "result");
-    if (done) return { requestStop: async () => {}, waitForExit: async () => toExit(done) };
+    if (done)
+      return { requestStop: async () => {}, waitForExit: async () => toExit(done, ctx.context) };
     // This Run restarted on this device: resume its own session (the SDK's local files are here).
     const restarted = previous.find((m) => m.type === "system" && m.subtype === "init")?.session_id;
 
@@ -294,7 +386,7 @@ export const claudeAdapter = ({
     const environment = ctx.context.environment;
     const cwd = await runCwd(stateDir, ctx.runId, ctx.context);
     if (!cwd) {
-      const exit: Exit = {
+      const exit: AgentExit = {
         code: 1,
         reason: "environment_missing",
         summary: truncate(
@@ -308,8 +400,8 @@ export const claudeAdapter = ({
     const attachmentPaths = ctx.context.attachments.flatMap((attachment) =>
       attachment.path ? [attachment.path] : [],
     );
-    // An earlier Run's session, possibly from another device: only when the store holds it complete.
-    const earlier = ctx.context.previousProviderSessionId;
+    // Maintenance jobs use fresh fixed-prompt turns, not a conversational provider session.
+    const earlier = ctx.context.jobKind === "normal" ? ctx.context.previousProviderSessionId : null;
     const loaded = earlier
       ? await sessionStore
           ?.load({ projectKey: cwd, sessionId: earlier })
@@ -319,41 +411,47 @@ export const claudeAdapter = ({
           })
       : null;
     const sessionId = restarted ?? (loaded?.length ? earlier! : undefined);
-    const skillConfig = ctx.context.bot.skills?.length
-      ? await nativeSkills(stateDir, ctx.runId, ctx.context.bot.skills)
-      : undefined;
+    const skillConfig =
+      ctx.context.jobKind === "normal" && ctx.context.bot.skills?.length
+        ? await nativeSkills(stateDir, ctx.runId, ctx.context.bot.skills)
+        : undefined;
     const skillNames = skillConfig ? new Set(skillConfig.names) : undefined;
     let mirrorErrors = 0;
 
     const abort = new AbortController();
     let stopReason: string | undefined;
-    // ponytail: a pass is known only in this process; a Run resumed from a finished transcript posts its text.
+    const maintenance = ctx.context.jobKind !== "normal";
+    // A pass is known only in this process; a Run resumed from a finished transcript posts its text.
     let passed = false;
-    const tools = ctx.run
-      ? hiveTools(ctx.context, ctx.run, {
-          signal: abort.signal,
-          pollMs: approvalPollMs,
-          onPass: () => (passed = true),
-          skillUse: false,
-        })
-      : [];
-    const hive = tools.map((t) => toolName(t.name));
+    const tools =
+      !maintenance && ctx.run
+        ? hiveTools(ctx.context, ctx.run, {
+            signal: abort.signal,
+            pollMs: approvalPollMs,
+            onPass: () => (passed = true),
+            skillUse: false,
+          })
+        : [];
+    const hive = tools.map((tool) => toolName(tool.name));
     // tool_use id → requestMessageId of `hive_wait_for_reply` calls not yet answered.
     const waits = new Map<string, string>();
     let waitingFor: string | undefined;
-    const waiting = (): Exit => ({
+    const waiting = (): AgentExit => ({
       code: 0,
       reason: "waiting",
       summary: truncate(`claude: waiting for the reply to ${waitingFor}`, kib8),
       waitingFor: { requestMessageId: waitingFor! },
     });
-    const run = async (): Promise<Exit> => {
+    const run = async (): Promise<AgentExit> => {
       const file = await open(transcript, "a");
       try {
         let result: SDKResultMessage | undefined;
-        const prompt = restarted
-          ? "Your previous attempt was interrupted. Give your final answer to the last request."
-          : await promptWithAttachments(userPrompt(ctx.context), ctx.context.attachments);
+        const prompt =
+          restarted && !maintenance
+            ? "Your previous attempt was interrupted. Give your final answer to the last request."
+            : maintenance
+              ? userPrompt(ctx.context)
+              : await promptWithAttachments(userPrompt(ctx.context), ctx.context.attachments);
         const messages = queryFn({
           prompt,
           options: {
@@ -361,31 +459,52 @@ export const claudeAdapter = ({
             abortController: abort,
             systemPrompt: systemPrompt(ctx.context),
             // Only generated per-Run project settings are loaded; user and checkout settings stay isolated.
-            ...toolOptions(policy, hive, skillNames),
-            hooks: {
-              PreToolUse: [
-                { hooks: [preToolUse(policy, roots, new Set(hive), skillNames, attachmentPaths)] },
-              ],
-            },
-            canUseTool: approvalGate({
-              policy,
-              run: ctx.run,
-              cwdLabel: policy.cwdMode === "environment" ? environment! : "run_scratch",
-              roots: [...roots, ...attachmentPaths],
-              hiveTools: new Set(hive),
-              pollMs: approvalPollMs,
-              skillNames,
-            }),
-            settingSources: skillConfig ? ["project"] : [],
-            ...(skillConfig
-              ? { projectConfigRoot: skillConfig.projectConfigRoot, skills: skillConfig.names }
-              : {}),
+            ...toolOptions(maintenance ? { ...policy, tools: {} } : policy, hive, skillNames),
+            ...(!maintenance
+              ? {
+                  hooks: {
+                    PreToolUse: [
+                      {
+                        hooks: [
+                          preToolUse(policy, roots, new Set(hive), skillNames, attachmentPaths),
+                        ],
+                      },
+                    ],
+                  },
+                  canUseTool: approvalGate({
+                    policy,
+                    run: ctx.run,
+                    cwdLabel: policy.cwdMode === "environment" ? environment! : "run_scratch",
+                    roots: [...roots, ...attachmentPaths],
+                    hiveTools: new Set(hive),
+                    pollMs: approvalPollMs,
+                    skillNames,
+                  }),
+                  settingSources: skillConfig ? ["project"] : [],
+                  ...(skillConfig
+                    ? {
+                        projectConfigRoot: skillConfig.projectConfigRoot,
+                        skills: skillConfig.names,
+                      }
+                    : {}),
+                }
+              : { settingSources: [] }),
             mcpServers: tools.length ? { hive: hiveMcpServer(tools) } : {},
             strictMcpConfig: true,
             maxTurns,
+            ...(ctx.context.jobKind !== "normal"
+              ? {
+                  outputFormat: {
+                    type: "json_schema" as const,
+                    schema: maintenanceOutputSchemas[ctx.context.jobKind],
+                  },
+                }
+              : {}),
             // Eager: each batch reaches the fsynced journal as it lands, not only at end of turn.
-            ...(sessionStore ? { sessionStore, sessionStoreFlush: "eager" as const } : {}),
-            ...(sessionId ? { resume: sessionId } : {}),
+            ...(!maintenance && sessionStore
+              ? { sessionStore, sessionStoreFlush: "eager" as const }
+              : {}),
+            ...(!maintenance && sessionId ? { resume: sessionId } : {}),
           },
         });
         for await (const message of messages) {
@@ -423,7 +542,7 @@ export const claudeAdapter = ({
           }
         }
         if (waitingFor) return waiting();
-        if (result) return toExit(result);
+        if (result) return toExit(result, ctx.context);
         if (stopReason) return { code: null, reason: stopReason, summary: "claude: stopped" };
         return { code: 1, reason: "no result message", summary: "claude: no result" };
       } catch (error) {

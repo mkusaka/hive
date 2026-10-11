@@ -158,9 +158,13 @@ describe("views", () => {
     expect(await screen.findByText("release notes ready")).toBeTruthy();
   });
 
-  it("Memory lists workspace memories and writes one", async () => {
+  it("Memory filters by source and writes one", async () => {
     const { user, hive } = await open("Memory");
     expect(await screen.findByText("deploys on Fridays are frozen")).toBeTruthy();
+    await user.selectOptions(screen.getByRole("combobox", { name: "Memory source" }), "explicit");
+    expect(hive.calls.get).toContain(
+      "/v1/memories?workspaceId=ws-1&scopeKind=workspace&scopeId=ws-1&source=explicit",
+    );
     await user.type(screen.getByRole("textbox", { name: "Memory" }), "use bun{Enter}");
     expect(hive.sent("memory.write")).toEqual([
       {

@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { findComposer, renderApp, sidebar } from "./fakeHive.ts";
 import { bots, dms } from "./fixtures.ts";
@@ -117,6 +117,54 @@ describe("bot panel", () => {
     await user.click(panel.getByRole("tab", { name: "Library" }));
     expect(await panel.findByText("prefers bun")).toBeTruthy();
     expect(hive.calls.get).toContain("/v1/memories?workspaceId=ws-1&scopeKind=bot&scopeId=bot-1");
+  });
+
+  it("labels consolidated memories, filters by source, and shows workspace proposals", async () => {
+    const { panel, user, hive } = await openCoder();
+    await user.click(panel.getByRole("tab", { name: "Library" }));
+    expect(await panel.findByText("deploys are frozen on Fridays")).toBeTruthy();
+    expect(panel.getByText("consolidated")).toBeTruthy();
+    expect(panel.getByText("merged from 2")).toBeTruthy();
+    expect(panel.getByRole("heading", { name: "Proposed for workspace" })).toBeTruthy();
+    await user.selectOptions(panel.getByRole("combobox", { name: "Memory source" }), "explicit");
+    expect(hive.calls.get).toContain(
+      "/v1/memories?workspaceId=ws-1&scopeKind=bot&scopeId=bot-1&source=explicit",
+    );
+  });
+
+  it("promotes or dismisses a workspace proposal and reloads the library", async () => {
+    const { panel, user, hive } = await openCoder();
+    await user.click(panel.getByRole("tab", { name: "Library" }));
+    await panel.findByRole("button", { name: "Promote" });
+    const before = hive.calls.get.filter((path) => path.startsWith("/v1/memories?")).length;
+    await user.click(panel.getByRole("button", { name: "Promote" }));
+    await user.click(panel.getByRole("button", { name: "Dismiss" }));
+    expect(hive.sent("memory.promote")).toEqual([
+      { workspaceId: "ws-1", command: { type: "memory.promote", memoryId: "mem-3" } },
+    ]);
+    expect(hive.sent("memory.delete")).toEqual([
+      {
+        workspaceId: "ws-1",
+        command: { type: "memory.delete", memoryId: "mem-3", expectedRevision: 2 },
+      },
+    ]);
+    await waitFor(() =>
+      expect(
+        hive.calls.get.filter((path) => path.startsWith("/v1/memories?")).length,
+      ).toBeGreaterThan(before),
+    );
+  });
+
+  it("toggles the nightly memory consolidation routine", async () => {
+    const { panel, user, hive } = await openCoder();
+    const toggle = await panel.findByRole("checkbox", {
+      name: "Nightly memory consolidation enabled",
+    });
+    await user.click(toggle);
+    expect(hive.sent("routine.pause")).toContainEqual({
+      workspaceId: "ws-1",
+      command: { type: "routine.pause", routineId: "rt-nightly" },
+    });
   });
 
   it("shows the executor service in Computer and starts it with the chosen provider", async () => {

@@ -493,3 +493,19 @@ export const listMemories = (
 
 export const memoryDelete = (c: Client, e: Envelope, memoryId: string, expectedRevision: number) =>
   c.command(e, { type: "memory.delete", memoryId, expectedRevision });
+
+export const memoryConsolidate = (c: Client, e: Envelope, botId: string, channelId?: string) =>
+  c.command(e, {
+    type: "memory.consolidate",
+    botId,
+    ...(channelId === undefined ? {} : { channelId }),
+  });
+
+export const memoryPromote = (c: Client, e: Envelope, memoryId: string) =>
+  c.command(e, { type: "memory.promote", memoryId });
+
+export const conversationSummarize = (c: Client, e: Envelope, conversationId: string) =>
+  c.command(e, { type: "conversation.summarize", conversationId });
+
+export const getConversationSummary = (c: Client, workspaceId: string, conversationId: string) =>
+  c.get(inWorkspace(`conversations/${encodeURIComponent(conversationId)}/summary`, workspaceId));

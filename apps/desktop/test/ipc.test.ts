@@ -117,6 +117,22 @@ describe("IPC handlers", () => {
     expect(requests.map((r) => r.path)).toEqual([path, "/v1/commands"]);
   });
 
+  it("posts summary and memory proposal commands", async () => {
+    const { h, requests } = setup();
+    const commands = [
+      { type: "conversation.summarize", conversationId: "conv-1" },
+      { type: "memory.promote", memoryId: "mem-1" },
+      { type: "memory.delete", memoryId: "mem-1", expectedRevision: 2 },
+    ];
+    const accepted = await Promise.all(
+      commands.map((command) => h.command({ ...envelope, command })),
+    );
+    expect(accepted.map((result) => result.ok)).toEqual([true, true, true]);
+    expect(
+      requests.map((request) => (request.body as { command: { type: string } }).command.type),
+    ).toEqual(["conversation.summarize", "memory.promote", "memory.delete"]);
+  });
+
   it("posts routine pause / resume / run / delete and rejects invalid routine commands", async () => {
     const { h, requests } = setup();
     const accepted = await Promise.all(

@@ -204,6 +204,13 @@
       "when": 1791755564276,
       "tag": "0034_mobile_push_tokens",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "6",
+      "when": 1791756559736,
+      "tag": "0035_conversation_summaries",
+      "breakpoints": true
     }
   ]
 }

@@ -11,6 +11,7 @@ export type RoutineRow = {
   channel_id: string | null;
   task_id: string | null;
   input_text: string;
+  job_kind: "normal" | "summarize" | "consolidate";
   schedule: string;
   schedule_revision: number;
   misfire: "skip" | "coalesce";
@@ -19,7 +20,7 @@ export type RoutineRow = {
   revision: number;
 };
 export const routineColumns = `r.id, r.workspace_id, r.bot_id, r.conversation_id, c.channel_id, r.task_id,
-  r.input_text, r.schedule, r.schedule_revision, r.misfire, r.next_fire_at, r.enabled, r.revision`;
+  r.input_text, r.job_kind, r.schedule, r.schedule_revision, r.misfire, r.next_fire_at, r.enabled, r.revision`;
 export const routineFrom = `routines r
   LEFT JOIN conversations c ON c.workspace_id = r.workspace_id AND c.id = r.conversation_id`;
 
@@ -81,9 +82,10 @@ export const occurrenceStatements = (
       workspaceId,
       inputId: eventId!,
       botId: r.bot_id,
-      lane: r.conversation_id ?? `routine:${r.id}`,
+      lane:
+        r.job_kind === "consolidate" ? `routine:${r.id}` : (r.conversation_id ?? `routine:${r.id}`),
       purpose: "routine",
-      conversationId: r.conversation_id,
+      conversationId: r.job_kind === "consolidate" ? null : r.conversation_id,
       deliveryMode: "wake",
     }),
     createJob(db, {
@@ -92,6 +94,10 @@ export const occurrenceStatements = (
       botId: r.bot_id,
       triggerKey: `inbox:${inboxItemId}`,
       taskId: r.task_id ?? undefined,
+      jobKind: r.job_kind,
+      conversationId: r.job_kind === "consolidate" ? undefined : (r.conversation_id ?? undefined),
+      consolidationScopeKind: r.job_kind === "consolidate" ? "bot" : undefined,
+      consolidationScopeId: r.job_kind === "consolidate" ? r.bot_id : undefined,
     }),
     insertOccurrence(db, r, scheduledAt, jobId!, occurrenceId, occurrenceKey, input.payload),
   ];
@@ -210,7 +216,18 @@ const fireRoutine = async (
     r.misfire === "coalesce"
       ? fresh.slice(-1)
       : fresh.filter((at) => now - Date.parse(at) <= routineSkipGraceMs);
-  const created = run.map((at) => occurrenceStatements(db, r, at));
+  const active =
+    r.job_kind === "consolidate"
+      ? await db
+          .prepare(
+            `SELECT 1 FROM jobs WHERE workspace_id = ? AND job_kind = 'consolidate' AND consolidation_scope_kind = 'bot'
+      AND consolidation_scope_id = ? AND state IN ('queued', 'waiting_device', 'active', 'waiting_input', 'recovery_required')`,
+          )
+          .bind(r.workspace_id, r.bot_id)
+          .first()
+      : null;
+  const selected = active ? [] : run;
+  const created = selected.map((at) => occurrenceStatements(db, r, at));
   const [setGuard, clearGuard] = guard(db);
   try {
     await db.batch([
@@ -226,7 +243,9 @@ const fireRoutine = async (
         ...o.statements,
         ...o.changes.map((c) => appendChange(db, { workspaceId: r.workspace_id, ...c })),
       ]),
-      ...fresh.filter((at) => !run.includes(at)).map((at) => insertOccurrence(db, r, at, null)),
+      ...fresh
+        .filter((at) => !selected.includes(at))
+        .map((at) => insertOccurrence(db, r, at, null)),
     ]);
     return { workspaceId: r.workspace_id, jobIds: created.map((o) => o.jobId) };
   } catch (error) {
