@@ -1,7 +1,7 @@
 # @hive/executor
 
 The Local Executor (docs/architecture.md §20): a poll loop that claims queued Jobs over HTTPS, runs a provider
-adapter and submits the result. Providers: `claude` (Claude Agent SDK) and `fake`. Runs on Node 24 or Bun.
+adapter and submits the result. Providers: `claude` (Claude Agent SDK), `codex` (`codex app-server`) and `fake`. Runs on Node 24 or Bun.
 
 ## Modules
 
@@ -25,10 +25,13 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK) and `fake
 - `src/adapters/fake.ts`: exits after `FAKE_DELAY_MS` (default 50) with code 0 and summary
   `fake: handled inbox item <id>`; `FAKE_FAIL=1` exits 1. It is idempotent, so reconcile may simply start it again.
 - `src/adapters/claude.ts`: one SDK `query()` per Run (see below).
+- `src/adapters/codex.ts`: one `codex app-server` process and thread per Run (see Codex provider);
+  `src/adapters/codexProtocol.ts` holds the hand-written protocol types it uses.
 - `src/toolPolicy.ts`: the Bot tool policy as SDK options, the PreToolUse hook and the `canUseTool` approval gate
   (see Tool policy and approvals).
-- `src/environments.ts`: `<state-dir>/environments.json`, environment name → local checkout root.
-- `src/main.ts`: `--api-url --token-file --state-dir [--once] --provider fake|claude` (`node:util` `parseArgs`).
+- `src/environments.ts`: `<state-dir>/environments.json`, environment name → local checkout root; `runCwd`, the
+  per-Run cwd both real adapters use.
+- `src/main.ts`: `--api-url --token-file --state-dir [--once] --provider fake|claude|codex` (`node:util` `parseArgs`).
 
 ## Claude provider
 
@@ -66,6 +69,62 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK) and `fake
   `CLAUDE_CONFIG_DIR=<profile dir> hive executor run --provider claude`. hive never switches to an API key; an
   `ANTHROPIC_API_KEY` in the environment would be used by the SDK, so keep it unset for subscription use. The
   SDK runs its bundled Claude Code (2.1.289 with SDK 0.3.289), not the installed `claude`.
+
+## Codex provider
+
+`codexAdapter` (CODEX-01; docs/architecture.md §13.4, §20.2, §20.4; gate G-08 passed 2026-10-11, see
+docs/roadmap.md Status).
+
+- **Protocol pin.** codex-cli **0.162.1**, `codex app-server` (v2 API), stdio: JSON-RPC 2.0 messages without the
+  `"jsonrpc"` field, one per line. Methods used, taken from `codex app-server generate-ts --experimental` (not
+  guessed): requests `initialize` (+ `initialized` notification), `config/read`, `thread/start`, `turn/start`,
+  `turn/interrupt`; notifications `item/started`, `item/completed`, `turn/completed`; server requests
+  `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/call`. Any other server
+  request is answered with error `-32601` (an unanswered request would hang the turn). Other versions are
+  untested; regenerate the bindings and recheck `adapters/codexProtocol.ts` before bumping.
+- **Process.** `spawn("codex", ["app-server"], {cwd, env: process.env, detached: true})`: an argv array, never a
+  shell string, in its own process group. The first transcript line is `{dir: "local", event: "spawn", pid,
+spawnedAt, binary, argv}` (§20.2 PID + start identity). After the turn, stdin is closed and the process exits.
+- **Thread.** `initialize` with `experimentalApi: true` (needed for `dynamicTools`), then `config/read {cwd}` for
+  the user's MCP server names, then `thread/start {cwd, approvalPolicy: "untrusted", sandbox: "read-only",
+developerInstructions: <system prompt>, config, dynamicTools}`. `config` switches off every configured MCP
+  server (`mcp_servers.<name>.enabled = false`) and the features `hooks`, `apps`, `plugins`, `multi_agent`,
+  `computer_use`, `browser_use` and `memories` for this thread, the counterpart of the Claude adapter's
+  `settingSources: []`. The cwd rule is the Claude adapter's (`runCwd`). `thread.id` → `runtime.run.started`
+  `{providerSessionId}`. One `turn/start` with the same user prompt as the Claude adapter.
+- **Transcript journal.** Every inbound and outbound protocol message is appended to
+  `<state-dir>/transcripts/<runId>.jsonl` as `{dir: "in" | "out", msg}` and fsynced before it is processed or
+  written to the process (serialized; a failed write fails the Run). Two inbound messages are journaled redacted,
+  because the transcript is uploaded: the `config/read` result (the user's whole Codex config, including MCP
+  server env and headers) keeps only the MCP server names, and `account/rateLimits/updated` (credit balance) keeps
+  no params. Uploaded by the same uploader with provider `codex`. Codex also keeps its own rollout under
+  `CODEX_HOME`.
+- **Approvals.** With `untrusted` + read-only sandbox, Codex asks before every command it does not consider safe
+  and before every file change. A command approval goes through the same approval gate as Claude's `canUseTool` as
+  action `Bash` with input `{command, cwd}`; a file change as `Edit` with `{file_path: <paths>, changes}` (paths
+  from the `fileChange` item of `item/started`; a path outside the cwd is declined without asking). `allow` →
+  `accept`, `ask` → cloud approval → `accept` / `decline`, `deny` → `decline` without the cloud. An approved
+  command runs outside the read-only sandbox (as the executor's OS user).
+- **Hive tools.** The same tools as the Claude adapter (`src/tools.ts`), offered as experimental `dynamicTools`
+  (JSON Schema from the Zod shapes) and answered in this process on `item/tool/call` (arguments validated with Zod
+  first), so the Run capability never reaches Codex. `hive_wait_for_reply` → `turn/interrupt` and a `waiting`
+  exit (`{dir: "local", event: "waiting"}` is journaled for a restart).
+- **Results.** `turn/completed` `completed` → exit 0, the last `final_answer` agent message (else the last agent
+  message) as summary (≤ 8 KiB) and reply; `failed` / `interrupted` → exit 1 with the turn error. The process
+  closing before the turn ends → exit 1 `codex app-server exited (code, signal)`; a missing binary → `spawn
+failed: ...`.
+- **Stop.** `requestStop` aborts a pending approval poll (→ `decline`) and sends `turn/interrupt`; after 5 s
+  without exit, SIGTERM to the process group, after 5 s more SIGKILL. No signal is sent after the process closed
+  (the PID may be reused).
+- **Restart.** A transcript that already holds `turn/completed` is reused without spawning; otherwise a new
+  process and thread start (no `thread/resume` yet).
+- **Auth.** The process inherits `process.env`; `CODEX_HOME` (default `~/.codex`) selects the Codex login (G-08
+  used the ChatGPT login). With a per-profile shell wrapper run `CODEX_HOME=<profile dir> hive executor run
+--provider codex`. `codex` must be on `PATH`.
+- **Capabilities (`describe`).** All false: no resume, no steering, no native child identity, and
+  `enforceToolApproval: false`: under `untrusted` Codex may run a command it classifies as safe without an
+  approval request, even when Bash is `deny`. That classification is Codex's, not hive's (in G-08 even `ls`, run
+  as `zsh -lc ls`, asked).
 
 ## Transcript upload
 
@@ -147,6 +206,8 @@ loop claim new Jobs.
 
 `bun run test` from the repo root. `test/runner.test.ts` runs in Node against an in-memory cloud;
 `test/uploader.test.ts` covers the splitter and the uploader's ACK / retry rules; `test/claude.test.ts` drives the Claude adapter with a fake `queryFn` (SDK message shapes, no subprocess);
+`test/codex.test.ts` drives the Codex adapter against `test/fakeCodex.mjs`, a scripted app-server spawned with
+`process.execPath` (happy path, journaling order, approvals, deny, outside paths, stop, kill, crash, hive tools);
 `test/tools.test.ts` covers the hive tools and the `waiting` exit; `test/toolPolicy.test.ts` the SDK options, the
 path hook, the approval gate and the environment cwd; the end-to-end
 loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (workerd).
@@ -158,7 +219,7 @@ loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (
 - Transcripts are uploaded after the Run, not streamed while it runs; no artifact upload, no local retention
   cleanup and no SessionStore adapter (G-07), so no cross-device resume. A failed upload is retried only at the
   next start.
-- No OS sandbox and no Bash path restriction; no effect broker for external writes (§19). No Codex adapter. A Run
+- No OS sandbox and no Bash path restriction; no effect broker for external writes (§19). A Run
   resumed by reconcile has no capability, so no hive tools and every `ask` tool is denied.
 - Only `runtime.run.started` and `runtime.run.stopped` are observed; no usage / cost or other runtime events are
   sent to the cloud. The fake adapter sends no `runtime.run.started`, so its Runs stay `starting`.
@@ -166,3 +227,6 @@ loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (
   start identity) before confirming. A long-running loop confirms a stale Run only when its own renewal hits
   `STALE_GENERATION`; a Run journaled by an earlier process is confirmed at the next start.
 - No scheduler / offers or WebSocket: the executor polls. Capacity is one Run at a time.
+- Codex: no same-device `thread/resume` and no cross-PC resume (§13.4: a new thread with the current context);
+  the user's `AGENTS.md`, skills and model defaults from `CODEX_HOME` still apply; commands Codex classifies as safe
+  may bypass approvals; `dynamicTools` is an experimental protocol field; token usage is only in the transcript.

@@ -308,7 +308,7 @@ const transcriptAccess = async (
   if (user.workspaceIds.length === 0) throw notFound();
   const row = await db
     .prepare(
-      `SELECT r.workspace_id, s.id AS stream_id, s.confirmed_through_seq,
+      `SELECT r.workspace_id, s.id AS stream_id, s.confirmed_through_seq, s.provider,
               EXISTS (SELECT 1 FROM workspace_members w
                        WHERE w.workspace_id = r.workspace_id AND w.user_id = ?1 AND w.role = 'owner') AS owner,
               EXISTS (SELECT 1 FROM jobs j
@@ -326,6 +326,7 @@ const transcriptAccess = async (
       workspace_id: string;
       stream_id: string | null;
       confirmed_through_seq: number | null;
+      provider: string | null;
       owner: number;
       member: number;
     }>();
@@ -428,6 +429,140 @@ export const normalize = (line: string, seq: number): TranscriptEntry[] => {
   }
 };
 
+type CodexItem = {
+  type?: string;
+  text?: string;
+  command?: string;
+  status?: string;
+  exitCode?: number | null;
+  aggregatedOutput?: string | null;
+  changes?: { path?: string }[];
+  tool?: string;
+  server?: string;
+  arguments?: unknown;
+  contentItems?: { text?: string }[] | null;
+  agentThreadId?: string;
+  receiverThreadIds?: string[];
+};
+// Item kinds with nothing for a reader (the user message is taken from `turn/start`).
+const silentItems = new Set([
+  "userMessage",
+  "reasoning",
+  "plan",
+  "hookPrompt",
+  "contextCompaction",
+]);
+
+/**
+ * One Codex app-server line (`{dir: "in" | "out", msg}` or `{dir: "local", event}`, apps/executor codex adapter) →
+ * normalized entries. Sub-agents (AT-20) are named only by the explicit thread id the protocol gives, never
+ * attributed to the Bot. Streaming deltas, status and account notifications give none.
+ */
+export const normalizeCodex = (line: string, seq: number): TranscriptEntry[] => {
+  let l: {
+    dir?: string;
+    event?: string;
+    msg?: {
+      id?: unknown;
+      method?: string;
+      params?: Record<string, any>;
+      result?: any;
+      error?: any;
+    };
+  };
+  try {
+    l = JSON.parse(line) as typeof l;
+  } catch {
+    return [];
+  }
+  const entry = (kind: TranscriptEntry["kind"], text: string, toolName?: string) => ({
+    seq,
+    kind,
+    text: clean(text),
+    ...(toolName ? { toolName } : {}),
+  });
+  if (l.dir === "local") return [entry("system", l.event ?? "local")];
+  const m = l.msg ?? {};
+  const p = m.params ?? {};
+  if (l.dir === "out") {
+    if (m.method === "turn/start") {
+      const input = (p.input ?? []) as { text?: string }[];
+      return [entry("user", input.map((i) => i.text ?? "").join("\n"))];
+    }
+    if (typeof m.result?.decision === "string")
+      return [entry("system", `approval: ${m.result.decision}`)];
+    return [];
+  }
+  switch (m.method) {
+    case "thread/started":
+      return [entry("system", "thread started")];
+    case "error":
+      return [entry("system", `error: ${p.error?.message ?? ""}`)];
+    case "item/commandExecution/requestApproval":
+      return [entry("system", `approval requested: Bash ${p.command ?? ""}`)];
+    case "item/fileChange/requestApproval":
+      return [entry("system", "approval requested: Edit")];
+    case "turn/completed": {
+      const turn = p.turn ?? {};
+      const items = (turn.items ?? []) as CodexItem[];
+      const final = items.findLast((i) => i.type === "agentMessage")?.text;
+      return [
+        entry(
+          "result",
+          turn.status === "completed"
+            ? (final ?? "completed")
+            : `${turn.status}: ${turn.error?.message ?? ""}`,
+        ),
+      ];
+    }
+    case "item/completed":
+      break;
+    default:
+      return [];
+  }
+  const item = (p.item ?? {}) as CodexItem;
+  switch (item.type) {
+    case "agentMessage":
+      return [entry("assistant", item.text ?? "")];
+    case "commandExecution":
+      return [
+        entry("tool_use", JSON.stringify({ command: item.command }), "Bash"),
+        entry(
+          "tool_result",
+          `${item.status} (exit ${item.exitCode ?? "-"})\n${item.aggregatedOutput ?? ""}`,
+        ),
+      ];
+    case "fileChange":
+      return [
+        entry("tool_use", (item.changes ?? []).map((c) => c.path).join("\n"), "Edit"),
+        entry("tool_result", item.status ?? ""),
+      ];
+    case "dynamicToolCall":
+      return [
+        entry("tool_use", JSON.stringify(item.arguments ?? {}), item.tool),
+        entry("tool_result", (item.contentItems ?? []).map((c) => c.text ?? "").join("\n")),
+      ];
+    case "mcpToolCall":
+      return [
+        entry(
+          "tool_use",
+          JSON.stringify(item.arguments ?? {}),
+          `mcp__${item.server}__${item.tool}`,
+        ),
+      ];
+    case "subAgentActivity":
+      return item.agentThreadId ? [entry("system", `sub-agent thread ${item.agentThreadId}`)] : [];
+    case "collabAgentToolCall":
+      return item.receiverThreadIds?.length
+        ? [entry("system", `sub-agent threads ${item.receiverThreadIds.join(", ")}`)]
+        : [];
+    default:
+      return silentItems.has(item.type ?? "")
+        ? []
+        : [entry("system", `item ${item.type ?? "unknown"}`)];
+  }
+};
+
 /**
  * One confirmed part per page (≤ 1 MiB from the executor): `cursor` is the part seq, `nextCursor` the next one or
  * null. Only parts up to the watermark are read.
@@ -461,7 +596,9 @@ export const getTranscript = async (
   const lines = (await object.text()).split("\n");
   if (lines.at(-1) === "") lines.pop();
   return {
-    entries: lines.flatMap((line, i) => normalize(line, offset!.n + i)),
+    entries: lines.flatMap((line, i) =>
+      (access.provider === "codex" ? normalizeCodex : normalize)(line, offset!.n + i),
+    ),
     nextCursor: partSeq < confirmed ? String(partSeq + 1) : null,
     confirmedThroughSeq: confirmed,
   };

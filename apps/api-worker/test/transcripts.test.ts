@@ -7,6 +7,7 @@ import { createCloudClient } from "@hive/executor/cloudClient";
 import { type JournalEntry, runOnce } from "@hive/executor/runner";
 import { transcriptUploader } from "@hive/executor/uploader";
 import { describe, expect, it } from "vitest";
+import { normalizeCodex } from "../src/transcripts.ts";
 import {
   claim,
   type Claimed,
@@ -348,5 +349,77 @@ describe("executor uploader end to end", () => {
     expect(await hive.rawTranscript(client, result!.runId)).toBe(
       new TextDecoder().decode(new Uint8Array([...part0, ...part1])),
     );
+  });
+});
+
+describe("Codex transcript view", () => {
+  const lines: unknown[] = [
+    { dir: "local", event: "spawn", pid: 1 },
+    {
+      dir: "out",
+      msg: { id: 4, method: "turn/start", params: { input: [{ type: "text", text: "Say hi" }] } },
+    },
+    { dir: "in", msg: { method: "item/agentMessage/delta", params: { delta: "H" } } },
+    {
+      dir: "in",
+      msg: { id: "s1", method: "item/commandExecution/requestApproval", params: { command: "ls" } },
+    },
+    { dir: "out", msg: { id: "s1", result: { decision: "accept" } } },
+    {
+      dir: "in",
+      msg: {
+        method: "item/completed",
+        params: {
+          item: {
+            type: "commandExecution",
+            command: "ls",
+            status: "completed",
+            exitCode: 0,
+            aggregatedOutput: "a.txt",
+          },
+        },
+      },
+    },
+    {
+      dir: "in",
+      msg: {
+        method: "item/completed",
+        params: { item: { type: "agentMessage", text: "Hi ghp_secret" } },
+      },
+    },
+    {
+      dir: "in",
+      msg: {
+        method: "item/completed",
+        params: { item: { type: "subAgentActivity", agentThreadId: "thr-2" } },
+      },
+    },
+    {
+      dir: "in",
+      msg: { method: "item/completed", params: { item: { type: "subAgentActivity" } } },
+    },
+    { dir: "in", msg: { method: "item/completed", params: { item: { type: "imageView" } } } },
+    {
+      dir: "in",
+      msg: {
+        method: "turn/completed",
+        params: { turn: { status: "failed", items: [], error: { message: "boom" } } },
+      },
+    },
+  ];
+
+  it("maps protocol messages to normalized kinds and names sub-agents only by explicit id", () => {
+    expect(lines.flatMap((l, i) => normalizeCodex(JSON.stringify(l), i))).toEqual([
+      { seq: 0, kind: "system", text: "spawn" },
+      { seq: 1, kind: "user", text: "Say hi" },
+      { seq: 3, kind: "system", text: "approval requested: Bash ls" },
+      { seq: 4, kind: "system", text: "approval: accept" },
+      { seq: 5, kind: "tool_use", text: '{"command":"ls"}', toolName: "Bash" },
+      { seq: 5, kind: "tool_result", text: "completed (exit 0)\na.txt" },
+      { seq: 6, kind: "assistant", text: "Hi [redacted]" },
+      { seq: 7, kind: "system", text: "sub-agent thread thr-2" },
+      { seq: 9, kind: "system", text: "item imageView" },
+      { seq: 10, kind: "result", text: "failed: boom" },
+    ]);
   });
 });

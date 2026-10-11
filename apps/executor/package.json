@@ -8,6 +8,7 @@
     "./runner": "./src/runner.ts",
     "./adapters/fake": "./src/adapters/fake.ts",
     "./adapters/claude": "./src/adapters/claude.ts",
+    "./adapters/codex": "./src/adapters/codex.ts",
     "./journal": "./src/journal.ts",
     "./uploader": "./src/uploader.ts",
     "./environments": "./src/environments.ts"

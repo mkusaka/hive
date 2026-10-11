@@ -426,8 +426,9 @@ describe("output and credentials", () => {
     h.deps.runExecutor = async (_cloud, _once, provider) => void providers.push(provider);
     expect(await h.hive("executor", "run", "--once", "--provider", "claude")).toBe(0);
     expect(await h.hive("executor", "run", "--once")).toBe(0);
-    expect(await h.hive("executor", "run", "--provider", "codex")).toBe(2);
-    expect(providers).toEqual(["claude", "fake"]);
+    expect(await h.hive("executor", "run", "--once", "--provider", "codex")).toBe(0);
+    expect(await h.hive("executor", "run", "--provider", "gemini")).toBe(2);
+    expect(providers).toEqual(["claude", "fake", "codex"]);
   });
 });
 

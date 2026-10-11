@@ -37,7 +37,7 @@ hive channel list | hive bot list | hive device list   # bootstrap lists of the 
 hive channel messages <channel-id>                     # newest-first messages of a member channel
 hive bot conversations                                 # private bot-to-bot conversations and their messages
 hive sync changes [--cursor <cursor>]                  # without --cursor: the bootstrap cursor
-hive executor run [--once] [--provider fake|claude]    # Local Executor with the stored token (default fake)
+hive executor run [--once] [--provider fake|claude|codex]  # Local Executor with the stored token (default fake)
 hive project create --key <KEY> --name <name>
 hive task create (--project <KEY> | --parent <task>) --title <title> [--priority <n>]
 hive task list [--project <KEY>] [--status <status>]

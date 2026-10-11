@@ -468,6 +468,13 @@ Raw provider transcripts in R2 with a D1 manifest (docs/architecture.md §3.3, �
   number in the raw stream (blocks of one message share it); SDK messages of other types are skipped; `text` is
   redacted (`sk-`, `ghp_`, `xox?-`, `AKIA` tokens and PEM blocks → `[redacted]`) and then cut to 4 KiB. The raw
   route is owner-only and streams one part at a time.
+- **Codex streams** (`provider: codex`, lines `{dir, msg}` from the executor's Codex adapter) map by
+  `normalizeCodex`: `turn/start` → `user`; `item/completed` agent message → `assistant`, command execution →
+  `tool_use` `Bash` + `tool_result`, file change → `tool_use` `Edit` + `tool_result`, dynamic / MCP tool call →
+  `tool_use` (+ `tool_result`); approval requests and decisions, `thread/started`, `error` and the spawn line →
+  `system`; `turn/completed` → `result`. Sub-agent items appear as `system` only with their explicit thread id
+  (AT-20: never attributed to the Bot); unknown item types → `system` `item <type>`; deltas and status
+  notifications are skipped.
 - **Never indexed.** Neither the raw parts nor the normalized view go into `search_documents`.
 
 ## Known gaps

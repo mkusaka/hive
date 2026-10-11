@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { text } from "node:stream/consumers";
 import { claudeAdapter } from "@hive/executor/adapters/claude";
+import { codexAdapter } from "@hive/executor/adapters/codex";
 import { saveEnvironment } from "@hive/executor/environments";
 import { fakeAdapter } from "@hive/executor/adapters/fake";
 import { fileJournal, transcriptReader } from "@hive/executor/journal";
@@ -74,10 +75,12 @@ process.exitCode = await run(process.argv.slice(2), {
         adapter:
           provider === "claude"
             ? claudeAdapter({ stateDir: executorDir })
-            : fakeAdapter({
-                delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
-                fail: process.env.FAKE_FAIL === "1",
-              }),
+            : provider === "codex"
+              ? codexAdapter({ stateDir: executorDir })
+              : fakeAdapter({
+                  delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
+                  fail: process.env.FAKE_FAIL === "1",
+                }),
       },
       // docs/roadmap.md §1: executor Job reconcile every 30 s (no WebSocket yet).
       { once, pollMs: 30_000 },

@@ -31,7 +31,7 @@ export type Deps = {
   pollMs?: number;
 };
 
-export type Provider = "fake" | "claude";
+export type Provider = "fake" | "claude" | "codex";
 
 type Values = Record<string, string | boolean | (string | boolean)[] | undefined>;
 type Ctx = {
@@ -627,12 +627,12 @@ const specs: Record<string, Spec> = {
     ]),
   ),
   "executor run": {
-    usage: "[--once] [--provider fake|claude]",
+    usage: "[--once] [--provider fake|claude|codex]",
     options: { once: flag, provider: { type: "string", default: "fake" } },
     run: async (c) => {
       const provider = c.values.provider;
-      if (provider !== "fake" && provider !== "claude")
-        throw invalid("--provider must be fake or claude");
+      if (provider !== "fake" && provider !== "claude" && provider !== "codex")
+        throw invalid("--provider must be fake, claude or codex");
       const token = c.creds.deviceToken;
       if (!token)
         throw new CliError("UNAUTHENTICATED", 3, "no deviceToken: run `hive device register`");

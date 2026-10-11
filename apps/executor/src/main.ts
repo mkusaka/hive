@@ -1,8 +1,9 @@
 // hive Local Executor (Phase 1): `bun run apps/executor/src/main.ts --api-url ... --token-file ...
-// --state-dir ... [--once] --provider fake|claude`.
+// --state-dir ... [--once] --provider fake|claude|codex`.
 import { readFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import { claudeAdapter } from "./adapters/claude.ts";
+import { codexAdapter } from "./adapters/codex.ts";
 import { fakeAdapter } from "./adapters/fake.ts";
 import { createCloudClient } from "./cloudClient.ts";
 import { fileJournal, transcriptReader } from "./journal.ts";
@@ -23,11 +24,11 @@ const tokenFile = values["token-file"];
 const stateDir = values["state-dir"];
 if (!apiUrl || !tokenFile || !stateDir) {
   console.error(
-    "usage: main.ts --api-url URL --token-file PATH --state-dir DIR [--once] --provider fake|claude",
+    "usage: main.ts --api-url URL --token-file PATH --state-dir DIR [--once] --provider fake|claude|codex",
   );
   process.exit(2);
 }
-if (values.provider !== "fake" && values.provider !== "claude") {
+if (!["fake", "claude", "codex"].includes(values.provider)) {
   console.error(`unsupported provider: ${values.provider}`);
   process.exit(2);
 }
@@ -47,10 +48,12 @@ const result = await runLoop(
     adapter:
       values.provider === "claude"
         ? claudeAdapter({ stateDir })
-        : fakeAdapter({
-            delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
-            fail: process.env.FAKE_FAIL === "1",
-          }),
+        : values.provider === "codex"
+          ? codexAdapter({ stateDir })
+          : fakeAdapter({
+              delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
+              fail: process.env.FAKE_FAIL === "1",
+            }),
   },
   // docs/roadmap.md §1: executor Job reconcile every 30 s (no WebSocket yet).
   { once: values.once, pollMs: 30_000 },

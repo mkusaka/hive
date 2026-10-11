@@ -7,7 +7,7 @@
 // directory, or the environment's checkout root from `<state-dir>/environments.json` (`cwdMode: environment`).
 // `hive_wait_for_reply` ends the Run: once its tool result appears in the stream, the adapter aborts the query (no
 // further model turn) and exits with `waitingFor`, which the runner submits as a `waiting` result (§8.2).
-import { mkdir, open, readFile, realpath, stat } from "node:fs/promises";
+import { mkdir, open, readFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import {
   type Options,
@@ -15,7 +15,7 @@ import {
   type SDKMessage,
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { readEnvironments } from "../environments.ts";
+import { runCwd } from "../environments.ts";
 import type { AgentAdapter, LaunchContext, RunningAgent } from "../runner.ts";
 import { approvalGate, preToolUse, toolOptions, truncate } from "../toolPolicy.ts";
 import { hiveMcpServer, hiveTools, toolName, waitForReplyTool } from "../tools.ts";
@@ -139,29 +139,17 @@ export const claudeAdapter = ({
     // Preflight: an environment run needs the environment's checkout on this device.
     const policy = ctx.context.bot.toolPolicy;
     const environment = ctx.context.environment;
-    let cwd = join(stateDir, "runs", ctx.runId);
-    if (policy.cwdMode === "environment") {
-      const root = environment ? (await readEnvironments(stateDir))[environment] : undefined;
-      const isDir = root
-        ? await stat(root).then(
-            (s) => s.isDirectory(),
-            () => false,
-          )
-        : false;
-      if (!root || !isDir) {
-        const exit: Exit = {
-          code: 1,
-          reason: "environment_missing",
-          summary: truncate(
-            `claude: environment ${environment ?? "(none)"} is not on this device`,
-            kib8,
-          ),
-        };
-        return { requestStop: async () => {}, waitForExit: async () => exit };
-      }
-      cwd = root;
-    } else {
-      await mkdir(cwd, { recursive: true });
+    const cwd = await runCwd(stateDir, ctx.runId, ctx.context);
+    if (!cwd) {
+      const exit: Exit = {
+        code: 1,
+        reason: "environment_missing",
+        summary: truncate(
+          `claude: environment ${environment ?? "(none)"} is not on this device`,
+          kib8,
+        ),
+      };
+      return { requestStop: async () => {}, waitForExit: async () => exit };
     }
     const roots = [...new Set([cwd, await realpath(cwd)])];
 
