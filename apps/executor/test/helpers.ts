@@ -17,6 +17,7 @@ export const context: RunContext = {
     recent: [{ actorKind: "user", actorId: "actor-1", body: "Say hello.", createdAt: "" }],
   },
   inboxItem: { id: "inbox-1", body: "Say hello." },
+  batch: null,
 };
 
 const lease = () => new Date(Date.now() + 40).toISOString();

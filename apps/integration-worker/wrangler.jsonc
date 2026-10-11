@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hive-integration",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-15",
+  // The same D1 database as hive-api. Secrets GITHUB_WEBHOOK_SECRET and SLACK_SIGNING_SECRET come from
+  // `wrangler secret put` (or `.dev.vars` locally); see README.md.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hive",
+      // PLACEHOLDER: replace with the real id once the owner provisions D1 (`bunx wrangler d1 create hive`).
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "../../packages/db/migrations",
+    },
+  ],
+}

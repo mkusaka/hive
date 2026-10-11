@@ -21,6 +21,7 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/projects?workspaceId=`                                 | Access assertion (user)                | Projects of the Workspace (max 500)                                                            |
 | `GET /v1/tasks?workspaceId=&projectKey=&status=`                | Access assertion (user)                | Tasks with computed `display` and `prerequisites` (max 500); see Work below                    |
 | `GET /v1/tasks/:id`                                             | Access assertion (user)                | A Task with prerequisites, dependents, Results and Jobs                                        |
+| `GET /v1/subscriptions?workspaceId=`                            | Access assertion (user)                | Subscriptions of the Workspace with their spec (max 500); see Subscriptions below              |
 | `GET /v1/sync/changes?cursor=`                                  | Access assertion (user)                | Permitted changes after the cursor (limit 1..500, default 100); see Sync below                 |
 | `GET /v1/realtime?workspaceId=`                                 | Access assertion, or device Bearer     | WebSocket upgrade to the Workspace's Realtime DO; see Realtime below                           |
 | `GET /v1/executor/me`                                           | `Authorization: Bearer <device-token>` | Returns the device principal                                                                   |
@@ -42,7 +43,7 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
   `withOperationReceipt`, so a replay with the same key returns the stored response and a different payload under
   the same key is 409 `IDEMPOTENCY_CONFLICT`.
 - **Command types:** `workspace.create`, `device.register`, `device.revoke`, `channel.create`, `bot.create`,
-  `agent.send`, `event.emit`, and the Work commands below.
+  `agent.send`, `event.emit`, the Work commands and the Subscription / integration commands below.
 - **Actors.** A user's `actors` row is created by `workspace.create` together with the membership (the only path
   that creates a membership today), unique per `(workspace_id, user_id)`. Messages and channel membership use it.
 - **`channel.create`** creates the channel, its main conversation and an `owner` channel membership for the caller.
@@ -96,6 +97,9 @@ Executor reads and observations, outside the command envelope:
   `{bot: {id, name, instructions}, task: {key, title, description} | null, conversation: {id, channelId, recent}
 | null, inboxItem: {id, body} | null}`. `recent` is the Conversation's last 20 messages, oldest first, as
   `{actorKind, actorId, body, createdAt}`. The item body is the trigger message's text, else the event's data JSON.
+  A batch Job (`jobs.inbox_batch_id`) has `inboxItem: null` and `batch: {id, items: [{id, body}]}` (oldest
+  first); its `conversation` is the batch lane's. `run.result.submit` then settles every batch member and may
+  reply in that Conversation.
 - **`POST /v1/executor/observations {runId, executionGeneration, kind, payload}`.** Only `runtime.run.started` is
   stored: `payload.providerSessionId` goes to `runs.provider_session_id` with the same fence (409 when stale, 422
   when missing). Repeating it is harmless. Any other `kind` returns 202 and is dropped.
@@ -135,6 +139,47 @@ receipt and a concurrent change rolls the batch back; the failure is then re-rea
 - **Display states.** `GET /v1/tasks` and `/v1/tasks/:id` add `display`: the status, or `ready` / `blocked` while
   `pending` (`displayState`); a cancelled prerequisite blocks (AT-17). Never stored.
 
+## Subscriptions
+
+Bot Subscriptions decide which Bot inbox an event reaches (docs/architecture.md §6.4, §17.1). Only users manage
+them for now: there is no Bot principal yet. Every change bumps `revision` and copies the row into the immutable
+`subscription_revisions` in the same batch.
+
+- **`subscription.create {botId, integrationId?, eventTypes, filter?, destination, delivery?, expiresAt?}`.**
+  `eventTypes` are exact types or `prefix.*` globs (1..20). `filter` is the AST from `@hive/contracts`
+  (`FilterExpression`: `and / or / not / eq / neq / in / contains / prefix` over a fixed field list, depth ≤ 4,
+  ≤ 32 nodes, rejected at parse with 422); omitted, it matches every event of `eventTypes`. `destination`
+  `{conversationId, projectId?, taskId?}`: the Conversation must be in the Workspace (404) and the caller a member
+  of its Channel (403); Project / Task must exist (404). `delivery` `{mode: notify|wake|batch, debounceMs = 10000,
+maxBatchItems = 30, ttlSeconds = 86400}` (`ttlSeconds` is stored, not enforced). The Bot and `integrationId`
+  must exist (404). Returns `{subscriptionId, revision: 1}`.
+- **`subscription.update {subscriptionId, expectedRevision, eventTypes?, filter?, destination?, delivery?,
+expiresAt?, enabled?}`.** Replaces the given fields under a revision CAS (409 `REVISION_CONFLICT`, `reason:
+"stale_revision"`). `enabled: true` resumes a paused Subscription.
+- **`subscription.pause {subscriptionId}`** sets `enabled = 0` (a no-op when already paused).
+  **`subscription.delete {subscriptionId}`** removes the row; revisions, pending inbox items and Jobs stay.
+- **`subscription.test {subscriptionId, limit = 50}`** is a dry-run: it evaluates the Subscription over the
+  Workspace's last `limit` (≤ 200) events and returns `{evaluated, matched: [{eventId, type, receivedAt}]}`. It
+  writes nothing, not even a receipt.
+- **`integration.create {kind: github|slack, externalAccountId?}`** adds an `integration_installations` row and
+  returns `{integrationId, hookPath}` for `apps/integration-worker`. `externalAccountId` is the app's own
+  provider account (the Slack bot user id), whose posts are never routed (AT-27).
+
+Routing (in the pump) for any event other than `agent.message.sent`:
+
+- Candidates are the Workspace's enabled Subscriptions with no `expires_at` in the past. One matches when an
+  `eventTypes` pattern matches, its `integration_id` is null or the event's, and the filter is true for the
+  envelope (`type`, `source.kind`, `subject`, `data`).
+- Matches collapse to one recipient per (Bot, lane), lane = destination Conversation (§6.2): one
+  `event_deliveries` row with purpose `subscription` and every matched id in `matched_subscription_ids`, one inbox
+  item and at most one Job. When the matched Subscriptions' modes differ, `wake` beats `batch` beats `notify`.
+- `wake` queues a Job (`inbox:<itemId>`), `notify` only stores the item. `batch` joins the (Bot, lane)'s open
+  `inbox_batches` row, opening one with `seal_at = now + debounceMs` and `max_items = maxBatchItems`. After each
+  pump pass, batches past `seal_at` or at `max_items` are sealed with ONE Job (`batch:<batchId>`,
+  `inbox_batch_id`); items arriving later open the next batch.
+- All recipients of one event are committed with the consumer receipt in one batch. No match writes the receipt
+  only (matched = 0, AT-06).
+
 ## Sync
 
 The list, sync and realtime routes take the Workspace as `?workspaceId=` (required; 403 if the principal is not a
@@ -157,6 +202,10 @@ member).
   | `task.create / assign / complete / cancel` | task (workspace)                                                         |
   | `task.plan`                                | task, task_dependency `<prereq>:<dependent>` upsert / delete (workspace) |
   | `job.start`                                | Job, task (workspace)                                                    |
+  | `subscription.*` (not `test`)              | subscription, delete on `delete` (workspace)                             |
+  | `integration.create`                       | integration (workspace)                                                  |
+  | event route via Subscriptions              | inbox item (destination channel), Job (workspace) for `wake`             |
+  | batch seal (pump)                          | Job (workspace)                                                          |
   | `run.result.submit` of a Task Job          | also task_result (workspace)                                             |
 
   `run.lease.renew` and heartbeats are not logged. `event.emit` logs nothing itself (events are not a synced
@@ -196,7 +245,8 @@ WebSocket Hibernation API. It holds connections only, never state (ADR-04); ever
 
 - `agent.message.sent`: one batch writes the consumer receipt, an `event_deliveries` row, links the existing
   inbox item to it and, for `wake`, inserts a `queued` Job with trigger key `inbox:<inboxItemId>`.
-- Any other event: no subscriptions exist yet, so only the consumer receipt is written (matched = 0).
+- Any other event: Subscription routing (see Subscriptions above); no match writes only the consumer receipt.
+- Then due Inbox batches are sealed into one Job each; the response is `{processed, dead, sealed}`.
 - Routing twice is a no-op (consumer receipt PK; UNIQUE trigger key as backstop). A failed row keeps its lease
   and is retried when it expires; after 5 attempts it is marked `dead`. Topics without a consumer yet
   (`run.finished`) are marked `sent`.
@@ -228,6 +278,12 @@ It runs from the `scheduled()` cron trigger (every minute) and from `POST /v1/ex
   graph and its CAS covers only the edited Task, so two concurrent plans on different Tasks can still close a
   cycle (`workspaces.control_revision`, §11.2, does not exist yet). `task.cancel` does not stop Jobs. Task lists
   are bounded at 500 without a cursor.
+- **Subscriptions.** No Bot principal, so Bots cannot manage their own Subscriptions (§17.1 gives them
+  `subscription.*`); no policy / approval for widening scope. A batch is a fixed window from its first item, not a
+  sliding debounce, and it can briefly exceed `max_items` until the next pump pass seals it. `ttlSeconds` and
+  `destination.projectId / taskId` are stored only (Jobs carry no Task). `subscription.test` sees every event of
+  the Workspace, including echoes that never route. No `append` mode. `data.keyword` is in the filter field list
+  but no normalizer fills it yet, so a filter on it never matches.
 - **Bot channel membership.** `agent.send` does not require the recipient Bot to be a member of the channel;
   `bot.create` adds no membership.
 

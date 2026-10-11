@@ -152,10 +152,14 @@ describe("claudeAdapter", () => {
     let signal: AbortSignal | undefined;
     const queryFn: QueryFn = async function* ({ options }) {
       signal = options.abortController!.signal;
-      yield init;
-      await new Promise((_, reject) =>
+      // Listen before yielding: an abort that lands first must still be observed.
+      const aborted = new Promise((_, reject) =>
         signal!.addEventListener("abort", () => reject(new Error("aborted"))),
       );
+      aborted.catch(() => undefined); // handled by the await below, or superseded by the throw
+      yield init;
+      if (signal.aborted) throw new Error("aborted");
+      await aborted;
     };
     const agent = await claudeAdapter({ stateDir: dir, queryFn }).start(launch());
     await new Promise((resolve) => setTimeout(resolve, 10));

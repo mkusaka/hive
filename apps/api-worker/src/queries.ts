@@ -288,3 +288,22 @@ export const getTask = async (db: D1Database, wsIds: string[], id: string) => {
     jobs: jobs.results,
   };
 };
+
+/** Subscriptions of the Workspace with their spec JSON parsed (max 500). */
+export const listSubscriptions = async (db: D1Database, workspaceId: string) => {
+  const { results } = await db
+    .prepare(
+      `SELECT id, bot_id AS botId, integration_id AS integrationId, event_types AS eventTypes, filter, destination,
+              delivery, enabled, expires_at AS expiresAt, revision, created_at AS createdAt, updated_at AS updatedAt
+         FROM subscriptions WHERE workspace_id = ? ORDER BY created_at, id LIMIT 500`,
+    )
+    .bind(workspaceId)
+    .all<Record<string, unknown>>();
+  for (const s of results) {
+    for (const key of ["eventTypes", "filter", "destination", "delivery"]) {
+      s[key] = JSON.parse(s[key] as string);
+    }
+    s.enabled = s.enabled === 1;
+  }
+  return { subscriptions: results };
+};

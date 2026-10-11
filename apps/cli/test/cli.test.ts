@@ -141,6 +141,35 @@ describe("argv → request", () => {
     });
   });
 
+  it("subscription and integration commands", async () => {
+    const spec = {
+      botId: "bot-1",
+      eventTypes: ["github.*"],
+      destination: { conversationId: "conv-1" },
+    };
+    const h = harness(undefined, { stdin: JSON.stringify(spec) });
+    expect(await h.hive("subscription", "create", "--file", "-")).toBe(0);
+    expect(await h.hive("subscription", "list")).toBe(0);
+    expect(await h.hive("subscription", "pause", "sub-1")).toBe(0);
+    expect(await h.hive("subscription", "test", "sub-1", "--limit", "5")).toBe(0);
+    expect(
+      await h.hive("integration", "create", "--kind", "slack", "--external-account-id", "U1"),
+    ).toBe(0);
+    expect(
+      h.calls.map((c) => [c.method, c.path, (c.body as { command?: unknown })?.command]),
+    ).toEqual([
+      ["POST", "/v1/commands", { ...spec, type: "subscription.create" }],
+      ["GET", "/v1/subscriptions?workspaceId=ws-1", undefined],
+      ["POST", "/v1/commands", { type: "subscription.pause", subscriptionId: "sub-1" }],
+      ["POST", "/v1/commands", { type: "subscription.test", subscriptionId: "sub-1", limit: 5 }],
+      [
+        "POST",
+        "/v1/commands",
+        { type: "integration.create", kind: "slack", externalAccountId: "U1" },
+      ],
+    ]);
+  });
+
   it("rejects invalid input locally with exit 2 and sends nothing", async () => {
     const h = harness(undefined, { stdin: "not json" });
     expect(await h.hive("event", "emit", "custom.x", "--data-file", "-")).toBe(2);

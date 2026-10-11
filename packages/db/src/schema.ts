@@ -410,12 +410,18 @@ export const events = sqliteTable(
     occurredAt: text("occurred_at").notNull(),
     receivedAt: text("received_at").notNull(),
     expiresAt: text("expires_at"),
+    // Second identity of one external fact seen through several events, e.g. a Slack post delivered as both
+    // `app_mention` and `message`: `slack:<team>:<channel>:<ts>` (docs/architecture.md §6.2).
+    logicalKey: text("logical_key"),
   },
   (t) => [
     scoped(t),
     uniqueIndex("events_source_dedupe")
       .on(t.workspaceId, t.sourceKind, t.integrationId, t.externalEventId)
       .where(sql`${t.integrationId} IS NOT NULL AND ${t.externalEventId} IS NOT NULL`),
+    uniqueIndex("events_logical_dedupe")
+      .on(t.workspaceId, t.logicalKey)
+      .where(sql`${t.logicalKey} IS NOT NULL`),
   ],
 );
 
@@ -482,9 +488,11 @@ export const inboxItems = sqliteTable(
     deliveryId: text("delivery_id"),
     // docs/architecture.md §7.2. No SQL CHECK: adding one to an existing table makes drizzle-kit
     // recreate it; the command schema validates the value.
-    deliveryMode: text("delivery_mode", { enum: ["wake", "notify"] })
+    deliveryMode: text("delivery_mode", { enum: ["wake", "notify", "batch"] })
       .notNull()
       .default("wake"),
+    // `batch` items: the Inbox batch they joined. Single-column FK: added by ALTER TABLE (see jobs.task_id).
+    batchId: text("batch_id").references((): AnySQLiteColumn => inboxBatches.id),
     state: text("state", { enum: inboxStates }).notNull().default("pending"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
@@ -503,6 +511,103 @@ export const inboxItems = sqliteTable(
       foreignColumns: [eventDeliveries.workspaceId, eventDeliveries.id],
     }),
   ],
+);
+
+const batchStates = ["open", "sealed"] as const;
+
+/**
+ * current state (docs/architecture.md §7.2). One `open` batch per (bot, lane); membership is fixed at seal, when
+ * the pump creates its one Job (`trigger_key = batch:<id>`). `max_items` comes from the Subscription that opened it.
+ */
+export const inboxBatches = sqliteTable(
+  "inbox_batches",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    botId: text("bot_id").notNull(),
+    lane: text("lane").notNull(),
+    state: text("state", { enum: batchStates }).notNull().default("open"),
+    sealAt: text("seal_at").notNull(),
+    maxItems: integer("max_items").notNull(),
+    itemCount: integer("item_count").notNull().default(0),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    scoped(t),
+    uniqueIndex("inbox_batches_open")
+      .on(t.workspaceId, t.botId, t.lane)
+      .where(sql`${t.state} = 'open'`),
+    index("inbox_batches_seal").on(t.state, t.sealAt),
+    oneOf("inbox_batches_state", t.state, batchStates),
+    foreignKey({ columns: [t.workspaceId, t.botId], foreignColumns: [bots.workspaceId, bots.id] }),
+  ],
+);
+
+// -------------------------------------------------------------- Integrations
+
+const integrationKinds = ["github", "slack"] as const;
+
+/**
+ * current state. The id is the hook URL's `:integrationId`. `external_account_id` is the app's own account on the
+ * provider (the Slack bot user id), used to drop echoes of its own posts (AT-27).
+ */
+export const integrationInstallations = sqliteTable(
+  "integration_installations",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    kind: text("kind", { enum: integrationKinds }).notNull(),
+    enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+    externalAccountId: text("external_account_id"),
+    createdAt: createdAt(),
+  },
+  (t) => [scoped(t), oneOf("integration_installations_kind", t.kind, integrationKinds)],
+);
+
+// Subscription spec columns, shared by the current row and its immutable revisions (docs/architecture.md §17.1).
+const subscriptionSpec = () => ({
+  workspaceId: workspaceId(),
+  botId: text("bot_id").notNull(),
+  integrationId: text("integration_id"),
+  eventTypes: text("event_types", { mode: "json" }).notNull(),
+  filter: text("filter", { mode: "json" }).notNull(),
+  destination: text("destination", { mode: "json" }).notNull(),
+  delivery: text("delivery", { mode: "json" }).notNull(),
+  enabled: integer("enabled", { mode: "boolean" }).notNull(),
+  expiresAt: text("expires_at"),
+  revision: integer("revision").notNull(),
+});
+
+/** current state. Every change bumps `revision` and copies the row to `subscription_revisions`. */
+export const subscriptions = sqliteTable(
+  "subscriptions",
+  {
+    id: text("id").primaryKey(),
+    ...subscriptionSpec(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    scoped(t),
+    index("subscriptions_workspace_enabled").on(t.workspaceId, t.enabled),
+    foreignKey({ columns: [t.workspaceId, t.botId], foreignColumns: [bots.workspaceId, bots.id] }),
+    foreignKey({
+      columns: [t.workspaceId, t.integrationId],
+      foreignColumns: [integrationInstallations.workspaceId, integrationInstallations.id],
+    }),
+  ],
+);
+
+/** immutable history. No FK to `subscriptions`: revisions outlive a deleted Subscription. */
+export const subscriptionRevisions = sqliteTable(
+  "subscription_revisions",
+  {
+    subscriptionId: text("subscription_id").notNull(),
+    ...subscriptionSpec(),
+    createdAt: createdAt(),
+  },
+  (t) => [primaryKey({ columns: [t.subscriptionId, t.revision] })],
 );
 
 // --------------------------------------------------------------- Execution

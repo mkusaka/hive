@@ -130,6 +130,23 @@ export const jobStart = (
   input: { taskId: string; botId: string; deviceId?: string },
 ) => c.command(e, { type: "job.start", ...input });
 
+// --------------------------------------------- Subscriptions and integrations (§17)
+
+/** `spec` is the `subscription.create` command without `type` (botId, eventTypes, filter, destination, ...). */
+export const subscriptionCreate = (c: Client, e: Envelope, spec: Json) =>
+  c.command(e, { ...spec, type: "subscription.create" });
+export const listSubscriptions = (c: Client, workspaceId: string) =>
+  c.get(inWorkspace("subscriptions", workspaceId));
+export const subscriptionPause = (c: Client, e: Envelope, subscriptionId: string) =>
+  c.command(e, { type: "subscription.pause", subscriptionId });
+export const subscriptionTest = (c: Client, e: Envelope, subscriptionId: string, limit?: number) =>
+  c.command(e, { type: "subscription.test", subscriptionId, limit });
+export const integrationCreate = (
+  c: Client,
+  e: Envelope,
+  input: { kind: string; externalAccountId?: string },
+) => c.command(e, { type: "integration.create", ...input });
+
 /** `failed` / `cancelled` exit 5. `recovery_required` is not terminal here: it needs a human (§10). */
 export const terminalJobStates = ["succeeded", "failed", "cancelled"];
 

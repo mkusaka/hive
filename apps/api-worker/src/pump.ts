@@ -2,11 +2,20 @@
 // Known gap: the design hands outbox rows to Cloudflare Queues and routes in a Queue consumer. Until
 // then this function is both, driven by the cron trigger and `POST /v1/executor/pump`.
 import {
+  type FilterExpression,
+  type FilterTarget,
+  matchesEventType,
+  matchesFilter,
+} from "@hive/contracts";
+import {
   acquireOutboxBatch,
   createDeliveryAndInbox,
   markOutboxDead,
   markOutboxSent,
   recordEventRouted,
+  type Recipient,
+  routeToRecipients,
+  sealDueBatches,
 } from "@hive/db";
 import type { Notification } from "./realtime.ts";
 
@@ -21,21 +30,126 @@ type AgentMessageSent = {
   delivery: "wake" | "notify";
 };
 
+export type EventRow = {
+  id: string;
+  workspace_id: string;
+  type: string;
+  source_kind: string;
+  integration_id: string | null;
+  subject_kind: string | null;
+  subject_id: string | null;
+  data: string;
+  received_at: string;
+};
+export const eventColumns =
+  "id, workspace_id, type, source_kind, integration_id, subject_kind, subject_id, data, received_at";
+
+export type SubscriptionRow = {
+  id: string;
+  bot_id: string;
+  integration_id: string | null;
+  event_types: string;
+  filter: string;
+  destination: string;
+  delivery: string;
+};
+type Delivery = { mode: "notify" | "wake" | "batch"; debounceMs: number; maxBatchItems: number };
+
+const toTarget = (e: EventRow): FilterTarget => ({
+  type: e.type,
+  source: { kind: e.source_kind },
+  subject: e.subject_kind === null ? null : { kind: e.subject_kind, id: e.subject_id ?? "" },
+  data: JSON.parse(e.data) as unknown,
+});
+
+/** Event type pattern, integration and filter AST (docs/architecture.md §6.4). */
+export const subscriptionMatches = (sub: SubscriptionRow, event: EventRow) =>
+  matchesEventType(JSON.parse(sub.event_types) as string[], event.type) &&
+  (sub.integration_id === null || sub.integration_id === event.integration_id) &&
+  matchesFilter(JSON.parse(sub.filter) as FilterExpression, toTarget(event));
+
+// When Subscriptions of one (bot, lane) disagree, the strongest mode wins.
+const modeRank = { notify: 0, batch: 1, wake: 2 } as const;
+
+/**
+ * Enabled, unexpired Subscriptions matching the event, collapsed to one recipient per (bot, lane) with every
+ * matched id (§6.2). Lane = destination Conversation; purpose `subscription`.
+ */
+const subscriptionRecipients = async (db: D1Database, event: EventRow) => {
+  const now = new Date();
+  const { results } = await db
+    .prepare(
+      `SELECT s.id, s.bot_id, s.integration_id, s.event_types, s.filter, s.destination, s.delivery,
+              c.id AS conversation_id, c.channel_id
+         FROM subscriptions s
+         JOIN conversations c ON c.workspace_id = s.workspace_id
+                             AND c.id = json_extract(s.destination, '$.conversationId')
+        WHERE s.workspace_id = ? AND s.enabled = 1 AND (s.expires_at IS NULL OR s.expires_at > ?)
+        ORDER BY s.id`,
+    )
+    .bind(event.workspace_id, now.toISOString())
+    .all<SubscriptionRow & { conversation_id: string; channel_id: string }>();
+  const groups = new Map<string, Omit<Recipient, "workspaceId"> & { delivery: Delivery }>();
+  for (const sub of results.filter((s) => subscriptionMatches(s, event))) {
+    const delivery = JSON.parse(sub.delivery) as Delivery;
+    const key = `${sub.bot_id}\n${sub.conversation_id}`;
+    const group = groups.get(key);
+    if (group) {
+      group.matchedSubscriptionIds!.push(sub.id);
+      if (modeRank[delivery.mode] > modeRank[group.delivery.mode]) group.delivery = delivery;
+      continue;
+    }
+    groups.set(key, {
+      id: crypto.randomUUID(),
+      inputId: event.id,
+      botId: sub.bot_id,
+      conversationId: sub.conversation_id,
+      lane: sub.conversation_id,
+      purpose: "subscription",
+      deliveryMode: delivery.mode,
+      scope: `channel:${sub.channel_id}`,
+      matchedSubscriptionIds: [sub.id],
+      delivery,
+    });
+  }
+  const recipients = [...groups.values()];
+  for (const r of recipients) {
+    r.deliveryMode = r.delivery.mode;
+    if (r.delivery.mode === "batch") {
+      r.batch = {
+        sealAt: new Date(now.getTime() + r.delivery.debounceMs).toISOString(),
+        maxItems: r.delivery.maxBatchItems,
+      };
+    }
+  }
+  return recipients;
+};
+
 /**
  * Idempotent: the consumer receipt makes a second route of the same event a no-op. Returns the realtime
  * hint for what this call changed, or null.
  */
 export const routeEvent = async (db: D1Database, eventId: string): Promise<Notification | null> => {
   const event = await db
-    .prepare("SELECT workspace_id, type, data FROM events WHERE id = ?")
+    .prepare(`SELECT ${eventColumns} FROM events WHERE id = ?`)
     .bind(eventId)
-    .first<{ workspace_id: string; type: string; data: string }>();
+    .first<EventRow>();
   if (!event) throw new Error(`event not found: ${eventId}`);
   const workspaceId = event.workspace_id;
   if (event.type !== "agent.message.sent") {
-    // No subscriptions yet: nothing matches (matched=0), only the consumer receipt is written.
-    await recordEventRouted(db, { workspaceId, eventId });
-    return null;
+    const recipients = await subscriptionRecipients(db, event);
+    if (recipients.length === 0) {
+      // matched=0 (AT-06): only the consumer receipt is written.
+      await recordEventRouted(db, { workspaceId, eventId });
+      return null;
+    }
+    const routed = await routeToRecipients(db, { workspaceId, eventId, recipients });
+    if (!routed.routed) return null;
+    const jobAvailable = routed.deliveries.some((d) => d.jobId !== null);
+    const scopes = [...new Set(recipients.map((r) => r.scope))];
+    return jobAvailable
+      ? { workspaceId, scopes: [...scopes, `workspace:${workspaceId}`], jobAvailable }
+      : { workspaceId, scopes };
   }
   const data = JSON.parse(event.data) as AgentMessageSent;
   const scope = `channel:${data.channelId}`;
@@ -59,7 +173,7 @@ export const routeEvent = async (db: D1Database, eventId: string): Promise<Notif
 
 /**
  * Acquires ready outbox rows and handles them. A failed row keeps its lease and is retried after it
- * expires; at `maxAttempts` it goes `dead`. Topics without a consumer yet (e.g. `run.finished`) are
+ * expires; at `maxAttempts` it goes `dead`. Then due Inbox batches are sealed. Topics without a consumer yet (e.g. `run.finished`) are
  * marked sent so they do not cycle to dead. `notify` receives the realtime hint of each routed event.
  */
 export const pump = async (
@@ -89,8 +203,14 @@ export const pump = async (
       }
     }),
   );
+  // Inbox batches due by time or size get their one Job (§7.2).
+  const sealed = await sealDueBatches(db);
+  for (const { workspaceId } of sealed) {
+    input.notify?.({ workspaceId, scopes: [`workspace:${workspaceId}`], jobAvailable: true });
+  }
   return {
     processed: outcomes.filter((o) => o === "processed").length,
     dead: outcomes.filter((o) => o === "dead").length,
+    sealed: sealed.length,
   };
 };

@@ -560,8 +560,8 @@ export const insertEvent = (db: D1Database, e: typeof events.$inferInsert) =>
     .prepare(
       `INSERT INTO events (id, workspace_id, type, schema_version, source_kind, integration_id,
          external_event_id, source_device_id, actor_kind, actor_id, subject_kind, subject_id, data,
-         correlation_id, causation_id, occurred_at, received_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         correlation_id, causation_id, occurred_at, received_at, expires_at, logical_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       e.id,
@@ -582,6 +582,7 @@ export const insertEvent = (db: D1Database, e: typeof events.$inferInsert) =>
       e.occurredAt,
       e.receivedAt,
       e.expiresAt ?? null,
+      e.logicalKey ?? null,
     );
 
 type InboxInput = {
@@ -592,7 +593,7 @@ type InboxInput = {
   lane: string;
   purpose: string;
   conversationId: string | null;
-  deliveryMode: "wake" | "notify";
+  deliveryMode: "wake" | "notify" | "batch";
 };
 
 export const insertInboxItem = (db: D1Database, input: InboxInput) =>
@@ -624,13 +625,14 @@ export const createJob = (
     botId: string;
     triggerKey: string;
     taskId?: string;
+    inboxBatchId?: string;
     placement?: unknown;
   },
 ) =>
   db
     .prepare(
-      `INSERT INTO jobs (id, workspace_id, bot_id, state, trigger_key, task_id, placement)
-       VALUES (?, ?, ?, 'queued', ?, ?,
+      `INSERT INTO jobs (id, workspace_id, bot_id, state, trigger_key, task_id, inbox_batch_id, placement)
+       VALUES (?, ?, ?, 'queued', ?, ?, ?,
          COALESCE(?, (SELECT placement_policy FROM bots WHERE workspace_id = ? AND id = ?)))`,
     )
     .bind(
@@ -639,6 +641,7 @@ export const createJob = (
       input.botId,
       input.triggerKey,
       input.taskId ?? null,
+      input.inboxBatchId ?? null,
       input.placement === undefined ? null : JSON.stringify(input.placement),
       input.workspaceId,
       input.botId,
@@ -648,7 +651,8 @@ export const createJob = (
 
 export const eventRouter = { consumer: "event-router", handlerVersion: "1" } as const;
 
-const insertConsumerReceipt = (db: D1Database, workspaceId: string, eventId: string) =>
+/** The router's consumer receipt. In an intake batch it marks an event that must never route (AT-27). */
+export const insertConsumerReceipt = (db: D1Database, workspaceId: string, eventId: string) =>
   db
     .prepare(
       "INSERT INTO event_receipts (workspace_id, event_id, consumer, handler_version) VALUES (?, ?, ?, ?)",
@@ -689,30 +693,68 @@ export const recordEventRouted = (
   input: { workspaceId: string; eventId: string },
 ) => routeOnce(db, input.workspaceId, input.eventId, []);
 
+export type Recipient = InboxInput & {
+  /** Change-log scope of the inbox item. */
+  scope: string;
+  matchedSubscriptionIds?: string[];
+  /** `batch` mode: the open batch to create if (bot, lane) has none. */
+  batch?: { sealAt: string; maxItems: number };
+};
+
 /**
- * Event route (§11.1): consumer receipt, Delivery, Inbox item and (for `wake`) a queued Job in one batch.
- * The Inbox item may already exist (agent.send writes it at intake): it is linked to the Delivery, and
- * exactly one row must change. The Job's trigger key is `inbox:<inboxItemId>`. Change rows: the inbox item
- * under `scope` and the Job under `workspace:<id>`.
+ * One recipient's Delivery, Inbox item and (for `wake`) queued Job with trigger key `inbox:<id>`. The Inbox item may
+ * already exist (agent.send writes it at intake): it is linked to the Delivery, and exactly one row must change. A
+ * `batch` item joins the (bot, lane)'s open batch, opened here if there is none; the pump seals it.
  */
-export const createDeliveryAndInbox = async (
+const deliveryStatements = (
   db: D1Database,
-  input: InboxInput & { eventId: string; scope: string },
-): Promise<{ routed: false } | { routed: true; deliveryId: string; jobId: string | null }> => {
-  const deliveryId = crypto.randomUUID();
-  const jobId = input.deliveryMode === "wake" ? crypto.randomUUID() : null;
+  input: Recipient & { eventId: string },
+  deliveryId: string,
+  jobId: string | null,
+) => {
   const [setGuard, clearGuard] = guard(db);
-  const routed = await routeOnce(db, input.workspaceId, input.eventId, [
+  const now = iso();
+  const lane = [input.workspaceId, input.botId, input.lane];
+  const openBatch =
+    "SELECT id FROM inbox_batches WHERE workspace_id = ? AND bot_id = ? AND lane = ? AND state = 'open'";
+  const batch = input.deliveryMode === "batch" ? input.batch : undefined;
+  if (input.deliveryMode === "batch" && !batch)
+    throw new Error("batch delivery needs batch settings");
+  return [
     db
       .prepare(
-        `INSERT INTO event_deliveries (id, workspace_id, event_id, bot_id, lane, purpose)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO event_deliveries (id, workspace_id, event_id, bot_id, lane, purpose, matched_subscription_ids)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .bind(deliveryId, input.workspaceId, input.eventId, input.botId, input.lane, input.purpose),
+      .bind(
+        deliveryId,
+        input.workspaceId,
+        input.eventId,
+        input.botId,
+        input.lane,
+        input.purpose,
+        JSON.stringify(input.matchedSubscriptionIds ?? []),
+      ),
+    ...(batch
+      ? [
+          db
+            .prepare(
+              `INSERT INTO inbox_batches (id, workspace_id, bot_id, lane, seal_at, max_items) VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT (workspace_id, bot_id, lane) WHERE state = 'open' DO NOTHING`,
+            )
+            .bind(crypto.randomUUID(), ...lane, batch.sealAt, batch.maxItems),
+          db
+            .prepare(
+              `UPDATE inbox_batches SET item_count = item_count + 1, updated_at = ? WHERE id = (${openBatch})`,
+            )
+            .bind(now, ...lane),
+        ]
+      : []),
     db
       .prepare(
-        `INSERT INTO inbox_items (id, workspace_id, input_id, bot_id, conversation_id, lane, purpose, delivery_mode, delivery_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO inbox_items (id, workspace_id, input_id, bot_id, conversation_id, lane, purpose, delivery_mode,
+           delivery_id, batch_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ${batch ? `(${openBatch})` : "NULL"})
          ON CONFLICT (workspace_id, input_id, bot_id, lane, purpose)
          DO UPDATE SET delivery_id = excluded.delivery_id, updated_at = ?
          WHERE inbox_items.delivery_id IS NULL`,
@@ -727,7 +769,8 @@ export const createDeliveryAndInbox = async (
         input.purpose,
         input.deliveryMode,
         deliveryId,
-        iso(),
+        ...(batch ? lane : []),
+        now,
       ),
     setGuard,
     clearGuard,
@@ -754,6 +797,98 @@ export const createDeliveryAndInbox = async (
           }),
         ]
       : []),
-  ]);
-  return routed ? { routed: true, deliveryId, jobId } : { routed: false };
+  ];
+};
+
+/**
+ * Event route (§11.1): consumer receipt plus every recipient's Delivery, Inbox item and Job in one batch. Returns
+ * `{routed: false}` when the event was already routed.
+ */
+export const routeToRecipients = async (
+  db: D1Database,
+  input: { workspaceId: string; eventId: string; recipients: Omit<Recipient, "workspaceId">[] },
+): Promise<
+  { routed: false } | { routed: true; deliveries: { deliveryId: string; jobId: string | null }[] }
+> => {
+  const deliveries = input.recipients.map((r) => ({
+    deliveryId: crypto.randomUUID(),
+    jobId: r.deliveryMode === "wake" ? crypto.randomUUID() : null,
+  }));
+  const statements = input.recipients.flatMap((r, i) =>
+    deliveryStatements(
+      db,
+      { ...r, workspaceId: input.workspaceId, eventId: input.eventId },
+      deliveries[i]!.deliveryId,
+      deliveries[i]!.jobId,
+    ),
+  );
+  const routed = await routeOnce(db, input.workspaceId, input.eventId, statements);
+  return routed ? { routed: true, deliveries } : { routed: false };
+};
+
+/** A single recipient (agent.send). */
+export const createDeliveryAndInbox = async (
+  db: D1Database,
+  input: InboxInput & { eventId: string; scope: string },
+): Promise<{ routed: false } | { routed: true; deliveryId: string; jobId: string | null }> => {
+  const { workspaceId, eventId, ...recipient } = input;
+  const result = await routeToRecipients(db, { workspaceId, eventId, recipients: [recipient] });
+  return result.routed ? { routed: true, ...result.deliveries[0]! } : result;
+};
+
+// ------------------------------------------------------------ Inbox batches
+
+/**
+ * Seals open batches whose `seal_at` passed or that reached `max_items`, each with its one queued Job
+ * (`trigger_key = batch:<id>`, `inbox_batch_id`) in one guarded batch. A batch sealed concurrently is skipped.
+ */
+export const sealDueBatches = async (db: D1Database, limit = 50) => {
+  const now = iso();
+  const { results } = await db
+    .prepare(
+      `SELECT id, workspace_id, bot_id FROM inbox_batches
+        WHERE state = 'open' AND (seal_at <= ? OR item_count >= max_items) ORDER BY seal_at LIMIT ?`,
+    )
+    .bind(now, limit)
+    .all<{ id: string; workspace_id: string; bot_id: string }>();
+  const sealed = await Promise.all(
+    results.map(async (batch) => {
+      const jobId = crypto.randomUUID();
+      const [setGuard, clearGuard] = guard(db);
+      try {
+        await db.batch([
+          db
+            .prepare(
+              "UPDATE inbox_batches SET state = 'sealed', updated_at = ? WHERE id = ? AND state = 'open'",
+            )
+            .bind(now, batch.id),
+          setGuard,
+          clearGuard,
+          createJob(db, {
+            id: jobId,
+            workspaceId: batch.workspace_id,
+            botId: batch.bot_id,
+            triggerKey: `batch:${batch.id}`,
+            inboxBatchId: batch.id,
+          }),
+          appendChange(db, {
+            workspaceId: batch.workspace_id,
+            entityKind: "job",
+            entityId: jobId,
+            revision: 1,
+            scope: `workspace:${batch.workspace_id}`,
+          }),
+        ]);
+        return { workspaceId: batch.workspace_id, batchId: batch.id, jobId };
+      } catch (error) {
+        const row = await db
+          .prepare("SELECT state FROM inbox_batches WHERE id = ?")
+          .bind(batch.id)
+          .first<{ state: string }>();
+        if (row?.state === "sealed") return null;
+        throw error;
+      }
+    }),
+  );
+  return sealed.filter((s) => s !== null);
 };

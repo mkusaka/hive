@@ -27,6 +27,18 @@ D1 schema, migrations and the atomic repository for the Phase 1 slice
   `task_results` (one per submitted Run of a Task Job, with the Execution's scope revision). `jobs.task_id` marks an
   explicit Task Job; `claimJob` copies it and the Task's `scope_revision` into the Execution
   (`executions.task_id`, `task_scope_revision`). `createJob` takes an optional `taskId` and explicit `placement`.
+- Subscriptions (§17.1): `subscriptions` (current spec as JSON columns, `enabled`, `expires_at`, `revision`) and
+  immutable `subscription_revisions` (one copy per revision, no FK so it outlives a delete).
+  `integration_installations` holds GitHub / Slack hook ids and the app's own provider account
+  (`external_account_id`). `events.logical_key` with the partial UNIQUE `events_logical_dedupe` collapses one
+  external fact seen through several events (Slack `app_mention` + `message`).
+- Routing to several recipients: `routeToRecipients` writes the consumer receipt and, per recipient, the Delivery
+  (`matched_subscription_ids`), the inbox item and a Job for `wake`, all in one batch; `createDeliveryAndInbox` is
+  its single-recipient form. A `batch` recipient joins its (bot, lane)'s open `inbox_batches` row (partial UNIQUE
+  `inbox_batches_open`, opened on demand) through `inbox_items.batch_id`. `sealDueBatches` seals batches past
+  `seal_at` or at `max_items` with one Job each (`trigger_key = batch:<id>`, `jobs.inbox_batch_id`), under a
+  guarded `state = 'open'` CAS. `insertConsumerReceipt` is exported so intake can mark an event that must never
+  route (AT-27).
 - `src/dag.ts`: pure Task DAG rules. `wouldCreateCycle(edges, parentLinks, edge)` checks one "finishes before"
   graph of start dependencies plus the hidden child → parent completion relation (AT-18); `readiness` is `ready`
   only when every prerequisite is `completed` (a cancelled one blocks, AT-17); `displayState` adds it to the status.
@@ -72,7 +84,8 @@ a TTY).
 - No projectless Tasks: `tasks.project_id` is nullable, but `task.create` requires a Project (directly or through the
   parent) because there is no key scheme for Tasks without one.
 
-- `inbox_items.delivery_mode` has no SQL CHECK: adding one to an existing table makes drizzle-kit recreate the
+- `inbox_items.batch_id` is a single-column FK added by `ALTER TABLE` (like `jobs.task_id`).
+- `inbox_items.delivery_mode` (now also `batch`) has no SQL CHECK: adding one to an existing table makes drizzle-kit recreate the
   table. The command schema validates it.
 
 - `finishRun` updates the Job only while it is `active`; a `cancelled` or `recovery_required` Job is left as is while

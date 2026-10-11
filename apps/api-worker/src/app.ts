@@ -29,6 +29,7 @@ import {
   listJobs,
   listMessages,
   listProjects,
+  listSubscriptions,
   listTasks,
 } from "./queries.ts";
 import {
@@ -227,6 +228,10 @@ export const createApp = ({
   );
   app.get("/v1/tasks/:id", async (c) =>
     c.json(await getTask(c.env.DB, user(c).workspaceIds, c.req.param("id"))),
+  );
+
+  app.get("/v1/subscriptions", async (c) =>
+    c.json(await listSubscriptions(c.env.DB, workspaceParam(c))),
   );
 
   app.get("/v1/sync/changes", async (c) =>

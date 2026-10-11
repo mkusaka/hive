@@ -56,8 +56,8 @@ bun run test           # vitest across all workspace packages
 
 Layout: Bun workspaces under `apps/*` and `packages/*`. Today `packages/contracts` holds the shared Valibot schemas
 `packages/db` holds the D1 schema, migrations and atomic repository, `apps/api-worker` is the Access-protected
-API Worker, `apps/executor` is the Local Executor (fake provider only), `apps/cli` is the `hive` CLI and
-`apps/desktop` is the Electron app. See
+API Worker, `apps/executor` is the Local Executor (fake provider only), `apps/cli` is the `hive` CLI,
+`apps/integration-worker` is the GitHub / Slack webhook intake and `apps/desktop` is the Electron app. See
 [docs/architecture.md](docs/architecture.md#25-monorepo-layout-and-dependency-direction-28) for the target layout.
 
 ## Try it locally

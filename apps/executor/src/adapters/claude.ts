@@ -34,15 +34,18 @@ export const systemPrompt = ({ bot }: LaunchContext["context"]) =>
     .filter(Boolean)
     .join("\n\n");
 
-/** User message: Task, recent conversation (oldest first), then the trigger item's body. */
-export const userPrompt = ({ task, conversation, inboxItem }: LaunchContext["context"]) => {
+/** User message: Task, recent conversation (oldest first), then the trigger item's body or the batch's items. */
+export const userPrompt = ({ task, conversation, inboxItem, batch }: LaunchContext["context"]) => {
   const parts: string[] = [];
   if (task) parts.push(`Task ${task.key}: ${task.title}\n${task.description}`.trim());
   if (conversation?.recent.length) {
     const lines = conversation.recent.map((m) => `[${m.actorKind} ${m.actorId}] ${m.body}`);
     parts.push(`Recent conversation:\n${lines.join("\n")}`);
   }
-  parts.push(`Request:\n${inboxItem?.body ?? "Work on the task above."}`);
+  const request = batch
+    ? batch.items.map((i, n) => `[${n + 1}] ${i.body}`).join("\n")
+    : (inboxItem?.body ?? "Work on the task above.");
+  parts.push(`Request:\n${request}`);
   return parts.join("\n\n");
 };
 

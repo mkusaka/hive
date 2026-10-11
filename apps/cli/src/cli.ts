@@ -321,6 +321,52 @@ const specs: Record<string, Spec> = {
       return exitForJob(job);
     },
   },
+  "subscription create": {
+    usage: "--file <path|->",
+    options: { file: str },
+    run: async (c) => {
+      let spec: unknown;
+      try {
+        spec = JSON.parse(await c.deps.readInput(need(c.values, "file")));
+      } catch {
+        throw invalid("--file must contain a JSON object");
+      }
+      if (typeof spec !== "object" || spec === null || Array.isArray(spec))
+        throw invalid("--file must contain a JSON object");
+      c.print(await cmd.subscriptionCreate(c.client(), c.envelope(), spec as cmd.Json));
+    },
+  },
+  "subscription list": {
+    usage: "",
+    run: async (c) => c.print(await cmd.listSubscriptions(c.client(), c.workspace())),
+  },
+  "subscription pause": {
+    usage: "<subscription-id>",
+    args: 1,
+    run: async (c) => c.print(await cmd.subscriptionPause(c.client(), c.envelope(), c.args[0]!)),
+  },
+  "subscription test": {
+    usage: "<subscription-id> [--limit <n>]",
+    args: 1,
+    options: { limit: str },
+    run: async (c) => {
+      const limit = c.values.limit === undefined ? undefined : Number(c.values.limit);
+      if (limit !== undefined && !Number.isInteger(limit))
+        throw invalid("--limit must be an integer");
+      c.print(await cmd.subscriptionTest(c.client(), c.envelope(), c.args[0]!, limit));
+    },
+  },
+  "integration create": {
+    usage: "--kind github|slack [--external-account-id <id>]",
+    options: { kind: str, "external-account-id": str },
+    run: async (c) =>
+      c.print(
+        await cmd.integrationCreate(c.client(), c.envelope(), {
+          kind: need(c.values, "kind"),
+          externalAccountId: c.values["external-account-id"] as string | undefined,
+        }),
+      ),
+  },
   "executor run": {
     usage: "[--once] [--provider fake|claude]",
     options: { once: flag, provider: { type: "string", default: "fake" } },

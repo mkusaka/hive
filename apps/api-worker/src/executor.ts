@@ -124,38 +124,40 @@ const runLeaseRenew: Handler<v.InferOutput<typeof RunLeaseRenew>> = async (db, d
 /** Run completion plus the Inbox outcome of the Job's trigger item, in `finishRun`'s batch (§11.1). */
 const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (db, device, env) => {
   const { workspaceId, command } = env;
-  // The trigger item's channel names its change scope; an item without a conversation is workspace-wide.
-  const item = await db
+  // The Job's input items: its trigger item, or every member of its sealed Inbox batch (one lane, so one
+  // Conversation). The channel names their change scope; an item without a conversation is workspace-wide.
+  const { results: items } = await db
     .prepare(
       `SELECT i.id, i.conversation_id, c.channel_id, b.actor_id FROM runs r
          JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
          JOIN bots b ON b.workspace_id = j.workspace_id AND b.id = j.bot_id
-         JOIN inbox_items i ON i.workspace_id = j.workspace_id AND 'inbox:' || i.id = j.trigger_key
+         JOIN inbox_items i ON i.workspace_id = j.workspace_id
+                           AND ('inbox:' || i.id = j.trigger_key OR i.batch_id = j.inbox_batch_id)
          LEFT JOIN conversations c ON c.workspace_id = i.workspace_id AND c.id = i.conversation_id
-        WHERE r.id = ? AND r.workspace_id = ?`,
+        WHERE r.id = ? AND r.workspace_id = ?
+        ORDER BY i.created_at, i.id`,
     )
     .bind(command.runId, workspaceId)
-    .first<{
+    .all<{
       id: string;
       conversation_id: string | null;
       channel_id: string | null;
       actor_id: string;
     }>();
+  const item = items[0];
   const itemScope = item?.channel_id ? `channel:${item.channel_id}` : `workspace:${workspaceId}`;
+  // Batch membership is fixed at seal, so the ids read here are the batch's.
   const inboxOutcome = db
     .prepare(
       `UPDATE inbox_items SET state = ?, updated_at = ?
-        WHERE workspace_id = ? AND id = (
-          SELECT substr(j.trigger_key, 7) FROM runs r
-            JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
-           WHERE r.id = ? AND j.trigger_key LIKE 'inbox:%')`,
+        WHERE workspace_id = ? AND id IN (SELECT value FROM json_each(?))`,
     )
     // ponytail: schema state `processed` is the design's `handled` (§7.1); renaming needs a table rebuild.
     .bind(
       command.state === "succeeded" ? "processed" : "failed",
       new Date().toISOString(),
       workspaceId,
-      command.runId,
+      JSON.stringify(items.map((i) => i.id)),
     );
   // A Task Job's Execution gets an immutable Task Result for its scope revision. Task status is not touched:
   // Run success is not Task completion (AT-16). The Execution still goes `finished` / `failed`, not `submitted`.
@@ -215,19 +217,19 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
     summary: command.summary,
     error: command.error,
     operationId: env.idempotencyKey,
-    statements: item
-      ? [
-          ...taskResult,
-          ...replyMessage,
-          inboxOutcome,
-          appendChange(db, {
-            workspaceId,
-            entityKind: "inbox_item",
-            entityId: item.id,
-            scope: itemScope,
-          }),
-        ]
-      : [...taskResult, inboxOutcome],
+    statements: [
+      ...taskResult,
+      ...replyMessage,
+      inboxOutcome,
+      ...items.map((i) =>
+        appendChange(db, {
+          workspaceId,
+          entityKind: "inbox_item",
+          entityId: i.id,
+          scope: itemScope,
+        }),
+      ),
+    ],
   });
   if (!result.ok) throw staleGeneration();
   const response: RunResultAccepted = { ok: true };
@@ -302,7 +304,10 @@ const fencedRun = async (
   return run;
 };
 
-/** Run context (SDK-01): Bot instructions, Task, recent Conversation and the trigger item's body. */
+/**
+ * Run context (SDK-01): Bot instructions, Task, recent Conversation and the trigger item's body, or for a batch Job
+ * every member's body (its Conversation is the batch lane's).
+ */
 export const getRunContext = async (
   db: D1Database,
   device: Device,
@@ -312,7 +317,7 @@ export const getRunContext = async (
   const workspaceId = device.workspaceIds[0];
   const row = await db
     .prepare(
-      `SELECT b.id AS bot_id, b.name, b.instructions, t.key, t.title, t.description,
+      `SELECT b.id AS bot_id, b.name, b.instructions, t.key, t.title, t.description, j.inbox_batch_id,
               i.id AS item_id, i.conversation_id, c.channel_id,
               COALESCE(m.body, e.data) AS body
          FROM jobs j
@@ -333,12 +338,36 @@ export const getRunContext = async (
       key: string | null;
       title: string | null;
       description: string | null;
+      inbox_batch_id: string | null;
       item_id: string | null;
       conversation_id: string | null;
       channel_id: string | null;
       body: string | null;
     }>();
   if (!row) throw new HttpError("NOT_FOUND", "job not found");
+  let batch: RunContext["batch"] = null;
+  if (row.inbox_batch_id) {
+    const { results } = await db
+      .prepare(
+        `SELECT i.id, i.conversation_id, c.channel_id, COALESCE(m.body, e.data) AS body
+           FROM inbox_items i
+           LEFT JOIN conversations c ON c.workspace_id = i.workspace_id AND c.id = i.conversation_id
+           LEFT JOIN events e ON e.workspace_id = i.workspace_id AND e.id = i.input_id
+           LEFT JOIN messages m ON m.workspace_id = e.workspace_id AND e.subject_kind = 'message'
+                               AND m.id = e.subject_id
+          WHERE i.workspace_id = ? AND i.batch_id = ? ORDER BY i.created_at, i.id`,
+      )
+      .bind(workspaceId, row.inbox_batch_id)
+      .all<{
+        id: string;
+        conversation_id: string | null;
+        channel_id: string | null;
+        body: string;
+      }>();
+    batch = { id: row.inbox_batch_id, items: results.map(({ id, body }) => ({ id, body })) };
+    row.conversation_id = results[0]?.conversation_id ?? null;
+    row.channel_id = results[0]?.channel_id ?? null;
+  }
   let conversation: RunContext["conversation"] = null;
   if (row.conversation_id && row.channel_id) {
     const { results } = await db
@@ -365,6 +394,7 @@ export const getRunContext = async (
         : { key: row.key, title: row.title ?? "", description: row.description ?? "" },
     conversation,
     inboxItem: row.item_id ? { id: row.item_id, body: row.body ?? "" } : null,
+    batch,
   };
 };
 

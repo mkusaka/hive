@@ -1,4 +1,7 @@
 import * as v from "valibot";
+import { EventTypePattern, FilterExpression } from "./filter.ts";
+
+export * from "./filter.ts";
 
 const id = <const Name extends string>(name: Name) =>
   v.pipe(v.string(), v.minLength(1), v.brand(name));
@@ -189,6 +192,84 @@ export const JobStart = v.strictObject({
   deviceId: v.optional(DeviceId),
 });
 
+// ----------------------------------------- Subscriptions and integrations (§17)
+// Users only for now: there is no Bot principal yet.
+
+export const SubscriptionId = id("SubscriptionId");
+export const IntegrationId = id("IntegrationId");
+
+/** docs/roadmap.md §1: Slack/GitHub debounce 10 s, max 30 items per batch. */
+export const SubscriptionDelivery = v.strictObject({
+  mode: v.optional(v.picklist(["notify", "wake", "batch"]), "wake"),
+  debounceMs: v.optional(
+    v.pipe(v.number(), v.integer(), v.minValue(0), v.maxValue(3_600_000)),
+    10_000,
+  ),
+  maxBatchItems: v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(100)), 30),
+  /** Stored; inbox expiry is not enforced yet. */
+  ttlSeconds: v.optional(v.pipe(v.number(), v.integer(), v.minValue(1)), 86_400),
+});
+
+const SubscriptionSpec = {
+  eventTypes: v.pipe(v.array(EventTypePattern), v.minLength(1), v.maxLength(20)),
+  /** Defaults to "match every event of `eventTypes`". */
+  filter: v.optional(FilterExpression, { op: "and", nodes: [] }),
+  destination: v.strictObject({
+    conversationId: v.pipe(v.string(), v.minLength(1)),
+    projectId: v.optional(v.pipe(v.string(), v.minLength(1))),
+    taskId: v.optional(TaskId),
+  }),
+  delivery: v.optional(SubscriptionDelivery, {}),
+  expiresAt: v.optional(v.nullable(Timestamp)),
+};
+
+export const SubscriptionCreate = v.strictObject({
+  type: v.literal("subscription.create"),
+  botId: BotId,
+  /** Only events from this integration; omitted means any source. */
+  integrationId: v.optional(IntegrationId),
+  ...SubscriptionSpec,
+});
+
+/** Replaces the given fields; `enabled: true` resumes a paused Subscription. */
+export const SubscriptionUpdate = v.strictObject({
+  type: v.literal("subscription.update"),
+  subscriptionId: SubscriptionId,
+  expectedRevision: Revision,
+  eventTypes: v.optional(SubscriptionSpec.eventTypes),
+  filter: v.optional(FilterExpression),
+  destination: v.optional(SubscriptionSpec.destination),
+  delivery: v.optional(SubscriptionDelivery),
+  expiresAt: SubscriptionSpec.expiresAt,
+  enabled: v.optional(v.boolean()),
+});
+
+export const SubscriptionPause = v.strictObject({
+  type: v.literal("subscription.pause"),
+  subscriptionId: SubscriptionId,
+});
+
+/** Stops new Deliveries; pending Inbox items and Jobs are kept (§6.4). */
+export const SubscriptionDelete = v.strictObject({
+  type: v.literal("subscription.delete"),
+  subscriptionId: SubscriptionId,
+});
+
+/** Dry-run over the Workspace's last `limit` events: creates nothing, not even a receipt. */
+export const SubscriptionTest = v.strictObject({
+  type: v.literal("subscription.test"),
+  subscriptionId: SubscriptionId,
+  limit: v.optional(v.pipe(v.number(), v.integer(), v.minValue(1), v.maxValue(200)), 50),
+});
+
+/** Returns the hook path. Secrets are environment-level for now (no per-installation secret). */
+export const IntegrationCreate = v.strictObject({
+  type: v.literal("integration.create"),
+  kind: v.picklist(["github", "slack"]),
+  /** The app's own account on the provider (Slack bot user id): its posts are not routed (AT-27). */
+  externalAccountId: v.optional(Name),
+});
+
 // UTF-8 size. No TextEncoder: contracts stay runtime-neutral (`types: []`). A lone surrogate counts 3,
 // as TextEncoder would encode it (U+FFFD).
 const utf8Bytes = (text: string) => {
@@ -313,6 +394,8 @@ export type RunContext = {
     recent: { actorKind: string; actorId: string; body: string; createdAt: string }[];
   } | null;
   inboxItem: { id: string; body: string } | null;
+  /** A batch Job's sealed Inbox batch, items oldest first; `inboxItem` is then null. */
+  batch: { id: string; items: { id: string; body: string }[] } | null;
 };
 
 /**

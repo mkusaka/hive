@@ -31,6 +31,11 @@ hive task plan <task> --after <task>...                # adds prerequisites
 hive task assign <task> (--bot <bot-id> | --user <user-id> | --none)
 hive task complete <task>
 hive job start --task <task> --bot <bot-id> [--device <device-id>] [--wait [--timeout <s>]]
+hive subscription create --file <path|->           # JSON: the subscription.create fields without "type"
+hive subscription list
+hive subscription pause <subscription-id>
+hive subscription test <subscription-id> [--limit <n>]   # dry-run over recent events
+hive integration create --kind github|slack [--external-account-id <id>]   # prints the hook path
 ```
 
 `<task>` is a key (`APP-1`) or an id. The CLI lists the Workspace's Tasks to resolve it and sends the Task's
@@ -46,6 +51,10 @@ a fresh UUID per invocation).
 - **`--wait`** polls `GET /v1/operations/:id` until routing created the Job, then watches it. `--notify` creates no
   Job, so `--notify --wait` is invalid. A timeout never cancels the Job. The default timeout is 300 s.
 - **`event emit`** reads JSON from `--data-file` (`-` is stdin); without it `data` is `{}`.
+- **`subscription create`** sends the file's JSON object as the `subscription.create` command, for example
+  `{"botId": "<bot-id>", "eventTypes": ["github.pull_request.*"], "filter": {"op": "eq", "field":
+"data.repositoryId", "value": 42}, "destination": {"conversationId": "<conversation-id>"}, "delivery": {"mode":
+"batch"}}`. The server validates it (see `apps/api-worker/README.md`, Subscriptions).
 - **`executor run`** wraps `runLoop` from `@hive/executor` with the credentials' `deviceToken`; the journal lives in
   `<config dir>/hive/executor/` (Claude transcripts under `transcripts/`, run cwd under `runs/`; see
   `apps/executor/README.md`). `FAKE_DELAY_MS` / `FAKE_FAIL=1` tune the fake provider. Before each poll it calls
@@ -103,5 +112,5 @@ end-to-end loop is `apps/api-worker/test/cli.test.ts`.
   `--operation-id` / `--idempotency-key` by hand.
 - No offline queue (`--offline-queue`, exit 8).
 - No installed `hive` binary on PATH yet: run it through Bun (alias above).
-- No `event inspect`, `subscription`, `task cancel` or `task plan --remove` yet. `job start --wait` watches the
+- No `event inspect`, `subscription update / delete / resume`, `task cancel` or `task plan --remove` yet. `job start --wait` watches the
   Job, not the Task; complete the Task with `task complete`.

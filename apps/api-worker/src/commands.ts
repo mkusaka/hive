@@ -9,9 +9,15 @@ import {
   DeviceRevoke,
   EventEmit,
   type EventEmitAccepted,
+  IntegrationCreate,
   JobStart,
   type PlacementPolicy,
   ProjectCreate,
+  SubscriptionCreate,
+  SubscriptionDelete,
+  SubscriptionPause,
+  SubscriptionTest,
+  SubscriptionUpdate,
   TaskAssign,
   TaskCancel,
   TaskComplete,
@@ -38,6 +44,7 @@ import * as v from "valibot";
 import { hashSecret, newDeviceSecret } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
 import { HttpError } from "./errors.ts";
+import { eventColumns, type EventRow, type SubscriptionRow, subscriptionMatches } from "./pump.ts";
 
 export const CommandEnvelope = commandEnvelope(
   v.variant("type", [
@@ -55,6 +62,12 @@ export const CommandEnvelope = commandEnvelope(
     TaskComplete,
     TaskCancel,
     JobStart,
+    SubscriptionCreate,
+    SubscriptionUpdate,
+    SubscriptionPause,
+    SubscriptionDelete,
+    SubscriptionTest,
+    IntegrationCreate,
   ]),
 );
 type Envelope = v.InferOutput<typeof CommandEnvelope>;
@@ -908,6 +921,300 @@ const jobStart: Handler<v.InferOutput<typeof JobStart>> = async (db, user, env) 
   });
 };
 
+// ------------------------------------------ Subscriptions (docs/architecture.md §17.1)
+// User principal only: there is no Bot principal yet. Every change bumps `revision` and copies the row to
+// `subscription_revisions` in the same batch.
+
+type SubscriptionCommand = v.InferOutput<typeof SubscriptionCreate>;
+
+const loadSubscription = async (db: D1Database, workspaceId: string, id: string) => {
+  const row = await db
+    .prepare(
+      `SELECT id, bot_id, integration_id, event_types, filter, destination, delivery, enabled, expires_at, revision
+         FROM subscriptions WHERE workspace_id = ? AND id = ?`,
+    )
+    .bind(workspaceId, id)
+    .first<SubscriptionRow & { enabled: number; expires_at: string | null; revision: number }>();
+  if (!row) throw new HttpError("NOT_FOUND", "subscription not found");
+  return row;
+};
+
+/** Immutable copy of the current row; a no-op when that revision is already recorded. */
+const snapshotSubscription = (db: D1Database, id: string) =>
+  db
+    .prepare(
+      `INSERT INTO subscription_revisions (subscription_id, workspace_id, bot_id, integration_id, event_types,
+         filter, destination, delivery, enabled, expires_at, revision)
+       SELECT id, workspace_id, bot_id, integration_id, event_types, filter, destination, delivery, enabled,
+              expires_at, revision
+         FROM subscriptions WHERE id = ?
+       ON CONFLICT DO NOTHING`,
+    )
+    .bind(id);
+
+/**
+ * The destination Conversation must be in the Workspace and the caller a member of its Channel (forwarding into a
+ * Channel needs access to it, §17.1); a Project / Task must exist.
+ */
+const checkDestination = async (
+  db: D1Database,
+  workspaceId: string,
+  userId: string,
+  destination: SubscriptionCommand["destination"],
+) => {
+  const conversation = await db
+    .prepare(
+      `SELECT EXISTS (SELECT 1 FROM channel_members m JOIN actors a
+                ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+             WHERE m.workspace_id = c.workspace_id AND m.channel_id = c.channel_id AND a.user_id = ?) AS member
+         FROM conversations c WHERE c.workspace_id = ? AND c.id = ?`,
+    )
+    .bind(userId, workspaceId, destination.conversationId)
+    .first<{ member: number }>();
+  if (!conversation) throw new HttpError("NOT_FOUND", "destination conversation not found");
+  if (!conversation.member)
+    throw new HttpError("FORBIDDEN", "not a member of the destination channel");
+  for (const [table, id] of [
+    ["projects", destination.projectId],
+    ["tasks", destination.taskId],
+  ] as const) {
+    if (id === undefined) continue;
+    // oxlint-disable-next-line no-await-in-loop -- at most two lookups
+    const found = await db
+      .prepare(`SELECT 1 FROM ${table} WHERE workspace_id = ? AND id = ?`)
+      .bind(workspaceId, id)
+      .first();
+    if (!found) throw new HttpError("NOT_FOUND", `destination ${table.slice(0, -1)} not found`);
+  }
+};
+
+const subscriptionChange = (workspaceId: string, id: string, revision?: number): Change => ({
+  entityKind: "subscription",
+  entityId: id,
+  ...(revision === undefined ? {} : { revision }),
+  scope: `workspace:${workspaceId}`,
+});
+
+const subscriptionCreate: Handler<SubscriptionCommand> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const bot = await db
+    .prepare("SELECT 1 FROM bots WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, command.botId)
+    .first();
+  if (!bot) throw new HttpError("NOT_FOUND", "bot not found");
+  if (command.integrationId) {
+    const integration = await db
+      .prepare("SELECT 1 FROM integration_installations WHERE workspace_id = ? AND id = ?")
+      .bind(workspaceId, command.integrationId)
+      .first();
+    if (!integration) throw new HttpError("NOT_FOUND", "integration not found");
+  }
+  await checkDestination(db, workspaceId, user.userId, command.destination);
+  const subscriptionId = crypto.randomUUID();
+  return receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          `INSERT INTO subscriptions (id, workspace_id, bot_id, integration_id, event_types, filter, destination,
+             delivery, enabled, expires_at, revision)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1)`,
+        )
+        .bind(
+          subscriptionId,
+          workspaceId,
+          command.botId,
+          command.integrationId ?? null,
+          JSON.stringify(command.eventTypes),
+          JSON.stringify(command.filter),
+          JSON.stringify(command.destination),
+          JSON.stringify(command.delivery),
+          command.expiresAt ?? null,
+        ),
+      snapshotSubscription(db, subscriptionId),
+    ],
+    { operationId: env.operationId, status: "accepted", subscriptionId, revision: 1 },
+    [subscriptionChange(workspaceId, subscriptionId, 1)],
+  );
+};
+
+/** A replaced JSON column, or the stored one. */
+const json = (value: unknown, stored: string) =>
+  value === undefined ? stored : JSON.stringify(value);
+
+/** Revision CAS: a stale `expectedRevision` is 409 REVISION_CONFLICT. */
+const subscriptionUpdate: Handler<v.InferOutput<typeof SubscriptionUpdate>> = async (
+  db,
+  user,
+  env,
+) => {
+  const { workspaceId, command } = env;
+  const current = await loadSubscription(db, workspaceId, command.subscriptionId);
+  if (command.destination) {
+    await checkDestination(db, workspaceId, user.userId, command.destination);
+  }
+  const [setGuard, clearGuard] = guard(db);
+  const run = receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE subscriptions SET event_types = ?, filter = ?, destination = ?, delivery = ?, expires_at = ?,
+             enabled = ?, revision = revision + 1, updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND revision = ?`,
+        )
+        .bind(
+          json(command.eventTypes, current.event_types),
+          json(command.filter, current.filter),
+          json(command.destination, current.destination),
+          json(command.delivery, current.delivery),
+          command.expiresAt === undefined ? current.expires_at : command.expiresAt,
+          command.enabled === undefined ? current.enabled : Number(command.enabled),
+          new Date().toISOString(),
+          workspaceId,
+          command.subscriptionId,
+          command.expectedRevision,
+        ),
+      setGuard,
+      clearGuard,
+      snapshotSubscription(db, command.subscriptionId),
+    ],
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      subscriptionId: command.subscriptionId,
+      revision: command.expectedRevision + 1,
+    },
+    [subscriptionChange(workspaceId, command.subscriptionId, command.expectedRevision + 1)],
+  );
+  return explainFailure(run, async () => {
+    const row = await loadSubscription(db, workspaceId, command.subscriptionId);
+    return row.revision === command.expectedRevision
+      ? null
+      : new HttpError(
+          "REVISION_CONFLICT",
+          `subscription revision is ${row.revision}; refetch and retry`,
+          false,
+          "stale_revision",
+        );
+  });
+};
+
+/** Stops new Deliveries. Pausing a paused Subscription changes nothing. */
+const subscriptionPause: Handler<v.InferOutput<typeof SubscriptionPause>> = async (
+  db,
+  user,
+  env,
+) => {
+  const { workspaceId, command } = env;
+  await loadSubscription(db, workspaceId, command.subscriptionId);
+  return receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE subscriptions SET enabled = 0, revision = revision + 1, updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND enabled = 1`,
+        )
+        .bind(new Date().toISOString(), workspaceId, command.subscriptionId),
+      snapshotSubscription(db, command.subscriptionId),
+    ],
+    { operationId: env.operationId, status: "accepted", subscriptionId: command.subscriptionId },
+    [subscriptionChange(workspaceId, command.subscriptionId)],
+  );
+};
+
+/** Revisions stay as history; pending Inbox items and Jobs are kept (§6.4). */
+const subscriptionDelete: Handler<v.InferOutput<typeof SubscriptionDelete>> = async (
+  db,
+  user,
+  env,
+) => {
+  const { workspaceId, command } = env;
+  await loadSubscription(db, workspaceId, command.subscriptionId);
+  return receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare("DELETE FROM subscriptions WHERE workspace_id = ? AND id = ?")
+        .bind(workspaceId, command.subscriptionId),
+    ],
+    { operationId: env.operationId, status: "accepted", subscriptionId: command.subscriptionId },
+    [{ ...subscriptionChange(workspaceId, command.subscriptionId), op: "delete" }],
+  );
+};
+
+/**
+ * Dry-run (AT-06 style): evaluates the Subscription, whatever its enabled state, over the Workspace's last `limit`
+ * events and creates nothing, not even a receipt. Every Workspace member may read every event today.
+ */
+const subscriptionTest: Handler<v.InferOutput<typeof SubscriptionTest>> = async (
+  db,
+  _user,
+  env,
+) => {
+  const { workspaceId, command } = env;
+  const sub = await loadSubscription(db, workspaceId, command.subscriptionId);
+  const { results } = await db
+    .prepare(
+      `SELECT ${eventColumns} FROM events WHERE workspace_id = ?
+        ORDER BY received_at DESC, id DESC LIMIT ?`,
+    )
+    .bind(workspaceId, command.limit)
+    .all<EventRow>();
+  const matched = results
+    .filter((event) => subscriptionMatches(sub, event))
+    .map((e) => ({ eventId: e.id, type: e.type, receivedAt: e.received_at }));
+  return {
+    status: 200,
+    response: {
+      operationId: env.operationId,
+      subscriptionId: sub.id,
+      revision: sub.revision,
+      evaluated: results.length,
+      matched,
+    },
+  };
+};
+
+/** The hook URL path for the integration-worker. Secrets are environment-level (no per-installation secret yet). */
+const integrationCreate: Handler<v.InferOutput<typeof IntegrationCreate>> = async (
+  db,
+  user,
+  env,
+) => {
+  const { workspaceId, command } = env;
+  const integrationId = crypto.randomUUID();
+  return receipt(
+    db,
+    user,
+    env,
+    [
+      db
+        .prepare(
+          "INSERT INTO integration_installations (id, workspace_id, kind, external_account_id) VALUES (?, ?, ?, ?)",
+        )
+        .bind(integrationId, workspaceId, command.kind, command.externalAccountId ?? null),
+    ],
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      integrationId,
+      kind: command.kind,
+      hookPath: `/hooks/${command.kind}/${integrationId}`,
+    },
+    [{ entityKind: "integration", entityId: integrationId, scope: `workspace:${workspaceId}` }],
+  );
+};
+
 const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>> } = {
   "workspace.create": workspaceCreate,
   "device.register": deviceRegister,
@@ -923,6 +1230,12 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "task.complete": taskComplete,
   "task.cancel": taskCancel,
   "job.start": jobStart,
+  "subscription.create": subscriptionCreate,
+  "subscription.update": subscriptionUpdate,
+  "subscription.pause": subscriptionPause,
+  "subscription.delete": subscriptionDelete,
+  "subscription.test": subscriptionTest,
+  "integration.create": integrationCreate,
 };
 
 export const runCommand = (db: D1Database, principal: Principal, envelope: Envelope) => {
