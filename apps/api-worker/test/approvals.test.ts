@@ -109,6 +109,7 @@ describe("device environments", () => {
       placementPolicy: { environmentId: "backend" },
       toolPolicy: { tools: { Read: "allow" }, cwdMode: "environment" },
     });
+    await s.ok({ type: "channel.member.add", channelId: s.channelId, botId, role: "member" });
     const { jobId } = await queuedJob(s, botId as string);
     const listed = async () =>
       (

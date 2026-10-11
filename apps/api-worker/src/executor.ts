@@ -42,7 +42,6 @@ import {
   chainJobs,
   deliveryStatements,
   groupRecipients,
-  joinChannel,
   maxCorrelatedJobs,
   maxHops,
 } from "./commands.ts";
@@ -202,6 +201,24 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
     .bind(workspaceId, command.jobId)
     .first<JobRow>();
   if (!row) throw new HttpError("NOT_FOUND", "job not found");
+  const channelAccess = await db
+    .prepare(
+      `SELECT c.kind, m.role FROM jobs j
+         LEFT JOIN inbox_items i ON i.workspace_id = j.workspace_id AND j.trigger_key = 'inbox:' || i.id
+         LEFT JOIN conversations c ON c.workspace_id = i.workspace_id AND c.id = i.conversation_id
+         JOIN bots b ON b.workspace_id = j.workspace_id AND b.id = j.bot_id
+         LEFT JOIN channel_members m ON m.workspace_id = b.workspace_id AND m.channel_id = c.channel_id
+                                    AND m.actor_id = b.actor_id
+        WHERE j.workspace_id = ? AND j.id = ?`,
+    )
+    .bind(workspaceId, command.jobId)
+    .first<{ kind: string | null; role: string | null }>();
+  if (
+    (channelAccess?.kind === "channel" || channelAccess?.kind === "thread") &&
+    (channelAccess.role === null || channelAccess.role === "viewer")
+  ) {
+    throw new HttpError("FORBIDDEN", "viewer bots cannot claim channel jobs");
+  }
   const job = toQueuedJob(row);
   // Re-validated here (§9.2 step 3) so a stale list cannot bypass the offer rule. Only a claimable Job: a replay of
   // a claim that went through must reach its receipt even though the device now holds that Run.
@@ -558,9 +575,6 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
               }),
             ),
           ),
-          ...(fanOut?.joining.length
-            ? [joinChannel(db, workspaceId, item.channel_id!, fanOut.joining)]
-            : []),
         ]
       : [];
   // Pass (ROUTE-02): nothing is posted; the Run keeps `outcome = pass` and the observation is an Event.
@@ -748,7 +762,7 @@ export const getRunContext = async (
   const workspaceId = device.workspaceIds[0]!;
   const row = await db
     .prepare(
-      `SELECT b.id AS bot_id, b.actor_id, b.name, b.instructions, b.tool_policy, j.placement, t.id AS task_id, t.key, t.title, t.description,
+      `SELECT b.id AS bot_id, b.actor_id, b.name, b.instructions, b.tool_policy, b.skills, j.placement, t.id AS task_id, t.key, t.title, t.description,
               j.inbox_batch_id, i.id AS item_id, c.id AS conversation_id, c.channel_id, c.kind AS conversation_kind,
               m.id AS message_id, m.kind AS message_kind, fb.id AS from_bot_id, fb.name AS from_bot_name,
               COALESCE(m.body, CASE e.source_kind WHEN 'routine' THEN json_extract(e.data, '$.inputText') END,
@@ -776,6 +790,7 @@ export const getRunContext = async (
       name: string;
       instructions: string;
       tool_policy: string;
+      skills: string;
       placement: string;
       task_id: string | null;
       key: string | null;
@@ -824,6 +839,22 @@ export const getRunContext = async (
     row.conversation_id = results[0]?.conversation_id ?? null;
     row.channel_id = results[0]?.channel_id ?? null;
     row.conversation_kind = results[0]?.kind ?? null;
+  }
+  if (
+    row.channel_id &&
+    (row.conversation_kind === "channel" || row.conversation_kind === "thread")
+  ) {
+    const membership = await db
+      .prepare(
+        `SELECT m.role FROM bots b LEFT JOIN channel_members m
+           ON m.workspace_id = b.workspace_id AND m.channel_id = ? AND m.actor_id = b.actor_id
+         WHERE b.workspace_id = ? AND b.id = ?`,
+      )
+      .bind(row.channel_id, workspaceId, row.bot_id)
+      .first<{ role: string | null }>();
+    if (!membership || membership.role === null || membership.role === "viewer") {
+      throw new HttpError("FORBIDDEN", "viewer bots cannot run channel jobs");
+    }
   }
   let conversation: RunContext["conversation"] = null;
   let parentMessages: RunContext["parentMessages"] = [];
@@ -1045,6 +1076,7 @@ export const getRunContext = async (
       name: row.name,
       instructions: row.instructions,
       toolPolicy: JSON.parse(row.tool_policy) as ToolPolicy,
+      skills: JSON.parse(row.skills) as NonNullable<RunContext["bot"]["skills"]>,
     },
     environment: (JSON.parse(row.placement) as PlacementPolicy).environmentId ?? null,
     task:

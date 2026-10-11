@@ -91,7 +91,15 @@ describe("group chat routing", () => {
 
     const everyone = await s.post("<@everyone> say your name");
     expect(everyone.inboxItemIds).toHaveLength(2);
-    // A non-member mention joins and narrows to it alone.
+    // A non-member mention stays silent until an owner explicitly adds the Bot.
+    const unjoined = await s.post(`<@bot:${s.lurkerId}> hi`);
+    expect(unjoined.inboxItemIds).toEqual([]);
+    await s.ok({
+      type: "channel.member.add",
+      channelId: s.channelId,
+      botId: s.lurkerId,
+      role: "member",
+    });
     const lurker = await s.post(`<@bot:${s.lurkerId}> hi`);
     expect(lurker.inboxItemIds).toHaveLength(1);
     expect(

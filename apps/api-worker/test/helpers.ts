@@ -84,9 +84,12 @@ export const setup = async () => {
     expect(res.status).toBe(200);
     return res.json<Json>();
   };
-  const { deviceId, deviceToken } = await ok(register);
+  const { deviceId, deviceToken } = await (
+    await user.command(envelope(workspaceId, register))
+  ).json<{ deviceId: string; deviceToken: string }>();
   const { channelId } = await ok({ type: "channel.create", name: "dev" });
   const { botId } = await ok({ type: "bot.create", name: "coder" });
+  await ok({ type: "channel.member.add", channelId, botId, role: "member" });
   const pump = async () => {
     const res = await call("/v1/executor/pump", { Authorization: `Bearer ${deviceToken}` }, {});
     expect(res.status).toBe(200);
@@ -133,14 +136,27 @@ export const executor = (token: string, workspaceId: string) => {
 };
 
 export type Claimed = { runId: string; executionGeneration: number; leaseExpiresAt: string };
+type QueuedJobFixture = {
+  user: {
+    command: (body: unknown) => Promise<Response>;
+    get: (path: string) => Promise<Response>;
+  };
+  pump: () => Promise<{ processed: number; dead: number; approvalsExpired: number }>;
+  send: (delivery?: string, idempotencyKey?: string) => { operationId: string; command: unknown };
+};
 
 /** agent.send → pump → a queued Job for `botId` (default: the setup Bot). */
-export const queuedJob = async (s: Awaited<ReturnType<typeof setup>>, botId = s.botId) => {
+export const queuedJob = async (s: QueuedJobFixture & { botId: string }, botId = s.botId) => {
   const sent = s.send();
   (sent.command as Json).recipientBotId = botId;
-  const { inboxItemId } = await (await s.user.command(sent)).json<{ inboxItemId: string }>();
+  const response = await s.user.command(sent);
+  expect(response.status).toBe(200);
+  const { inboxItemId } = await response.json<{ inboxItemId: string }>();
   await s.pump();
-  const op = await (await s.user.get(`/v1/operations/${sent.operationId}`)).json<Json>();
+  const operation = await s.user.get(`/v1/operations/${sent.operationId}`);
+  expect(operation.status).toBe(200);
+  const op = await operation.json<Json>();
+  expect(typeof op.jobId).toBe("string");
   return { jobId: op.jobId as string, inboxItemId };
 };
 

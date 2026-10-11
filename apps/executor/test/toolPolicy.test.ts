@@ -98,6 +98,57 @@ describe("PreToolUse hook", () => {
   });
 });
 
+describe("native Skill permissions", () => {
+  it("allows configured skills only, without widening the parent tool policy", async () => {
+    const skillNames = new Set(["skill-release-notes"]);
+    const hook = preToolUse(policy, [root], hive, skillNames);
+    const gate = approvalGate({
+      policy,
+      run: null,
+      cwdLabel: "run_scratch",
+      hiveTools: hive,
+      skillNames,
+    });
+    const input = { skill: "skill-release-notes" };
+    expect(await gate("Skill", input, gateOptions())).toEqual({
+      behavior: "allow",
+      updatedInput: input,
+    });
+    expect(await gate("Skill", { skill: "unconfigured" }, gateOptions())).toMatchObject({
+      behavior: "deny",
+    });
+    expect(
+      await hook(
+        {
+          hook_event_name: "PreToolUse",
+          tool_name: "Skill",
+          tool_input: { skill: "unconfigured" },
+          tool_use_id: "t",
+        } as HookInput,
+        "t",
+        { signal: new AbortController().signal },
+      ),
+    ).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(
+      await hook(
+        {
+          hook_event_name: "PreToolUse",
+          tool_name: "Skill",
+          tool_input: null,
+          tool_use_id: "t",
+        } as HookInput,
+        "t",
+        { signal: new AbortController().signal },
+      ),
+    ).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(await gate("Write", { file_path: "a" }, gateOptions())).toMatchObject({
+      behavior: "deny",
+    });
+    const noSkills = approvalGate({ policy, run: null, cwdLabel: "run_scratch", hiveTools: hive });
+    expect(await noSkills("Skill", input, gateOptions())).toMatchObject({ behavior: "deny" });
+  });
+});
+
 describe("approvalGate (canUseTool)", () => {
   const input = { command: "ls -la", description: "list" };
 

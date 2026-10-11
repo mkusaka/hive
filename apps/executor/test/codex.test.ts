@@ -230,4 +230,51 @@ describe("codexAdapter", () => {
       replyText: "Not for me.",
     });
   });
+
+  it("lists and loads configured skills through a model-visible dynamic tool", async () => {
+    const { api } = fakeRunApi();
+    const skills = [
+      {
+        name: "release-notes",
+        description: "Prepare concise release notes.",
+        instructions: "Group changes by user impact.",
+      },
+    ];
+    const { dir, agent } = await start("skill", {
+      run: api,
+      context: { ...context, bot: { ...context.bot, skills } },
+    });
+    const exit = await agent.waitForExit();
+    expect(exit.replyText).toContain("Group changes by user impact.");
+    const threadStart = (await transcriptOf(dir)).find(
+      (line) => line.msg?.method === "thread/start",
+    )!.msg!.params;
+    expect(threadStart.developerInstructions).toContain(
+      "Skills:\n- release-notes: Prepare concise release notes.",
+    );
+    expect(threadStart.dynamicTools.map((tool: { name: string }) => tool.name)).toContain(
+      "hive_skill_use",
+    );
+  });
+
+  it("returns an unknown skill as a model-visible tool error", async () => {
+    const { api } = fakeRunApi();
+    const { agent } = await start("skill-unknown", {
+      run: api,
+      context: {
+        ...context,
+        bot: {
+          ...context.bot,
+          skills: [
+            {
+              name: "release-notes",
+              description: "Prepare concise release notes.",
+              instructions: "Group changes by user impact.",
+            },
+          ],
+        },
+      },
+    });
+    expect((await agent.waitForExit()).replyText).toContain("hive error: unknown skill missing");
+  });
 });

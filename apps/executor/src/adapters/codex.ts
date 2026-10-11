@@ -438,7 +438,7 @@ export const codexAdapter = ({
           cwd,
           approvalPolicy: "untrusted",
           sandbox: "read-only",
-          developerInstructions: systemPrompt(ctx.context),
+          developerInstructions: systemPrompt(ctx.context, true),
           config: isolation(Object.keys(config.mcp_servers ?? {})),
           ...(tools.length
             ? {

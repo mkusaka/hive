@@ -2,9 +2,13 @@
 import type {
   AgentSend,
   ApprovalResolve,
+  BotUpdate,
+  ChannelMemberAdd,
+  ChannelMemberRemove,
+  ChannelMemberUpdate,
+  ChannelUpdate,
   ChannelJoin,
   ChannelLeave,
-  ChannelUpdate,
   commandEnvelope,
   DmOpen,
   JobCancel,
@@ -17,8 +21,8 @@ import type {
   RoutineRun,
   RoutineRotateSecret,
   RoutineUpdate,
-  SidebarUpdate,
   RunLinkTask,
+  SidebarUpdate,
   WorkspaceCreate,
 } from "@hive/contracts";
 import type * as v from "valibot";
@@ -28,7 +32,7 @@ export type ApiResult =
   | { ok: true; value: Record<string, unknown> }
   | { ok: false; error: { code: string; message: string; body?: unknown } };
 
-/** The commands the UI sends today: messaging, Job cancellation, approval, memory, Channel, DM, routine, sidebar, external Run task linking and workspace creation (Welcome). */
+/** The commands the UI sends today. */
 export type UiCommand = v.InferInput<
   ReturnType<
     typeof commandEnvelope<
@@ -43,7 +47,11 @@ export type UiCommand = v.InferInput<
           typeof ChannelUpdate,
           typeof ChannelJoin,
           typeof ChannelLeave,
+          typeof ChannelMemberAdd,
+          typeof ChannelMemberUpdate,
+          typeof ChannelMemberRemove,
           typeof DmOpen,
+          typeof BotUpdate,
           typeof RoutineCreate,
           typeof RoutineUpdate,
           typeof RoutineDelete,

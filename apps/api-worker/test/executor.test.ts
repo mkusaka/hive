@@ -83,6 +83,7 @@ describe("executor job.claim", () => {
         preferredDeviceIds: [other.deviceId],
       },
     });
+    await s.ok({ type: "channel.member.add", channelId: s.channelId, botId, role: "member" });
     const { jobId } = await queuedJob(s, botId as string);
     const device = executor(s.deviceToken, s.workspaceId);
 
@@ -209,6 +210,7 @@ describe("executor lease and result", () => {
       name: "greeter",
       instructions: "Reply in one short sentence.",
     });
+    await s.ok({ type: "channel.member.add", channelId: s.channelId, botId, role: "member" });
     const job = await queuedJob(s, botId as string);
     const device = executor(s.deviceToken, s.workspaceId);
     const run = await (await device.command(claim(job.jobId))).json<Claimed>();

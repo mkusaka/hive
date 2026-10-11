@@ -58,6 +58,7 @@ export const App = () => {
   // The open Thread panel's replies, oldest first.
   const [replies, setReplies] = useState<Row[]>([]);
   const [bots, setBots] = useState<Row[]>([]);
+  const [canManageBots, setCanManageBots] = useState(false);
   const [inbox, setInbox] = useState<Row[]>([]);
   const [externalRuns, setExternalRuns] = useState<Row[]>([]);
   const [sessionKind, setSessionKind] = useState<"jobs" | "external">("jobs");
@@ -155,7 +156,13 @@ export const App = () => {
     };
     load("channels", inWorkspace("channels", ws), "channels", setChannels);
     load("dms", inWorkspace("dms", ws), "dms", setDms);
-    load("bots", inWorkspace("bots", ws), "bots", setBots);
+    if (keys.has("bots"))
+      tasks.push(
+        get(inWorkspace("bots", ws)).then((body) => {
+          setBots(body.bots as Row[]);
+          setCanManageBots(Boolean(body.canManage));
+        }),
+      );
     load("devices", inWorkspace("devices", ws), "devices", setDevices);
     load("jobs", inWorkspace("jobs", ws, { limit: "50" }), "jobs", setJobs);
     // Who is reading / working in the open Channel follows its Bots' Jobs (ROUTE-02).
@@ -697,6 +704,8 @@ export const App = () => {
           bots={bots}
           channels={channels}
           devices={devices}
+          canManage={canManageBots}
+          refreshBots={() => void refetch(new Set(["bots"]), ws)}
           refreshDevices={refreshDevices}
           close={() => setPanel(null)}
         />

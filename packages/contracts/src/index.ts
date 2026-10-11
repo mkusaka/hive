@@ -99,18 +99,57 @@ export const ChannelUpdate = v.strictObject({
   channelId: ChannelId,
   topic: v.pipe(v.string(), v.maxLength(250)),
 });
-/** Adds a Bot to the Channel (members only). Membership never routes: a member Bot wakes only when mentioned. */
+/** Adds a Bot as a member; Channel / Workspace owners only. */
 export const ChannelJoin = v.strictObject({
   type: v.literal("channel.join"),
   channelId: ChannelId,
   botId: BotId,
 });
-/** Removes a Bot from the Channel (members only). */
+/** Removes a Bot's membership; Channel / Workspace owners only. */
 export const ChannelLeave = v.strictObject({
   type: v.literal("channel.leave"),
   channelId: ChannelId,
   botId: BotId,
 });
+export const ChannelRole = v.picklist(["owner", "member", "viewer"]);
+export type ChannelRole = v.InferOutput<typeof ChannelRole>;
+const ChannelMemberFields = {
+  channelId: ChannelId,
+  userId: v.optional(UserId),
+  botId: v.optional(BotId),
+};
+/** Adds one user or Bot to a Channel. Only Channel / Workspace owners may manage membership. */
+export const ChannelMemberAdd = v.pipe(
+  v.strictObject({
+    type: v.literal("channel.member.add"),
+    ...ChannelMemberFields,
+    role: ChannelRole,
+  }),
+  v.check(
+    (input) => (input.userId === undefined) !== (input.botId === undefined),
+    "provide exactly one userId or botId",
+  ),
+);
+/** Changes one member's role. The last owner cannot be demoted. */
+export const ChannelMemberUpdate = v.pipe(
+  v.strictObject({
+    type: v.literal("channel.member.update"),
+    ...ChannelMemberFields,
+    role: ChannelRole,
+  }),
+  v.check(
+    (input) => (input.userId === undefined) !== (input.botId === undefined),
+    "provide exactly one userId or botId",
+  ),
+);
+/** Removes one member. The last owner cannot be removed. */
+export const ChannelMemberRemove = v.pipe(
+  v.strictObject({ type: v.literal("channel.member.remove"), ...ChannelMemberFields }),
+  v.check(
+    (input) => (input.userId === undefined) !== (input.botId === undefined),
+    "provide exactly one userId or botId",
+  ),
+);
 /** The caller's direct messages with the Bot: the existing conversation, or a new one. */
 export const DmOpen = v.strictObject({ type: v.literal("dm.open"), botId: BotId });
 
@@ -158,15 +197,37 @@ export type ToolName = v.InferOutput<typeof ToolName>;
 export const effectKinds = ["slack.post", "github.comment"] as const;
 export type EffectKind = (typeof effectKinds)[number];
 
+export const ToolPolicyManage = v.strictObject({
+  subscriptions: v.optional(v.boolean()),
+  routines: v.optional(v.boolean()),
+  channels: v.optional(v.boolean()),
+  bots: v.optional(v.boolean()),
+});
+export type ToolPolicyManage = v.InferOutput<typeof ToolPolicyManage>;
+
 export const ToolPolicy = v.strictObject({
   tools: v.optional(v.record(ToolName, v.picklist(["allow", "ask", "deny"])), {}),
   cwdMode: v.optional(v.picklist(["run_scratch", "environment"]), "run_scratch"),
   /** Per effect kind; a kind not listed is `deny`. Absent on Bots created before EFFECT-01. */
   effects: v.optional(v.record(v.picklist(effectKinds), v.picklist(["allow", "ask", "deny"]))),
+  /** Bot self-service permissions. Every absent flag is false. */
+  manage: v.optional(ToolPolicyManage),
 });
 export type ToolPolicy = v.InferOutput<typeof ToolPolicy>;
 
 const Instructions = v.pipe(v.string(), v.maxLength(64 * 1024));
+const SkillInstructions = v.pipe(
+  v.string(),
+  v.check((text) => utf8Bytes(text) <= 8192, "instructions must be at most 8 KiB"),
+);
+export const BotSkill = v.strictObject({
+  name: Name,
+  description: v.pipe(v.string(), v.maxLength(8192)),
+  instructions: SkillInstructions,
+  tools: v.optional(ToolPolicy),
+});
+export type BotSkill = v.InferOutput<typeof BotSkill>;
+export const BotSkills = v.pipe(v.array(BotSkill), v.maxLength(20));
 const Revision = v.pipe(v.number(), v.integer(), v.minValue(1));
 
 export const BotCreate = v.strictObject({
@@ -176,6 +237,7 @@ export const BotCreate = v.strictObject({
   /** The Bot's system prompt for its runs. */
   instructions: v.optional(Instructions, ""),
   toolPolicy: v.optional(ToolPolicy, {}),
+  skills: v.optional(BotSkills, []),
 });
 
 /** Replaces the given fields; `expectedRevision` is the Bot's `config_revision`. Running Runs keep what they read. */
@@ -186,6 +248,7 @@ export const BotUpdate = v.strictObject({
   instructions: v.optional(Instructions),
   toolPolicy: v.optional(ToolPolicy),
   placementPolicy: v.optional(PlacementPolicy),
+  skills: v.optional(BotSkills),
 });
 
 /**
@@ -732,6 +795,7 @@ export const ExternalRunInput = v.strictObject({
 export type ExternalRunInput = v.InferOutput<typeof ExternalRunInput>;
 
 export const ExecutorCommand = v.variant("type", [JobClaim, RunLeaseRenew, RunResultSubmit]);
+export type ExecutorCommand = v.InferInput<typeof ExecutorCommand>;
 
 // ------------------------------------------------- Approvals (docs/architecture.md §19)
 
@@ -961,9 +1025,18 @@ export const RunCommand = v.variant("type", [
   TaskDelegate,
   MemoryWrite,
   EffectPrepare,
+  SubscriptionCreate,
+  SubscriptionUpdate,
+  SubscriptionDelete,
+  RoutineCreate,
+  RoutineUpdate,
+  RoutinePause,
+  RoutineResume,
+  RoutineDelete,
+  ChannelCreate,
+  BotCreate,
 ]);
 export type RunCommand = v.InferInput<typeof RunCommand>;
-export type ExecutorCommand = v.InferInput<typeof ExecutorCommand>;
 
 export type JobClaimed = {
   runId: string;
@@ -1007,8 +1080,14 @@ export type GroupMessage = Speaker & {
 /** `GET /v1/executor/runs/:id`: the device's own Run, for reconcile after a restart. */
 /** `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=`: what the adapter builds its prompt from. */
 export type RunContext = {
-  bot: { id: string; name: string; instructions: string; toolPolicy: ToolPolicy };
-  /** The Job's placement `environmentId` (an environment name), or null. */
+  bot: {
+    id: string;
+    name: string;
+    instructions: string;
+    toolPolicy: ToolPolicy;
+    /** Always an array from the Worker; optional for stored contexts created before PERM-01. */
+    skills?: BotSkill[];
+  };
   environment: string | null;
   task: { id: string; key: string; title: string; description: string } | null;
   conversation: {

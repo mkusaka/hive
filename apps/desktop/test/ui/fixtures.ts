@@ -39,7 +39,15 @@ export const bots = [
     name: "coder",
     instructions: "Write small diffs.",
     placementPolicy: {},
-    toolPolicy: { bash: "ask" },
+    toolPolicy: { bash: "ask", manage: { routines: true } },
+    skills: [
+      {
+        name: "release-notes",
+        description: "Draft release notes.",
+        instructions: "Summarize changes.",
+      },
+    ],
+    configRevision: 1,
     revision: 1,
   },
   {
@@ -49,6 +57,8 @@ export const bots = [
     instructions: null,
     placementPolicy: {},
     toolPolicy: {},
+    skills: [],
+    configRevision: 1,
     revision: 1,
   },
 ];
@@ -119,7 +129,13 @@ export const routes = (): Routes => ({
   "/v1/me": { userId: me, label: "you@example.test" },
   "/v1/channels": { channels },
   "/v1/dms": { dms: [] },
-  "/v1/bots": { bots },
+  "/v1/bots": { bots, canManage: true },
+  "/v1/users": {
+    users: [
+      { id: "user-1", label: "Mina" },
+      { id: "user-2", label: "Ari" },
+    ],
+  },
   "/v1/sidebar": {
     workspaceName: "acme",
     prefs: { pinned: [], hidden: [], groups: [] },
@@ -178,6 +194,7 @@ export const routes = (): Routes => ({
   "/v1/channels/ch-1/presence": { presence: [{ botId: "bot-1", name: "coder", state: "idle" }] },
   "/v1/channels/ch-2/presence": { presence: [] },
   "/v1/channels/ch-1/members": {
+    canManage: true,
     members: [
       {
         actorId: "actor-user-1",

@@ -33,11 +33,11 @@ import { createPerformers, getRunEffect, listEffects } from "./effects.ts";
 import { pump } from "./pump.ts";
 import {
   getJob,
+  getTask,
   getOperation,
   getRunApproval,
   getSidebar,
   getStatus,
-  getTask,
   listAudit,
   listBotConversations,
   listBots,
@@ -56,6 +56,7 @@ import {
   listSubscriptions,
   listThreads,
   listTasks,
+  listUsers,
 } from "./queries.ts";
 import {
   type Attachment,
@@ -464,6 +465,7 @@ export const createApp = ({
       }),
     ),
   );
+  app.get("/v1/users", async (c) => c.json(await listUsers(c.env.DB, workspaceParam(c))));
   app.get("/v1/channels/:id/members", async (c) =>
     c.json(
       await listChannelMembers(c.env.DB, {
@@ -505,7 +507,9 @@ export const createApp = ({
   app.get("/v1/sidebar", async (c) =>
     c.json(await getSidebar(c.env.DB, workspaceParam(c), user(c).userId)),
   );
-  app.get("/v1/bots", async (c) => c.json(await listBots(c.env.DB, workspaceParam(c))));
+  app.get("/v1/bots", async (c) =>
+    c.json(await listBots(c.env.DB, workspaceParam(c), user(c).userId)),
+  );
   app.get("/v1/bot-conversations", async (c) =>
     c.json(await listBotConversations(c.env.DB, workspaceParam(c))),
   );

@@ -2,6 +2,7 @@ import * as v from "valibot";
 import { describe, expect, it } from "vitest";
 import {
   BotCreate,
+  BotSkills,
   EventEmit,
   eventEnvelope,
   parse,
@@ -64,8 +65,29 @@ describe("command schemas", () => {
           recovery: "manual",
         },
         toolPolicy: { tools: {}, cwdMode: "run_scratch" },
+        skills: [],
       },
     });
+  });
+
+  it("caps Bot Skills by count and UTF-8 instruction bytes", () => {
+    const skill = { name: "release", description: "notes", instructions: "x".repeat(8192) };
+    expect(
+      parse(
+        BotSkills,
+        Array.from({ length: 20 }, (_, index) => ({ ...skill, name: `skill-${index}` })),
+      ).ok,
+    ).toBe(true);
+    expect(
+      parse(
+        BotSkills,
+        Array.from({ length: 21 }, (_, index) => ({ ...skill, name: `skill-${index}` })),
+      ).ok,
+    ).toBe(false);
+    expect(parse(BotSkills, [{ ...skill, instructions: `${"あ".repeat(2730)}ab` }]).ok).toBe(true);
+    expect(parse(BotSkills, [{ ...skill, instructions: `${"あ".repeat(2730)}abc` }]).ok).toBe(
+      false,
+    );
   });
 
   it("rejects preferred devices outside the allowed list and a pinned placement without one device", () => {

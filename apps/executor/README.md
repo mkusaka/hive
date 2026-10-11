@@ -57,23 +57,29 @@ redacted again by the Worker. `--dry-run` makes no network calls or local writes
 
 ## Claude provider
 
-- **Prompt.** `systemPrompt` = "You are <bot name>, a bot in a hive workspace." plus the Bot's `instructions`. The
-  user message = the Task (if any), the Conversation's recent messages (oldest first), a "Memory" section (the
-  context's memories with their scope) and a "Related" section (search hits with source kind and snippet), then the
-  trigger item's body. Plain text.
-- **Tools.** The Bot's tool policy (below) decides the native tools; `settingSources: []` (no user / project
-  settings, hooks or CLAUDE.md), `strictMcpConfig`, `maxTurns: 4`. With a Run capability, `mcpServers: {hive}` is an
-  in-process SDK MCP server (`src/tools.ts`) whose tools are in `allowedTools`; without one (a Run resumed after a
-  restart: the token is returned once and not journaled) there are no hive tools and no approvals.
+- **Prompt and skills.** `systemPrompt` = "You are <bot name>, a bot in a hive workspace." plus the Bot's
+  `instructions`. A configured Bot Skill is materialized under the Run's private `claude-config/.claude/skills/`
+  directory, then enabled through the Agent SDK's native `Options.skills`, using the generated directory names
+  (`skill-<encoded Bot Skill name>`); only generated project settings load for that Run. The native `Skill` tool is
+  enabled only for configured skills; both permission gates reject other skill names. Skill metadata never adds
+  execution tools: the parent Bot's policy and its `PreToolUse` hook remain the capability ceiling. The user
+  message = the Task (if any), the Conversation's recent messages (oldest first), a
+  "Memory" section (the context's memories with their scope) and a "Related" section (search hits with source kind
+  and snippet), then the trigger item's body. Plain text.
+- **Tools.** The Bot's tool policy (below) decides the native tools; `strictMcpConfig`, `maxTurns: 4`. With a Run
+  capability, `mcpServers: {hive}` is an in-process SDK MCP server (`src/tools.ts`) whose tools are in
+  `allowedTools`; without one (a Run resumed after a restart: the token is returned once and not journaled) there
+  are no hive tools and no approvals.
 - **Hive tools.** `hive_send_request {botId | botName, text}`, `hive_notify {botId | botName, text}`,
   `hive_wait_for_reply {requestMessageId}`, `hive_reply {text}` (only when the trigger item is a request from another
   Bot), `hive_pass {}` (only in a Channel, thread or DM; no cloud call, ROUTE-02), `hive_task_get {taskId}` and `hive_task_update {status?: "completed", assignee?}` (only for a Task Job),
   `hive_memory_write {content, scope: bot | task | channel}` (the scope id is the context's Bot, Task or
-  Conversation channel; `task` / `channel` only when the context has one) and `hive_memory_search {q}`
-  (`GET /v1/run/search`, the Run's scopes only). They
-  call `/v1/run/*` with the capability (`cloud.forRun`); the token never enters a prompt. Inputs are Zod shapes,
-  which the SDK turns into the model's JSON Schema and validates before a handler runs. A cloud error comes back
-  as tool text with `isError`, never as an exception in the SDK loop.
+  Conversation channel) and `hive_memory_search {q}` (`GET /v1/run/search`, the Run's scopes only). Management
+  tools are exposed only for their matching `toolPolicy.manage` flag:
+  `hive_subscription_{create,update,delete}`, `hive_routine_{create,update,pause,resume,delete}`,
+  `hive_channel_create`, and `hive_bot_create`. They call `/v1/run/*` with the capability (`cloud.forRun`); the
+  token never enters a prompt. Inputs are Zod shapes, which the SDK turns into the model's JSON Schema and validates
+  before a handler runs. A cloud error comes back as tool text with `isError`, never as an exception in the SDK loop.
 - **Waiting.** When the tool result of `hive_wait_for_reply` appears in the stream, the adapter aborts the query
   (no further model turn is spent) and exits with `waitingFor`; the runner submits `state: "waiting"` and the Job
   waits in the cloud without holding the executor. The successor Run's prompt holds the original request and
@@ -136,10 +142,12 @@ developerInstructions: <system prompt>, config, dynamicTools}`. `config` switche
   from the `fileChange` item of `item/started`; a path outside the cwd is declined without asking). `allow` →
   `accept`, `ask` → cloud approval → `accept` / `decline`, `deny` → `decline` without the cloud. An approved
   command runs outside the read-only sandbox (as the executor's OS user).
-- **Hive tools.** The same tools as the Claude adapter (`src/tools.ts`), offered as experimental `dynamicTools`
+- **Hive tools and skills.** Claude-equivalent hive tools (`src/tools.ts`) are offered as experimental `dynamicTools`
   (JSON Schema from the Zod shapes) and answered in this process on `item/tool/call` (arguments validated with Zod
-  first), so the Run capability never reaches Codex. `hive_wait_for_reply` → `turn/interrupt` and a `waiting`
-  exit (`{dir: "local", event: "waiting"}` is journaled for a restart).
+  first), so the Run capability never reaches Codex. Skills are listed by name and description in the developer
+  prompt; `hive_skill_use {name}` returns the selected instructions and returns a tool error for an unknown name.
+  `hive_wait_for_reply` → `turn/interrupt` and a `waiting` exit (`{dir: "local", event:"waiting"}` is journaled for
+  a restart).
 - **Results.** `turn/completed` `completed` → exit 0, the last `final_answer` agent message (else the last agent
   message) as summary (≤ 8 KiB) and reply; `failed` / `interrupted` → exit 1 with the turn error. The process
   closing before the turn ends → exit 1 `codex app-server exited (code, signal)`; a missing binary → `spawn

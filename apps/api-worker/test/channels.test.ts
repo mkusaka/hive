@@ -92,9 +92,39 @@ describe("channels", () => {
       .bind(crypto.randomUUID(), s.workspaceId, conversationId, bot!.actor_id, crypto.randomUUID())
       .run();
     expect(await members()).toEqual([
-      expect.objectContaining({ kind: "user", role: "owner", botId: null }),
+      expect.objectContaining({ userId: expect.any(String), role: "owner", botId: null }),
+      expect.objectContaining({ botId: s.botId, role: "member" }),
     ]);
     const other = await outsider(s.workspaceId);
     expect((await other.get(path)).status).toBe(404);
+  });
+
+  it("keeps the last channel owner while allowing an owner to manage members", async () => {
+    const s = await setup();
+    const self = await (await s.user.me()).json<{ userId: string }>();
+    const lastOwner = await s.user.command(
+      envelope(s.workspaceId, {
+        type: "channel.member.update",
+        channelId: s.channelId,
+        userId: self.userId,
+        role: "member",
+      }),
+    );
+    expect(lastOwner.status).toBe(422);
+    const other = await outsider(s.workspaceId);
+    const otherMe = await (await other.me()).json<{ userId: string }>();
+    await s.ok({
+      type: "channel.member.add",
+      channelId: s.channelId,
+      userId: otherMe.userId,
+      role: "owner",
+    });
+    const demoted = await s.ok({
+      type: "channel.member.update",
+      channelId: s.channelId,
+      userId: self.userId,
+      role: "member",
+    });
+    expect(demoted.role).toBe("member");
   });
 });

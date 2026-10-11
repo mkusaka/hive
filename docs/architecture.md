@@ -165,6 +165,13 @@ another Workspace cannot be linked.
 Migrations are split per feature; tables are not all introduced at once. Schema comments classify each table as
 current state, immutable history, or rebuildable projection.
 
+Implemented as (PERM-01): `channel_members.role` is `owner | member | viewer`. All roles may read;
+viewers cannot post or mention, and viewer Bots never wake. `channel.member.add / update / remove`
+accept a user or Bot and require a Channel owner (Workspace owners may always manage membership).
+`channel.create` makes its creator an owner; atomic guards prevent removing or demoting the last owner.
+`GET /v1/channels/:id/members` includes roles and `canManage`; `GET /v1/users` supplies picker labels.
+Bot Skills are stored in `bots.skills` JSON, not separate Skill tables in this implementation.
+
 ### 3.2 Core fields (§6.2)
 
 ```ts
@@ -351,6 +358,10 @@ signature / auth / permission / schema checks
 - ACK only after durable acceptance. Never return 2xx and leave persistence to `ctx.waitUntil()`. D1 + Queues and
   D1 + R2 are never treated as one distributed transaction.
 
+Implemented as (PERM-01): delivery and execution recheck the target Bot's Channel role. Viewer or
+non-member Bots receive no Channel wake through mentions, direct sends, subscriptions or routines;
+claim and run-context reads also reject a Bot whose posting membership has been revoked.
+
 ### 6.2 Dedup keys (§9.2)
 
 | Stage                                 | Unique identity                                                         |
@@ -435,11 +446,11 @@ Bot; no mention = only posted (superseded for Channels by ROUTE-02 below). A tok
 The run context renders tokens as `@<bot name>` (`@unknown` for a missing Bot). `agent.send` stays for the CLI,
 bot-to-bot and integrations.
 
-Implemented as (DM-01): Slack's two conversation kinds. **Channels** have members, and Bots are real members:
-`channel.join` / `channel.leave {channelId, botId}` (callers must be members; `channel` change row), and a
-`message.post` mentioning a non-member Bot adds it in the same batch (one `INSERT … SELECT FROM json_each`, one
-`channel` change row). Membership routes since ROUTE-02 (below): a member Bot reads every post of the Channel's main
-conversation. **Direct messages**
+Implemented as (DM-01, updated by PERM-01): **Channels** have explicit user and Bot members managed through
+`channel.member.add / update / remove` and owner-managed `channel.join` / `channel.leave`. Mentioning a non-member
+Bot does not join it automatically; mentioning a viewer Bot posts the message without waking it. Membership routes
+since ROUTE-02 (below): every non-viewer member Bot reads unaddressed posts of the Channel's main conversation.
+**Direct messages**
 are `conversations.kind = 'dm'` with `dm_user_id` + `dm_bot_id` (migration 0021, partial UNIQUE on
 `(workspace_id, dm_user_id, dm_bot_id) WHERE kind = 'dm'`). Like a bot pair, a DM is backed by a member-less Channel
 row sharing its id `dm-<userId>-<botId>` (`channel_id` is NOT NULL and the table cannot be rebuilt on D1), so it is
@@ -472,11 +483,11 @@ Implemented as (ROUTE-02): a Channel's main conversation is a **group chat** wit
 keep their wake rules. One function (`groupRecipients`, api-worker `commands.ts`) decides who a post wakes, for a
 user's `message.post` and for a Run's reply alike:
 
-1. A post with no mention wakes **every member Bot** (`channel_members` with a Bot actor), one delivery each in the
-   `message.post` batch; a Channel without member Bots only posts. `<@bot:ID>` mentions narrow it to those Bots (a
-   non-member joins, as before), `<@everyone>` (composer `@everyone` / `@all`) is every member, and a Reply
+1. A post with no mention wakes **every non-viewer member Bot** (`channel_members` with a Bot actor), one delivery
+   each in the `message.post` batch; a Channel without eligible Bots only posts. `<@bot:ID>` mentions narrow it to
+   those non-viewer members, `<@everyone>` (composer `@everyone` / `@all`) is every non-viewer member, and a Reply
    (`message.post.replyToMessageId`, a message of the same conversation, stored as `reply_to_message_id`) on a Bot's
-   message addresses that Bot. A Reply on a human message is a plain post.
+   message addresses that Bot only while it remains a non-viewer member. A Reply on a human message is a plain post.
 2. The run context of a Channel Run adds `peers` (the other member Bots: id, name, first line of instructions ≤ 120
    chars) and `since`: up to 50 messages posted after this Bot's previous Run in the conversation, each with
    `speakerKind` (`human` | `bot`), `speakerName`, `isSelf` and a `replyTo` quote. The prompt gets a "Group
@@ -889,6 +900,10 @@ the current Task / Memory / conversation summary.
 - ContextSnapshot stores input message IDs, memory revision IDs, task scopeRevision, bot config revision, source
   ACL epoch, summary IDs used and token estimate. There is no mechanism to capture private model reasoning.
 
+Implemented as (PERM-01): the Bot configuration carries up to 20 Skills, each with a name, description,
+at most 8 KiB of UTF-8 instructions and an optional tool-policy subset. `bot.update` replaces the Skills
+with revision CAS. The Desktop Details editor and `hive bot skill add / remove` use this same command.
+
 ### 13.6 Memory and compaction (§16.6)
 
 - Memory scopes: Workspace / Channel / Project / Bot / Task. Bot-specific Memory inherits the read restrictions of
@@ -962,6 +977,10 @@ CREATE VIRTUAL TABLE search_fts USING fts5(
   PR/Issue number, head SHA, sender, source delivery ID.
 - This is not unconditional ingestion of a user's GitHub Notifications inbox; "notification-driven" means GitHub
   App webhook events.
+
+Implemented as (PERM-01): a Bot may create, update or delete its own Subscriptions, or those of Bots it
+created, only with `toolPolicy.manage.subscriptions`. This permission does not grant integration credentials
+or widen the existing Channel access rules. Commands use the Run capability and durable receipts.
 
 ### 15.2 Webhook intake (§18.2)
 
@@ -1104,8 +1123,15 @@ Implemented as (UI-03): the desktop presents Routines per Channel. The Channel p
 Conversation is the Channel's (`GET /v1/routines?conversationId=`), each with its assigned Bot, and creates new ones
 into that Conversation; the Bot panel lists a Bot's Routines across Channels. `routine.delete` removes the Routine and
 its occurrence history in one batch; Jobs it already created stay. The Channel panel also shows the Channel's topic
-(`channels.topic`, set by `channel.update`, members only) and its members; Bots join no Channel today, so the members
-list adds the actors that posted in it.
+(`channels.topic`, set by `channel.update`, non-viewer members only) and its explicit user and Bot members.
+PERM-01 adds role badges, owner-only role/removal menus and an Add member picker.
+
+Implemented as (PERM-01): `toolPolicy.manage` has `subscriptions`, `routines`, `channels` and `bots`
+flags, all false when absent. Workspace owners set them through Bot Details or `hive bot update --manage`.
+Run commands manage only the Run's Bot or its directly created Bots (`created_by_bot_id`); destination
+Channels require non-viewer membership. Bot-created Channels include the creator Bot and Workspace owners
+as owners. Child Bots inherit no wider native/effect policy, and their management flags are always false.
+Subscription and Routine edits retain revision checks and the existing receipt/change-log boundary.
 
 ### 17.3 Webhook / MCP (§20.3)
 
@@ -1197,6 +1223,12 @@ invalid delegations, expired approvals and stale-generation writes are rejected.
   `device.register`); registration runs the CLI's own `device register` and then the same service reconcile, and
   Sign out (account menu, confirmed in a dialog) runs `hive logout`. The renderer still never sees a token. See `apps/desktop/README.md`, Welcome / first
   run.
+
+Implemented as (PERM-01): Claude Agent SDK 0.3.289 supports main-session `Options.skills`. The executor
+writes isolated per-Run `.claude/skills/*/SKILL.md` files and enables those names using the SDK option.
+Codex receives a Skills discovery section and `hive_skill_use` to load instructions. Skill metadata
+never widens the parent tool policy. Management MCP tools are exposed only for the Bot's enabled
+`manage` flags and use `/v1/run/commands`; cloud permission failures are returned as model-visible tool errors.
 
 ### 20.2 Startup and crashes (§23.2)
 

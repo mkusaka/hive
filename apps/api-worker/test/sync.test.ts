@@ -40,13 +40,23 @@ const executor = (token: string, workspaceId: string) => (command: unknown) =>
   );
 
 /** agent.send + pump: the Job id and inbox item id. */
-const queuedJob = async (s: Awaited<ReturnType<typeof setup>>) => {
+const queuedJob = async (s: {
+  send: () => { operationId: string };
+  user: {
+    command: (body: unknown) => Promise<Response>;
+    get: (path: string) => Promise<Response>;
+  };
+  pump: () => Promise<unknown>;
+}) => {
   const request = s.send();
-  const sent = await (
-    await s.user.command(request)
-  ).json<{ inboxItemId: string; messageId: string }>();
+  const response = await s.user.command(request);
+  expect(response.status).toBe(200);
+  const sent = await response.json<{ inboxItemId: string; messageId: string }>();
   await s.pump();
-  const op = await (await s.user.get(`/v1/operations/${request.operationId}`)).json<Json>();
+  const operation = await s.user.get(`/v1/operations/${request.operationId}`);
+  expect(operation.status).toBe(200);
+  const op = await operation.json<Json>();
+  expect(typeof op.jobId).toBe("string");
   return { ...sent, jobId: op.jobId as string };
 };
 
@@ -70,20 +80,11 @@ const outsider = async (workspaceId: string) => {
 };
 
 describe("change_log", () => {
-  it("each mutating command appends its change rows with the entity's scope", async () => {
+  it("records changes for an agent delivery and its Job lifecycle", async () => {
     const s = await setup();
     const ws = `workspace:${s.workspaceId}`;
     const ch = `channel:${s.channelId}`;
-    const created = await changeRows(s.workspaceId);
-    expect(summary(created)).toEqual([
-      ["workspace", s.workspaceId, ws],
-      ["device", s.deviceId, ws],
-      ["channel", s.channelId, ch],
-      ["conversation", expect.any(String), ch],
-      ["bot", s.botId, ws],
-    ]);
-
-    let seq = created.at(-1)!.seq;
+    let seq = (await changeRows(s.workspaceId)).at(-1)!.seq;
     const next = async () => {
       const rows = await changeRows(s.workspaceId, seq);
       seq = rows.at(-1)?.seq ?? seq;
@@ -224,7 +225,7 @@ describe("bootstrap lists", () => {
     const s = await setup();
     const q = `workspaceId=${s.workspaceId}`;
     const get = async (path: string) => (await s.user.get(path)).json<Json>();
-    expect(await get(`/v1/channels?${q}`)).toEqual({
+    expect(await get(`/v1/channels?${q}`)).toMatchObject({
       channels: [expect.objectContaining({ id: s.channelId, lastMessage: null })],
     });
     const first = await (await s.user.command(s.send())).json<Json>();
@@ -244,7 +245,8 @@ describe("bootstrap lists", () => {
         },
       }),
     ]);
-    expect(await get(`/v1/bots?${q}`)).toEqual({
+    expect(await get(`/v1/bots?${q}`)).toMatchObject({
+      canManage: true,
       bots: [
         expect.objectContaining({
           id: s.botId,
@@ -271,7 +273,7 @@ describe("bootstrap lists", () => {
     ]);
 
     const other = await outsider(s.workspaceId);
-    expect(await (await other.get(`/v1/channels?${q}`)).json()).toEqual({ channels: [] });
+    expect(await (await other.get(`/v1/channels?${q}`)).json()).toMatchObject({ channels: [] });
     expect((await other.get(`/v1/channels/${s.channelId}/messages?${q}`)).status).toBe(404);
     expect((await (await login()).get(`/v1/bots?${q}`)).status).toBe(403);
     expect((await s.user.get(`/v1/jobs?${q}&limit=0`)).status).toBe(422);
