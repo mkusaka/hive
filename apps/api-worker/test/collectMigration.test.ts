@@ -9,7 +9,7 @@ for (const statement of env.COLLECT_MIGRATION.split("--> statement-breakpoint"))
   if (trimmed.length > 0) migrationStatements.push(trimmed);
 }
 
-describe("migration 0027", () => {
+describe("migration 0031 (collector, formerly 0027)", () => {
   it("rebuilds populated runs without losing Execution, capability, or transcript references", async () => {
     const s = await setup();
     const { jobId } = await queuedJob(s);

@@ -100,7 +100,7 @@ bun run db:check   # migrations are consistent and `db:generate` has nothing lef
 
 `db:check` validates the complete snapshot chain, then checks schema drift against the journal's final snapshot
 in a temporary directory. drizzle-kit otherwise picks the lexically last filename: after this merge, migration
-order is `0022_threads` → `0024_routine_triggers` → `0030_run_outcome` → `0027_external_runs`, not ticket-number order.
+order is `0022_threads` → `0024_routine_triggers` → `0030_run_outcome` → `0031_external_runs` (the collector migration was renumbered at merge time so that filename order, which wrangler and the test pool apply, matches the chain).
 The collector snapshot includes the routine-trigger schema and `runs.outcome`, and its `prevId` is the 0030 id.
 
 ## Foreign keys added to existing tables

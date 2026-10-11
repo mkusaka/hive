@@ -4,7 +4,7 @@ import { defineConfig } from "vitest/config";
 
 const migrations = new URL("../../packages/db/migrations", import.meta.url).pathname;
 const collectMigration = await readFile(
-  new URL("../../packages/db/migrations/0027_external_runs.sql", import.meta.url).pathname,
+  new URL("../../packages/db/migrations/0031_external_runs.sql", import.meta.url).pathname,
   "utf8",
 );
 
