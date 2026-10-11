@@ -1111,6 +1111,11 @@ invalid delegations, expired approvals and stale-generation writes are rejected.
   with `--executor` (headless, running the CLI's `executor run` code). Electron main reconciles the agent on every
   start (reinstalls unless the plist is identical and running), so the service never runs another build; closing
   or quitting the app leaves it running, Stop only unloads it. See `apps/desktop/README.md`, Executor service.
+- Implemented as (LOGIN-01): main also owns first run. Until the credentials file has an API URL, a usable grant, a
+  Workspace and a device token, the renderer shows a Welcome screen whose steps call main (`config.set`, `login`,
+  `device.register`); registration runs the CLI's own `device register` and then the same service reconcile, and
+  Sign out (account menu, confirmed in a dialog) runs `hive logout`. The renderer still never sees a token. See `apps/desktop/README.md`, Welcome / first
+  run.
 
 ### 20.2 Startup and crashes (§23.2)
 

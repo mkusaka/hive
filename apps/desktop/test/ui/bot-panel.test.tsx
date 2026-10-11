@@ -5,8 +5,8 @@ import { findComposer, renderApp, sidebar } from "./fakeHive.ts";
 import { dms } from "./fixtures.ts";
 
 /** Opens coder's DM from its sidebar blob, then its panel from the DM header. */
-const openCoder = async () => {
-  const app = renderApp({ get: { "/v1/dms": { dms } } });
+const openCoder = async (overrides: Parameters<typeof renderApp>[0] = {}) => {
+  const app = renderApp({ ...overrides, get: { "/v1/dms": { dms } } });
   await app.user.click(await (await sidebar()).findByRole("button", { name: "coder" }));
   const head = within(await waitForHead(app.container));
   await app.user.click(head.getByRole("button", { name: "coder" }));
@@ -58,5 +58,14 @@ describe("bot panel", () => {
     await user.selectOptions(panel.getByRole("combobox", { name: "Provider" }), "codex");
     await user.click(panel.getByRole("button", { name: "Start" }));
     expect(hive.calls.executor).toEqual([{ start: { provider: "codex", concurrency: 1 } }]);
+  });
+
+  it("offers Set up this PC in Computer when this device is not registered", async () => {
+    const { panel, user, hive } = await openCoder({
+      executor: { registered: false, installed: false },
+    });
+    await user.click(panel.getByRole("tab", { name: "Computer" }));
+    await user.click(await panel.findByRole("button", { name: "Set up this PC" }));
+    expect(hive.calls.setup).toEqual([{ register: { name: "test-pc" } }]);
   });
 });

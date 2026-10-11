@@ -1,6 +1,7 @@
 import { createClient } from "@hive/cli/client";
 import { describe, expect, it } from "vitest";
-import { handlers } from "../src/main/ipc.ts";
+import { type Credentials, type Deps, run } from "@hive/cli/cli";
+import { handlers, setupHandlers } from "../src/main/ipc.ts";
 
 const setup = (respond: () => Response = () => Response.json({ ok: true })) => {
   const requests: { path: string; jwt: string | null; body: unknown }[] = [];
@@ -201,5 +202,107 @@ describe("IPC handlers", () => {
       ok: false,
       error: { code: "CURSOR_EXPIRED", message: "cursor expired", body },
     });
+  });
+});
+
+/** The CLI's real `run` over fake deps, wired like main (stdout dropped, stderr collected). */
+const setupWith = (respond: () => Response) => {
+  const saved: Credentials[] = [];
+  const requests: unknown[] = [];
+  let reconciled = 0;
+  const deps = {
+    fetch: async (_url: URL, init: RequestInit) => {
+      requests.push(JSON.parse(init.body as string));
+      return respond();
+    },
+    loadCredentials: async () => ({
+      apiUrl: "http://localhost:8787",
+      accessJwt: "jwt",
+      workspaceId: "ws-1",
+    }),
+    saveCredentials: async (patch: Credentials) => {
+      saved.push(patch);
+      return {};
+    },
+    stdout: () => {},
+    stderr: () => {},
+  } as unknown as Deps;
+  const h = setupHandlers({
+    save: async (patch) => void saved.push(patch),
+    cli: async (argv) => {
+      const stderr: string[] = [];
+      const code = await run(argv, { ...deps, stderr: (l) => stderr.push(l) });
+      return { code, stderr };
+    },
+    os: "darwin",
+    agentVersion: "0.0.0",
+    reconcile: async () => void reconciled++,
+  });
+  return { h, saved, requests, reconciled: () => reconciled };
+};
+
+describe("setup IPC (config.set, logout, device.register)", () => {
+  it("config.set accepts https or http://localhost and rejects anything else", async () => {
+    const { h, saved } = setupWith(() => Response.json({}));
+    expect(await h.configSet({ apiUrl: "http://localhost:8787" })).toEqual({ ok: true, value: {} });
+    expect(
+      await h.configSet({ apiUrl: " https://api.example.com ", workspaceId: "ws-dev" }),
+    ).toEqual({ ok: true, value: {} });
+    expect(saved).toEqual([
+      { apiUrl: "http://localhost:8787" },
+      { apiUrl: "https://api.example.com", workspaceId: "ws-dev" },
+    ]);
+    const bad = [
+      { apiUrl: "http://api.example.com" },
+      { apiUrl: "file:///etc/passwd" },
+      { apiUrl: "not a url" },
+      { workspaceId: "" },
+      { deviceToken: "x" },
+      {},
+    ];
+    for (const result of await Promise.all(bad.map(h.configSet)))
+      expect(result).toMatchObject({ ok: false, error: { code: "INVALID_ARGS" } });
+    expect(saved).toHaveLength(2);
+  });
+
+  it("device.register runs `hive device register`, saves the token, reconciles and never returns it", async () => {
+    const { h, saved, requests, reconciled } = setupWith(() =>
+      Response.json({ deviceId: "dev-1", deviceToken: "dev-1.secret" }),
+    );
+    const result = await h.deviceRegister({ name: " studio " });
+    expect(result).toEqual({ ok: true, value: {} });
+    expect(JSON.stringify(result)).not.toContain("secret");
+    expect(requests).toMatchObject([
+      {
+        workspaceId: "ws-1",
+        command: { type: "device.register", name: "studio", os: "darwin", agentVersion: "0.0.0" },
+      },
+    ]);
+    expect(saved).toEqual([{ apiUrl: "http://localhost:8787", deviceToken: "dev-1.secret" }]);
+    expect(reconciled()).toBe(1);
+    expect(await h.deviceRegister({ name: "" })).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_ARGS" },
+    });
+  });
+
+  it("device.register maps a failed command to an error and skips the reconcile", async () => {
+    const { h, reconciled } = setupWith(() =>
+      Response.json(
+        { code: "FORBIDDEN", message: "not a member", retryable: false },
+        { status: 403 },
+      ),
+    );
+    expect(await h.deviceRegister({ name: "studio" })).toMatchObject({
+      ok: false,
+      error: { code: "COMMAND_FAILED", message: expect.stringContaining("not a member") },
+    });
+    expect(reconciled()).toBe(0);
+  });
+
+  it("logout runs `hive logout`, which drops only the OAuth grant", async () => {
+    const { h, saved } = setupWith(() => Response.json({}));
+    expect(await h.logout()).toEqual({ ok: true, value: {} });
+    expect(saved).toEqual([{ oauth: undefined }]);
   });
 });

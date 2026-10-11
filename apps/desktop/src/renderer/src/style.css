@@ -1092,3 +1092,189 @@ button.topic {
   color: var(--text-3);
   font-size: 12px;
 }
+/* Account avatar at the bottom of the sidebar (and of the collapsed rail). */
+.side-foot {
+  display: flex;
+  padding-top: 4px;
+}
+button.account {
+  padding: 2px;
+  border-radius: 50%;
+  background: none;
+}
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  background: rgb(0 0 0 / 0.5);
+  -webkit-app-region: no-drag;
+}
+.dialog {
+  width: min(400px, calc(100vw - 32px));
+  padding: 20px;
+  border: 1px solid var(--bg-tertiary);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 0.5);
+}
+.dialog h2 {
+  margin: 0 0 8px;
+  font-size: 17px;
+}
+.dialog p {
+  margin: 0;
+  color: var(--text-2);
+  line-height: 1.6;
+}
+.dialog-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 24px;
+}
+.dialog-actions button {
+  padding: 9px 16px;
+  border-radius: 999px;
+}
+button.pill-dark {
+  background: var(--bg-tertiary);
+}
+button.pill-light,
+button.pill-light:hover:not(:disabled) {
+  background: #f5f5f5;
+  color: #111;
+}
+button.pill-light:focus-visible {
+  outline: 2px solid #f5f5f5;
+  outline-offset: 2px;
+}
+
+/* Welcome (LOGIN-01): full window, black like the reference app's sign-in; the whole screen moves the window. */
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  height: 100vh;
+  padding: 48px 16px 24px;
+  background: #0a0a0a;
+  -webkit-app-region: drag;
+}
+.welcome button,
+.welcome input,
+.welcome a {
+  -webkit-app-region: no-drag;
+}
+.welcome-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 28px;
+  width: min(420px, 100%);
+  text-align: center;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  color: #fff;
+}
+.brand h1 {
+  margin: 0;
+  font-size: 64px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.tagline {
+  margin: 0;
+  max-width: 340px;
+  font-size: 20px;
+  line-height: 1.4;
+}
+.welcome-form {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+}
+.welcome-form h2 {
+  margin: 0;
+  font-size: 17px;
+}
+.welcome label,
+.setup-pc label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  color: var(--text-2);
+  font-size: 13px;
+  text-align: left;
+}
+.welcome label input,
+.setup-pc label input {
+  width: 100%;
+  padding: 10px 14px;
+  border-radius: 12px;
+  color: var(--text);
+  font-size: 15px;
+}
+button.pill-cta {
+  padding: 10px 26px;
+  border-radius: 999px;
+  background: #1c1c1c;
+  font-size: 17px;
+}
+button.pill-cta:hover:not(:disabled) {
+  background: #262626;
+}
+.welcome button.link,
+.setup-pc button.link {
+  padding: 0;
+  background: none;
+  color: var(--text-2);
+  text-decoration: underline;
+}
+.workspaces {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.workspaces button {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+  padding: 12px 16px;
+  border-radius: 12px;
+}
+.welcome .setup-pc {
+  width: 100%;
+  padding: 18px 20px;
+  text-align: left;
+}
+.setup-pc {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+.setup-pc h3,
+.setup-pc p {
+  margin: 0;
+}
+.setup-pc .row {
+  align-items: center;
+  margin-top: 4px;
+}
+.welcome-foot {
+  color: var(--text-3);
+  font-size: 13px;
+}

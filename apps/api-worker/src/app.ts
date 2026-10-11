@@ -178,7 +178,27 @@ export const createApp = ({
     await next();
   });
 
-  app.get("/v1/me", (c) => c.json(c.get("principal")));
+  // A user also gets a label (email, else id; the desktop account avatar) and their Workspaces' names ("Choose a
+  // workspace").
+  app.get("/v1/me", async (c) => {
+    const principal = c.get("principal");
+    if (principal.kind !== "user") return c.json(principal);
+    const db = c.env.DB;
+    const [row, { results }] = await Promise.all([
+      db
+        .prepare("SELECT email FROM users WHERE id = ?")
+        .bind(principal.userId)
+        .first<{ email: string | null }>(),
+      db
+        .prepare(
+          `SELECT w.id, w.name FROM workspaces w JOIN workspace_members m ON m.workspace_id = w.id
+           WHERE m.user_id = ? ORDER BY w.name, w.id`,
+        )
+        .bind(principal.userId)
+        .all<{ id: string; name: string }>(),
+    ]);
+    return c.json({ ...principal, label: row?.email ?? principal.userId, workspaces: results });
+  });
   app.get("/v1/executor/me", (c) => c.json(c.get("principal")));
 
   app.post("/v1/commands", async (c) => {

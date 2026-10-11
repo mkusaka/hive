@@ -18,7 +18,10 @@ const hive: HiveApi = {
     return () => void ipcRenderer.off(channels.realtime, listener);
   },
   getConfig: () => ipcRenderer.invoke(channels.config),
+  setConfig: (patch) => ipcRenderer.invoke(channels.configSet, patch),
   login: () => ipcRenderer.invoke(channels.login),
+  logout: () => ipcRenderer.invoke(channels.logout),
+  registerDevice: (input) => ipcRenderer.invoke(channels.deviceRegister, input),
 };
 
 contextBridge.exposeInMainWorld("hive", hive);

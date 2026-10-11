@@ -67,6 +67,9 @@ const icons = {
   show: "M3 12s4-6 9-6 9 6 9 6-4 6-9 6-9-6-9-6z M15 12a3 3 0 1 1-6 0a3 3 0 1 1 6 0",
   folder: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",
   chevron: "M6 9l6 6 6-6",
+  settings:
+    "M15 12a3 3 0 1 1-6 0a3 3 0 1 1 6 0 M12 2v3 M12 19v3 M4.9 4.9l2.1 2.1 M17 17l2.1 2.1 M2 12h3 M19 12h3 M4.9 19.1L7 17 M17 7l2.1-2.1",
+  logout: "M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4 M9 8l-4 4 4 4 M5 12h10",
   users:
     "M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1 M13 7a4 4 0 1 1-8 0a4 4 0 1 1 8 0 M22 19v-1a4 4 0 0 0-3-3.9 M16 3.1a4 4 0 0 1 0 7.8",
 };
@@ -100,15 +103,23 @@ export const MemoryList = ({ memories }: { memories: Row[] }) => (
 
 /**
  * A context menu at (x, y), kept inside the window, over a backdrop: a click outside, a right-click outside or Escape
- * closes it. Children are `role="menuitem"` buttons and `<hr />` separators.
+ * closes it. Children are `role="menuitem"` buttons and `<hr />` separators. With `up`, (x, y) is its bottom-left
+ * corner (the sidebar's account menu).
  */
-export const Menu = (props: { x: number; y: number; close: () => void; children: ReactNode }) => {
-  const { x, y, close } = props;
+export const Menu = (props: {
+  x: number;
+  y: number;
+  up?: boolean;
+  close: () => void;
+  children: ReactNode;
+}) => {
+  const { x, close } = props;
   const box = useRef<HTMLDivElement>(null);
-  const [at, setAt] = useState({ left: x, top: y });
+  const [at, setAt] = useState({ left: x, top: props.y });
   // Measured on every render: the content can grow (an expanded submenu).
   useLayoutEffect(() => {
     const el = box.current!;
+    const y = props.up ? props.y - el.offsetHeight : props.y;
     const left = Math.max(4, Math.min(x, window.innerWidth - el.offsetWidth - 8));
     const top = Math.max(4, Math.min(y, window.innerHeight - el.offsetHeight - 8));
     if (left !== at.left || top !== at.top) setAt({ left, top });

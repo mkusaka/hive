@@ -9,15 +9,20 @@ import { BotPanel, ChannelPanel, type ChannelTab } from "./panel.tsx";
 import { Sidebar, togglePin, type View } from "./sidebar.tsx";
 import { createSync, type ListKey, type SyncStatus } from "./sync.ts";
 import { Badge, failure, get, inWorkspace, MemoryList, type Row, text } from "./ui.tsx";
+import { Welcome } from "./welcome.tsx";
 
 type SidebarDoc = { workspaceName: string; prefs: SidebarPrefs; revision: number };
 const collapsedKey = "hive.sidebarCollapsed";
+/** API URL, signed in and a Workspace: the data can load (the Welcome screen may still show Set up this PC). */
+const isLive = (config: HiveConfig | null): config is HiveConfig =>
+  config !== null && config.apiUrl !== "" && config.workspaceId !== "" && !config.loginRequired;
 
 export const App = () => {
   const [config, setConfig] = useState<HiveConfig | null>(null);
   const [view, setView] = useState<View>("channel");
   const [error, setError] = useState<string | null>(null);
-  const [loggingIn, setLoggingIn] = useState(false);
+  // "Skip for now" on Set up this PC, for this window.
+  const [skippedDevice, setSkippedDevice] = useState(false);
   const [connection, setConnection] = useState("reconnecting");
   const [sync, setSync] = useState<SyncStatus>({ cursor: null, unsynced: 0, error: null });
 
@@ -40,6 +45,8 @@ export const App = () => {
   const [runId, setRunId] = useState("");
   const [run, setRun] = useState<Inspected | null>(null);
   const [me, setMe] = useState<string | null>(null);
+  // The account avatar's label (email, else id).
+  const [meLabel, setMeLabel] = useState("");
   const [side, setSide] = useState<SidebarDoc>({
     workspaceName: "",
     prefs: { pinned: [], hidden: [], groups: [] },
@@ -181,7 +188,7 @@ export const App = () => {
   }, [openBot]);
 
   useEffect(() => {
-    if (!config || config.problem || config.loginRequired) return;
+    if (!isLive(config)) return;
     const controller = createSync({
       workspaceId: config.workspaceId,
       get: window.hive.api.get,
@@ -208,11 +215,14 @@ export const App = () => {
     };
   }, [config, refetch]);
 
-  // Who "You" is in the message list (messages carry the author's user id).
+  // Who "You" is in the message list (messages carry the author's user id) and the account avatar.
   useEffect(() => {
-    if (config && !config.problem && !config.loginRequired)
+    if (isLive(config))
       void get("/v1/me").then(
-        (p) => setMe(String(p.userId)),
+        (p) => {
+          setMe(String(p.userId));
+          setMeLabel(text(p.label ?? p.userId));
+        },
         () => setMe(null),
       );
   }, [config]);
@@ -267,22 +277,18 @@ export const App = () => {
 
   // Selection changes load their list directly.
   useEffect(() => {
-    if (config && !config.problem && !config.loginRequired && channelId)
-      void refetch(new Set(["messages"]), config.workspaceId);
+    if (isLive(config) && channelId) void refetch(new Set(["messages"]), config.workspaceId);
   }, [config, channelId, dmId, refetch]);
   useEffect(() => {
-    if (config && !config.problem && !config.loginRequired && botId)
-      void refetch(new Set(["inbox"]), config.workspaceId);
+    if (isLive(config) && botId) void refetch(new Set(["inbox"]), config.workspaceId);
   }, [config, botId, refetch]);
   useEffect(() => {
     setReplies([]);
-    if (config && !config.problem && !config.loginRequired && threadId)
-      void refetch(new Set(["thread"]), config.workspaceId);
+    if (isLive(config) && threadId) void refetch(new Set(["thread"]), config.workspaceId);
   }, [config, threadId, refetch]);
   useEffect(() => {
     setRun(null);
-    if (config && !config.problem && !config.loginRequired && runId)
-      void refetch(new Set(["run"]), config.workspaceId);
+    if (isLive(config) && runId) void refetch(new Set(["run"]), config.workspaceId);
   }, [config, runId, refetch]);
   useEffect(() => {
     if (!channelId && channels[0]) setChannelId(channels[0].id);
@@ -290,28 +296,10 @@ export const App = () => {
   }, [channels, bots, channelId, botId]);
 
   if (!config) return <p className="pad">Loading…</p>;
-  if (config.problem) return <p className="pad error">{config.problem}</p>;
-  if (config.loginRequired)
+  const reloadConfig = async () => setConfig(await window.hive.getConfig());
+  if (!isLive(config) || (!config.deviceRegistered && !skippedDevice))
     return (
-      <div className="pad">
-        <p>Not logged in to Cloudflare Access (shared with the hive CLI).</p>
-        <button
-          type="button"
-          disabled={loggingIn}
-          onClick={() => {
-            setLoggingIn(true);
-            void window.hive.login().then(async (result) => {
-              setLoggingIn(false);
-              if (!result.ok) return setError(result.message);
-              setError(null);
-              setConfig(await window.hive.getConfig());
-            });
-          }}
-        >
-          {loggingIn ? "Waiting for the browser…" : "Log in"}
-        </button>
-        {error && <p className="error">{error}</p>}
-      </div>
+      <Welcome config={config} reload={reloadConfig} skipDevice={() => setSkippedDevice(true)} />
     );
   const ws = config.workspaceId;
 
@@ -362,6 +350,12 @@ export const App = () => {
         }}
         openDm={(id) => void openDm(id)}
         approvals={approvals.length}
+        account={me ? { id: me, label: meLabel } : null}
+        signOut={() =>
+          void window.hive
+            .logout()
+            .then((res) => (res.ok ? reloadConfig() : setError(failure(res))))
+        }
       />
       <main>
         {error && <p className="error banner">{error}</p>}

@@ -13,12 +13,13 @@ bun run --cwd apps/desktop dev     # downloads the Electron binary on first run,
 bun run --cwd apps/desktop build   # out/{main,preload,renderer}
 ```
 
-- **Credentials.** `$XDG_CONFIG_HOME/hive/credentials.json`, else `~/.config/hive/credentials.json`: `apiUrl` and
-  `workspaceId` (without them the window shows what is missing). Auth follows the CLI and shares its store:
-  `HIVE_ACCESS_JWT` / `accessJwt` for `wrangler dev`, else the OAuth grant in the same file (`hive login` and the app
-  each see the other's login and refreshes; see `apps/cli/README.md`, Credentials). Only when the file has no usable
-  grant does the window show a Login button, which runs the same browser login (`@hive/cli/accessLogin`) and writes
-  the grant to the file.
+- **Credentials.** `$XDG_CONFIG_HOME/hive/credentials.json`, else `~/.config/hive/credentials.json`: `apiUrl`,
+  `workspaceId` and `deviceToken` (what is missing puts the Welcome screen on that step, below). Auth follows the CLI
+  and shares its store: `HIVE_ACCESS_JWT` / `accessJwt` for `wrangler dev`, else the OAuth grant in the same file
+  (`hive login` and the app each see the other's login and refreshes; see `apps/cli/README.md`, Credentials).
+- **`HIVE_SKIP_SERVICE=1` (dev only).** Skips the executor service reconcile, at start and after Set up this PC. The
+  plist is per user, not per `XDG_CONFIG_HOME`, so a run against a scratch config dir must set it or it replaces
+  the real service.
 - **Screenshot hook (dev only).** `HIVE_SCREENSHOT=<png path>` saves `webContents.capturePage()` once,
   `HIVE_SCREENSHOT_DELAY_MS` (default 5000) after the first load. `HIVE_OPEN_BOT=<bot id>` opens that Bot's panel at
   start (sent as `openBot` in the config reply). Both are ignored in a packaged app.
@@ -26,6 +27,28 @@ bun run --cwd apps/desktop build   # out/{main,preload,renderer}
   starts Electron with the dev server URL. There is no React plugin: esbuild's automatic JSX runtime is enough,
   so there is no fast refresh (edits reload the page) and no inline preamble script to allow in the CSP. Main
   changes need a restart of `dev`.
+
+## Welcome / first run (LOGIN-01)
+
+Until the app can load, the window is a full-window dark Welcome screen (the hive mark, the name, the tagline, one
+pill button; the whole screen drags the frameless window). Each step writes to the shared credentials file through
+main and re-reads the config, which picks the next step:
+
+1. **No `apiUrl`:** an API URL field (prefilled from `HIVE_API_URL`) above **Sign in →**; `config.set` accepts an
+   https URL or `http://localhost`. The footer shows the API host with **Change** once one is set.
+2. **No usable grant:** **Sign in →** runs the CLI's browser login (Access Managed OAuth); while it waits the button
+   reads "Waiting for the browser…" with Cancel, and a failure shows under it. `HIVE_ACCESS_JWT` skips this step.
+3. **No `workspaceId`:** `GET /v1/me` lists the user's Workspaces (`workspaces: [{id, name}]`): **Choose a
+   workspace**, or with none **Create a workspace** (`workspace.create` with an id slugged from the name plus a
+   random suffix).
+4. **No `deviceToken`:** **Set up this PC** (name prefilled from `os.hostname()`) runs `hive device register`
+   (the CLI's `run` and deps; its stdout, which carries the token, is dropped), then the service reconcile. **Skip
+   for now** opens the app for this window; the Computer tab then shows the same card.
+
+**Account menu.** The avatar at the bottom of the sidebar (also in the collapsed rail; the first letter of the
+`label` from `GET /v1/me`, the user's email) opens Settings (the Status view for now) and **Sign out**. Sign out
+asks first in an in-app dialog (Cancel, or Escape; Sign out is focused), then runs `hive logout`: the OAuth grant
+goes, the device token and the service stay, and the window returns to Sign in.
 
 ## Views
 
@@ -110,15 +133,19 @@ img-src 'self'`. `'unsafe-inline'` styles are for Vite's dev-time `<style>` inje
 
 ## IPC surface (`src/shared/api.ts`)
 
-| `window.hive`       | Channel                | Validation / behavior                                                                                                                                                                                                                             |
-| ------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `api.get(path)`     | `hive:api.get`         | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, the query also allows URLSearchParams' `+` and `*`, no `..` anywhere                                                                                                                      |
-| `api.command(env)`  | `hive:api.command`     | `commandEnvelope(variant [MessagePost, AgentSend, JobCancel, ApprovalResolve, MemoryWrite, ChannelUpdate, RoutineCreate, RoutineUpdate, RoutineDelete, RoutinePause, RoutineResume, RoutineRun, SidebarUpdate])`: only these twelve command types |
-| `getConfig()`       | `hive:config`          | `{apiUrl, workspaceId, problem, connection}`; no secrets                                                                                                                                                                                          |
-| `onRealtime(cb)`    | `hive:realtime`        | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                                                                                                                                                       |
-| `executor.status()` | `hive:executor.status` | launchd state, pid, last exit code, installed provider / concurrency / argv, plist and log paths, `registered`; never the plist's env values                                                                                                      |
-| `executor.start(o)` | `hive:executor.start`  | `{provider: fake\|claude\|codex, concurrency: 1..64}` (strict); installs or replaces the service; `UNAUTHENTICATED` without a device token                                                                                                        |
-| `executor.stop()`   | `hive:executor.stop`   | `launchctl bootout` only; the plist stays                                                                                                                                                                                                         |
+| `window.hive`       | Channel                | Validation / behavior                                                                                                                                                                                                                                       |
+| ------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `api.get(path)`     | `hive:api.get`         | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, the query also allows URLSearchParams' `+` and `*`, no `..` anywhere                                                                                                                                |
+| `api.command(env)`  | `hive:api.command`     | `commandEnvelope(variant [MessagePost, AgentSend, JobCancel, ApprovalResolve, MemoryWrite, ChannelUpdate, RoutineCreate, RoutineUpdate, RoutineDelete, RoutinePause, RoutineResume, RoutineRun, SidebarUpdate, WorkspaceCreate])`: only these command types |
+| `getConfig()`       | `hive:config`          | `{apiUrl, workspaceId, problem, loginRequired, deviceRegistered, workspaces, hostname, defaultApiUrl, connection}`; no secrets                                                                                                                              |
+| `onRealtime(cb)`    | `hive:realtime`        | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                                                                                                                                                                 |
+| `executor.status()` | `hive:executor.status` | launchd state, pid, last exit code, installed provider / concurrency / argv, plist and log paths, `registered`; never the plist's env values                                                                                                                |
+| `executor.start(o)` | `hive:executor.start`  | `{provider: fake\|claude\|codex, concurrency: 1..64}` (strict); installs or replaces the service; `UNAUTHENTICATED` without a device token                                                                                                                  |
+| `executor.stop()`   | `hive:executor.stop`   | `launchctl bootout` only; the plist stays                                                                                                                                                                                                                   |
+| `setConfig(patch)`  | `hive:config.set`      | `{apiUrl?: https URL or http://localhost, workspaceId?: 1..200 chars}` (strict, not empty); merged into the credentials file                                                                                                                                |
+| `login()`           | `hive:login`           | the CLI's browser login; `{ok: true}` or `{ok: false, message}`                                                                                                                                                                                             |
+| `logout()`          | `hive:logout`          | `hive logout` (drops the OAuth grant only)                                                                                                                                                                                                                  |
+| `registerDevice(i)` | `hive:device.register` | `{name: 1..200 chars}` (strict); `hive device register --name --os <platform> --agent-version <app version>`, then the service reconcile; never returns the token                                                                                           |
 
 `api.*` never rejects: it resolves to `{ok: true, value}` or `{ok: false, error: {code, message, body?}}`, where
 `code` is the `ApiError` code (e.g. `CURSOR_EXPIRED`), `INVALID_ARGS` for rejected arguments, or a CLI client code
@@ -185,10 +212,15 @@ Status views. Every change to `src/renderer` adds or updates a test here.
   labels, sharing or avatar images; links in messages are text (the window denies opening links); Markdown is a small
   subset (no headings, tables, nested lists or images). The Bot panel's Routines and memories load when a tab opens
   and after its own commands (no change-row refetch), so a Routine fired or changed elsewhere shows on the next open.
-- Executor service: macOS only; no device registration in the app; a Claude Run under launchd was verified only with
+- Welcome (LOGIN-01): Cancel only stops waiting; the CLI's login has no abort, so its loopback listener stays until
+  the browser calls back, and a late callback still saves the grant. Skip for now lasts for the window. After Sign
+  out the Realtime socket keeps retrying with backoff until the next sign in. With `HIVE_ACCESS_JWT` Sign out has no
+  visible effect (the assertion wins). Changing the API URL keeps the old `workspaceId`. The account menu has no Weekly usage, Get mobile, Support or Add account
+  (one account per credentials file), and Settings is the Status view.
+- Executor service: macOS only; a Claude Run under launchd was verified only with
   `CLAUDE_CONFIG_DIR` captured from the starting shell (keychain login); launched from Finder, main has
   launchd's minimal `PATH`, which the service then inherits. The Executor section is hidden while the window shows
-  the Login button or a credentials problem.
+  the Welcome screen.
 - Sidebar (UI-04): no Delete in the item menu (there is no `channel.delete` command) and no Mark as Unread (no read
   state). Groups cannot be renamed; a group disappears with its last item. The workspace name has no menu.
 - Search / Memory: one page of hits (no cursor paging), no kind filter, no memory delete or supersede; the Memory

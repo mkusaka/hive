@@ -2,7 +2,7 @@
 // The renderer gets only the typed IPC surface in src/shared/api.ts. It also owns the executor launchd service, whose
 // program is this app started with `--executor` (headless executor mode, see README "Executor service").
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { accessTokens, login, systemBrowser } from "@hive/cli/accessLogin";
@@ -12,7 +12,7 @@ import { deps } from "@hive/cli/deps";
 import * as service from "@hive/cli/service";
 import { app, BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
 import { channels, type HiveConfig, type RealtimeEvent } from "../shared/api.ts";
-import { executorHandlers, handlers } from "./ipc.ts";
+import { executorHandlers, handlers, setupHandlers } from "./ipc.ts";
 
 // Same file and env override as the CLI (apps/cli/src/main.ts): one credential store, so a login or refresh by
 // either client is seen by the other.
@@ -90,12 +90,26 @@ const connectRealtime = (
 };
 
 const createWindow = async () => {
-  const creds = await loadCredentials();
-  const problem =
-    !creds.apiUrl || !creds.workspaceId
-      ? `no apiUrl / workspaceId in ${credentialsFile}: run the CLI walkthrough first`
-      : null;
-  const config = { apiUrl: creds.apiUrl ?? "", workspaceId: creds.workspaceId ?? "", problem };
+  // HIVE_ACCESS_JWT / accessJwt (local dev) wins; otherwise the shared OAuth grant, refreshed silently. Without a
+  // usable grant requests fail with LOGIN_REQUIRED and the Welcome screen shows Sign in.
+  const clientFor = (c: Credentials) =>
+    createClient({
+      apiUrl: c.apiUrl ?? "",
+      accessJwt: c.accessJwt,
+      accessToken: accessTokens({
+        apiUrl: c.apiUrl ?? "",
+        load: async () => (await readCredentials()).oauth,
+        save: (oauth) => saveCredentials({ oauth }),
+      }),
+      fetch,
+    });
+  // Re-read after every Welcome step (config.set, login, logout, device.register): the client follows the API URL.
+  let creds = await loadCredentials();
+  let client = clientFor(creds);
+  const reload = async () => {
+    creds = await loadCredentials();
+    client = clientFor(creds);
+  };
   // The socket can open before the page subscribes, so the config reply carries the current state.
   let connection: HiveConfig["connection"] = "reconnecting";
 
@@ -126,55 +140,105 @@ const createWindow = async () => {
       return fn(...args);
     };
 
-  // HIVE_ACCESS_JWT / accessJwt (local dev) wins; otherwise the shared OAuth grant, refreshed silently. Without a
-  // usable grant requests fail with LOGIN_REQUIRED and the window shows the Login button.
-  const client = createClient({
-    apiUrl: config.apiUrl,
-    accessJwt: creds.accessJwt,
-    accessToken: accessTokens({
-      apiUrl: config.apiUrl,
-      load: async () => (await readCredentials()).oauth,
-      save: (oauth) => saveCredentials({ oauth }),
-    }),
-    fetch,
-  });
-  const loginRequired = async () =>
-    !problem &&
-    (await client.accessHeaders().then(
-      () => false,
-      (error: unknown) => error instanceof CliError && error.code === "LOGIN_REQUIRED",
-    ));
-  const h = handlers(client);
-  ipcMain.handle(
-    channels.config,
-    guard(async (): Promise<HiveConfig> => ({
-      ...config,
-      loginRequired: await loginRequired(),
+  // Started once, the first time the config is complete; each attempt asks the current client for headers.
+  let realtime = false;
+  const startRealtime = (apiUrl: string, workspaceId: string) => {
+    if (realtime) return;
+    realtime = true;
+    const url = new URL(`/v1/realtime?${new URLSearchParams({ workspaceId })}`, apiUrl);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    connectRealtime(
+      url,
+      () => client.accessHeaders(),
+      (event) => {
+        if (event.type === "connection") connection = event.state;
+        if (!win.isDestroyed()) win.webContents.send(channels.realtime, event);
+      },
+    );
+  };
+
+  const getConfig = async (): Promise<HiveConfig> => {
+    const apiUrl = creds.apiUrl ?? "";
+    const workspaceId = creds.workspaceId ?? "";
+    const loginRequired =
+      apiUrl !== "" &&
+      (await client.accessHeaders().then(
+        () => false,
+        (error: unknown) => error instanceof CliError && error.code === "LOGIN_REQUIRED",
+      ));
+    let workspaces: HiveConfig["workspaces"] = [];
+    let problem: string | null = null;
+    if (apiUrl && !loginRequired && !workspaceId) {
+      try {
+        workspaces = ((await client.get("/v1/me")).workspaces ?? []) as HiveConfig["workspaces"];
+      } catch (error) {
+        problem = `GET /v1/me failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+    if (apiUrl && workspaceId && !loginRequired) startRealtime(apiUrl, workspaceId);
+    return {
+      apiUrl,
+      workspaceId,
+      problem,
+      loginRequired,
+      deviceRegistered: registered(creds),
+      workspaces,
+      hostname: hostname(),
+      defaultApiUrl: process.env.HIVE_API_URL ?? "",
       connection,
       // Dev-only hook for screenshots of the Bot panel.
       ...(!app.isPackaged && process.env.HIVE_OPEN_BOT
         ? { openBot: process.env.HIVE_OPEN_BOT }
         : {}),
-    })),
-  );
+    };
+  };
+
+  ipcMain.handle(channels.config, guard(getConfig));
   // Browser login (PKCE on a loopback redirect); the grant goes to the shared file. Never throws across IPC.
   ipcMain.handle(
     channels.login,
     guard(() =>
       login(
-        config.apiUrl,
+        creds.apiUrl ?? "",
         systemBrowser((line) => console.log(line)),
       ).then(
         async (oauth) => {
           await saveCredentials({ oauth });
+          await reload();
           return { ok: true as const };
         },
         (error: unknown) => ({ ok: false as const, message: String(error) }),
       ),
     ),
   );
-  ipcMain.handle(channels.get, guard(h.get));
-  ipcMain.handle(channels.command, guard(h.command));
+  // The CLI's own commands (`hive logout`, `hive device register`) on its credentials file; stdout (which carries
+  // the device token) is dropped.
+  const setup = setupHandlers({
+    save: async (patch) => {
+      await saveCredentials(patch);
+      await reload();
+    },
+    cli: async (argv) => {
+      const stderr: string[] = [];
+      const code = await run(argv, { ...deps, stdout: () => {}, stderr: (l) => stderr.push(l) });
+      await reload();
+      return { code, stderr };
+    },
+    os: process.platform,
+    agentVersion: app.getVersion(),
+    reconcile: reconcileService,
+  });
+  ipcMain.handle(channels.configSet, guard(setup.configSet));
+  ipcMain.handle(channels.logout, guard(setup.logout));
+  ipcMain.handle(channels.deviceRegister, guard(setup.deviceRegister));
+  ipcMain.handle(
+    channels.get,
+    guard((path: unknown) => handlers(client).get(path)),
+  );
+  ipcMain.handle(
+    channels.command,
+    guard((envelope: unknown) => handlers(client).command(envelope)),
+  );
   const e = executorHandlers(servicedProgram(), async () => registered(await loadCredentials()));
   ipcMain.handle(channels.executorStatus, guard(e.status));
   ipcMain.handle(channels.executorStart, guard(e.start));
@@ -184,18 +248,6 @@ const createWindow = async () => {
   win.webContents.on("will-navigate", (event, url) => {
     if (url !== rendererUrl) event.preventDefault();
   });
-
-  if (!problem) {
-    const url = new URL(
-      `/v1/realtime?${new URLSearchParams({ workspaceId: config.workspaceId })}`,
-      config.apiUrl,
-    );
-    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    connectRealtime(url, client.accessHeaders, (event) => {
-      if (event.type === "connection") connection = event.state;
-      if (!win.isDestroyed()) win.webContents.send(channels.realtime, event);
-    });
-  }
 
   // Dev-only screenshot hook for manual verification: HIVE_SCREENSHOT=<png path>.
   const screenshot = process.env.HIVE_SCREENSHOT;
@@ -219,11 +271,14 @@ const servicedProgram = () => [process.execPath, app.getAppPath(), "--executor"]
 const registered = (creds: Credentials) => Boolean(creds.deviceToken && creds.apiUrl);
 
 /**
- * On every window-mode start: (re)install the service when it is missing, stopped or runs another program, keeping
+ * On every window-mode start and after "Set up this PC": (re)install the service when it is missing, stopped or runs another program, keeping
  * the installed provider / concurrency (default claude, 1). Quitting the app leaves the service running (§20.1).
  */
 const reconcileService = async () => {
   if (process.platform !== "darwin") return;
+  // Dev only: a run against a scratch XDG_CONFIG_HOME must not replace the real service (the plist is per user).
+  if (!app.isPackaged && process.env.HIVE_SKIP_SERVICE)
+    return console.log("executor service: HIVE_SKIP_SERVICE set, not reconciled");
   if (!registered(await loadCredentials()))
     return console.log("executor service: device not registered, not installed");
   const current = await service.status();

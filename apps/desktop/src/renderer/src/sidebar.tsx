@@ -2,7 +2,7 @@
 // the user's groups, Channels, Direct messages, Bots and Hidden. Pinned / hidden / groups are the user's `sidebar_prefs` document on
 // the server; section collapse is local (localStorage).
 import type { SidebarPrefs } from "@hive/contracts";
-import { useCallback, useRef, useState, type DragEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type DragEvent, type ReactNode } from "react";
 import { Inlines, type Names } from "./chat.tsx";
 import { parseInline } from "./format.ts";
 import { Avatar, Icon, Menu, type Row, text } from "./ui.tsx";
@@ -87,8 +87,14 @@ export const Sidebar = (props: {
   /** Opens (or creates) the Bot's DM: a Bot or DM row was clicked. */
   openDm: (botId: string) => void;
   approvals: number;
+  /** The signed-in user (`GET /v1/me`): the account avatar at the bottom. */
+  account: { id: string; label: string } | null;
+  /** The account menu's Sign out, after the confirm dialog (`hive logout`). */
+  signOut: () => void;
 }) => {
   const { prefs, collapsed } = props;
+  const [accountMenu, setAccountMenu] = useState<{ x: number; y: number } | null>(null);
+  const [confirming, setConfirming] = useState(false);
   const [query, setQuery] = useState("");
   const [menu, setMenu] = useState<{ item: Item; x: number; y: number } | null>(null);
   const [sections, setSections] = useState(readCollapsed);
@@ -323,6 +329,56 @@ export const Sidebar = (props: {
         {section("bots", "Bots", loose("bot", props.bots))}
         {!collapsed && section("hidden", `Hidden (${hidden.length})`, hidden, { fallback: true })}
       </div>
+      <div className="side-foot">
+        <button
+          className="account"
+          aria-label="Account"
+          aria-haspopup="menu"
+          onClick={(e) => {
+            const box = e.currentTarget.getBoundingClientRect();
+            setAccountMenu({ x: box.left, y: box.top - 8 });
+          }}
+        >
+          <Avatar
+            id={props.account?.id ?? ""}
+            name={props.account?.label ?? "?"}
+            size={collapsed ? 36 : 32}
+            plain
+          />
+        </button>
+      </div>
+      {accountMenu && (
+        <Menu {...accountMenu} up close={() => setAccountMenu(null)}>
+          <button
+            role="menuitem"
+            onClick={() => {
+              setAccountMenu(null);
+              props.setView("status");
+            }}
+          >
+            <Icon name="settings" /> Settings
+          </button>
+          <hr />
+          <button
+            role="menuitem"
+            onClick={() => {
+              setAccountMenu(null);
+              setConfirming(true);
+            }}
+          >
+            <Icon name="logout" /> Sign out
+          </button>
+        </Menu>
+      )}
+      {confirming && (
+        <SignOutDialog
+          cancel={() => setConfirming(false)}
+          confirm={() => {
+            setConfirming(false);
+            props.signOut();
+          }}
+        />
+      )}
       {menu && menuItem && (
         <ItemMenu
           {...menu}
@@ -425,5 +481,41 @@ const ItemMenu = (props: {
         {props.hidden ? "Show in sidebar" : "Hide from sidebar"}
       </button>
     </Menu>
+  );
+};
+
+/** The in-app "Sign out?" confirm (the reference app's dialog); Escape or the backdrop cancels. */
+const SignOutDialog = (props: { cancel: () => void; confirm: () => void }) => {
+  const { cancel } = props;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && cancel();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [cancel]);
+  return (
+    <div className="dialog-backdrop" onClick={cancel}>
+      <div
+        className="dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="sign-out-title"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 id="sign-out-title">Sign out?</h2>
+        <p>
+          Signing out removes the Access login from this computer. Your Channels, Bots and the
+          executor service stay: the service keeps running with this device&apos;s token until you
+          remove it with <code>hive executor uninstall</code>.
+        </p>
+        <div className="dialog-actions">
+          <button className="pill-dark" onClick={cancel}>
+            Cancel
+          </button>
+          <button className="pill-light" autoFocus onClick={props.confirm}>
+            Sign out
+          </button>
+        </div>
+      </div>
+    </div>
   );
 };

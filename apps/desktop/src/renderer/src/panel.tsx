@@ -4,6 +4,7 @@ import { type ReactNode, useCallback, useEffect, useRef, useState } from "react"
 import type { ExecutorProvider, UiCommand } from "../../shared/api.ts";
 import { type Schedule, scheduleLine } from "./format.ts";
 import { Avatar, failure, Icon, inWorkspace, MemoryList, Menu, type Row, text } from "./ui.tsx";
+import { SetUpPc } from "./welcome.tsx";
 
 type Tab = "details" | "library" | "computer";
 
@@ -713,10 +714,8 @@ const ExecutorSection = () => {
   return (
     <>
       <h3>Executor on this PC</h3>
+      {status?.registered === false && <SetUpPc onDone={() => void refresh()} />}
       <div className="card">
-        {status?.registered === false && (
-          <p className="warn">this device is not registered: run `hive device register`</p>
-        )}
         {error && <p className="error">{error}</p>}
         <dl className="kv">
           <dt>State</dt>

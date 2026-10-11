@@ -36,7 +36,12 @@ describe("user auth", () => {
     expect(first.status).toBe(200);
     expect(first.headers.get("X-Request-Id")).toBe("ray-1");
     const principal = await first.json<{ kind: string; userId: string }>();
-    expect(principal).toMatchObject({ kind: "user", workspaceIds: [] });
+    expect(principal).toMatchObject({
+      kind: "user",
+      workspaceIds: [],
+      workspaces: [],
+      label: `${sub}@example.test`,
+    });
 
     const row = await env.DB.prepare(
       "SELECT id, email FROM users WHERE access_issuer = ? AND access_subject = ?",
@@ -55,7 +60,10 @@ describe("user auth", () => {
 describe("commands", () => {
   it("registers a device; a replay returns the same device without the token", async () => {
     const { user, workspaceId } = await withWorkspace();
-    expect(await (await user.me()).json()).toMatchObject({ workspaceIds: [workspaceId] });
+    expect(await (await user.me()).json()).toMatchObject({
+      workspaceIds: [workspaceId],
+      workspaces: [{ id: workspaceId, name: expect.any(String) }],
+    });
 
     const request = envelope(workspaceId, register);
     const first = await user.command(request);

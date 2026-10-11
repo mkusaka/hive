@@ -20,6 +20,7 @@ import {
   RoutineRun,
   RoutineUpdate,
   SidebarUpdate,
+  WorkspaceCreate,
 } from "@hive/contracts";
 import * as v from "valibot";
 import type { ApiResult } from "../shared/api.ts";
@@ -54,6 +55,7 @@ export const UiCommandSchema = commandEnvelope(
     RoutineResume,
     RoutineRun,
     SidebarUpdate,
+    WorkspaceCreate,
   ]),
 );
 
@@ -118,3 +120,79 @@ export const executorHandlers = (program: string[], registered: () => Promise<bo
   /** `launchctl bootout` only: the plist stays, so the next app start brings the service back. */
   stop: () => toResult(service.stop),
 });
+
+/** An https API URL, or http://localhost for `wrangler dev`. */
+const ApiUrl = v.pipe(
+  v.string(),
+  v.trim(),
+  v.maxLength(2048),
+  v.check((value) => {
+    try {
+      const url = new URL(value);
+      return (
+        url.protocol === "https:" || (url.protocol === "http:" && url.hostname === "localhost")
+      );
+    } catch {
+      return false;
+    }
+  }, "must be an https URL (or http://localhost)"),
+);
+
+/** `config.set` input: what the Welcome screen saves to the shared credentials file. */
+export const ConfigSet = v.pipe(
+  v.strictObject({
+    apiUrl: v.optional(ApiUrl),
+    workspaceId: v.optional(v.pipe(v.string(), v.trim(), v.minLength(1), v.maxLength(200))),
+  }),
+  v.check((patch) => Object.keys(patch).length > 0, "nothing to set"),
+);
+
+export const DeviceRegisterInput = v.strictObject({
+  name: v.pipe(v.string(), v.trim(), v.minLength(1), v.maxLength(200)),
+});
+
+/**
+ * Welcome / sign-out IPC. `cli` runs a `hive` command (the CLI's own `run` + deps in main, a fake in tests) and returns
+ * its exit code and stderr lines; stdout is dropped because `device register` prints the device token.
+ */
+export const setupHandlers = (opts: {
+  save(patch: v.InferOutput<typeof ConfigSet>): Promise<unknown>;
+  cli(argv: string[]): Promise<{ code: number; stderr: string[] }>;
+  os: string;
+  agentVersion: string;
+  /** The executor service reconcile after a registration. */
+  reconcile(): Promise<void>;
+}) => {
+  const cli = async (argv: string[]) => {
+    const { code, stderr } = await opts.cli(argv);
+    if (code !== 0) throw new CliError("COMMAND_FAILED", code, stderr.join("\n"));
+    return {};
+  };
+  return {
+    configSet: (input: unknown) => {
+      const parsed = parse(ConfigSet, input);
+      if (!parsed.ok) return Promise.resolve(invalid(parsed.issues));
+      return toResult(async () => (await opts.save(parsed.value), {}));
+    },
+    logout: () => toResult(() => cli(["logout"])),
+    deviceRegister: (input: unknown) => {
+      const parsed = parse(DeviceRegisterInput, input);
+      if (!parsed.ok) return Promise.resolve(invalid(parsed.issues));
+      const { name } = parsed.value;
+      return toResult(async () => {
+        await cli([
+          "device",
+          "register",
+          "--name",
+          name,
+          "--os",
+          opts.os,
+          "--agent-version",
+          opts.agentVersion,
+        ]);
+        await opts.reconcile();
+        return {};
+      });
+    },
+  };
+};

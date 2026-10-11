@@ -24,6 +24,8 @@ type Options = {
   command?: (envelope: UiCommand) => ApiResult | undefined;
   config?: Partial<HiveConfig>;
   executor?: Record<string, unknown>;
+  /** `login()`'s answer (default ok); `never` keeps it pending. */
+  login?: Awaited<ReturnType<HiveApi["login"]>> | "never";
 };
 
 const ok = (value: Record<string, unknown>): ApiResult => ({ ok: true, value });
@@ -35,6 +37,21 @@ export const fakeHive = (options: Options = {}) => {
     get: [] as string[],
     command: [] as UiCommand[],
     executor: [] as unknown[],
+    /** config.set patches, device.register inputs, logins and logouts, in order. */
+    setup: [] as unknown[],
+  };
+  // Like main: each Welcome step changes what the next getConfig returns.
+  const config: HiveConfig = {
+    apiUrl: "https://hive.test",
+    workspaceId: ws,
+    problem: null,
+    loginRequired: false,
+    deviceRegistered: true,
+    workspaces: [],
+    hostname: "test-pc",
+    defaultApiUrl: "",
+    connection: "connected",
+    ...options.config,
   };
   const listeners = new Set<(event: RealtimeEvent) => void>();
   const hive: HiveApi = {
@@ -66,20 +83,35 @@ export const fakeHive = (options: Options = {}) => {
       listeners.add(cb);
       return () => void listeners.delete(cb);
     },
-    getConfig: async () => ({
-      apiUrl: "https://hive.test",
-      workspaceId: ws,
-      problem: null,
-      loginRequired: false,
-      connection: "connected",
-      ...options.config,
-    }),
-    login: async () => ({ ok: true }),
+    getConfig: async () => ({ ...config }),
+    setConfig: async (patch) => {
+      calls.setup.push({ set: patch });
+      Object.assign(config, patch);
+      return ok({});
+    },
+    login: async () => {
+      calls.setup.push("login");
+      const answer = options.login ?? { ok: true };
+      if (answer === "never") return new Promise(() => {});
+      if (answer.ok) config.loginRequired = false;
+      return answer;
+    },
+    logout: async () => {
+      calls.setup.push("logout");
+      config.loginRequired = true;
+      return ok({});
+    },
+    registerDevice: async (input) => {
+      calls.setup.push({ register: input });
+      config.deviceRegistered = true;
+      return ok({});
+    },
   };
   window.hive = hive;
   return {
     routes,
     calls,
+    config,
     emit: (event: RealtimeEvent) => listeners.forEach((cb) => cb(event)),
     /** Commands of one type, without the random operation / idempotency ids. */
     sent: (type: string) =>

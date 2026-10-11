@@ -116,7 +116,7 @@ export const executorStatus = {
 
 export const routes = (): Routes => ({
   "/v1/sync/changes": { changes: [], cursor: "H0", hasMore: false },
-  "/v1/me": { userId: me },
+  "/v1/me": { userId: me, label: "you@example.test" },
   "/v1/channels": { channels },
   "/v1/dms": { dms: [] },
   "/v1/bots": { bots },
