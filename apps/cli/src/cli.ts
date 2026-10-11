@@ -21,10 +21,12 @@ export type Deps = {
   readInput(path: string): Promise<string>;
   stdout(line: string): void;
   stderr(line: string): void;
-  runExecutor(cloud: CloudClient, once: boolean): Promise<unknown>;
+  runExecutor(cloud: CloudClient, once: boolean, provider: Provider): Promise<unknown>;
   /** Watch interval; 2 s by default. */
   pollMs?: number;
 };
+
+export type Provider = "fake" | "claude";
 
 type Values = Record<string, string | boolean | (string | boolean)[] | undefined>;
 type Ctx = {
@@ -101,17 +103,30 @@ const specs: Record<string, Spec> = {
       c.print(await cmd.channelCreate(c.client(), c.envelope(), need(c.values, "name"))),
   },
   "bot create": {
-    usage: "--name <name> [--allowed-device <device-id>]...",
-    options: { name: str, "allowed-device": { type: "string", multiple: true } },
-    run: async (c) =>
+    usage:
+      "--name <name> [--allowed-device <device-id>]... [--instructions <text> | --instructions-file <path|->]",
+    options: {
+      name: str,
+      "allowed-device": { type: "string", multiple: true },
+      instructions: str,
+      "instructions-file": str,
+    },
+    run: async (c) => {
+      const { instructions, "instructions-file": file } = c.values;
+      if (instructions !== undefined && file !== undefined)
+        throw invalid("use --instructions or --instructions-file, not both");
       c.print(
         await cmd.botCreate(
           c.client(),
           c.envelope(),
           need(c.values, "name"),
           c.values["allowed-device"] as string[] | undefined,
+          typeof file === "string"
+            ? await c.deps.readInput(file)
+            : (instructions as string | undefined),
         ),
-      ),
+      );
+    },
   },
   "agent send": {
     usage: "<bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]",
@@ -307,9 +322,12 @@ const specs: Record<string, Spec> = {
     },
   },
   "executor run": {
-    usage: "[--once]",
-    options: { once: flag },
+    usage: "[--once] [--provider fake|claude]",
+    options: { once: flag, provider: { type: "string", default: "fake" } },
     run: async (c) => {
+      const provider = c.values.provider;
+      if (provider !== "fake" && provider !== "claude")
+        throw invalid("--provider must be fake or claude");
       const token = c.creds.deviceToken;
       if (!token)
         throw new CliError("UNAUTHENTICATED", 3, "no deviceToken: run `hive device register`");
@@ -329,7 +347,9 @@ const specs: Record<string, Spec> = {
           return cloud.listQueuedJobs(limit);
         },
       };
-      c.print((await c.deps.runExecutor(pumping, c.values.once === true)) ?? { claimed: null });
+      c.print(
+        (await c.deps.runExecutor(pumping, c.values.once === true, provider)) ?? { claimed: null },
+      );
     },
   },
 };

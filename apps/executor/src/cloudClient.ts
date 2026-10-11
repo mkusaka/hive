@@ -7,6 +7,8 @@ import type {
   JobClaimed,
   LeaseRenewed,
   QueuedJob,
+  RunContext,
+  RunObservation,
 } from "@hive/contracts";
 
 // No parameter properties: Node's type stripping rejects them.
@@ -35,8 +37,15 @@ export type CloudClient = {
     state: "succeeded" | "failed";
     summary: string;
     error?: string;
+    reply?: { conversationId: string; text: string };
   }): Promise<void>;
   getRun(runId: string): Promise<ExecutorRun>;
+  getRunContext(input: {
+    jobId: string;
+    runId: string;
+    executionGeneration: number;
+  }): Promise<RunContext>;
+  observe(input: RunObservation): Promise<void>;
 };
 
 export const createCloudClient = ({
@@ -108,5 +117,16 @@ export const createCloudClient = ({
       );
     },
     getRun: (runId) => request("GET", `/v1/executor/runs/${encodeURIComponent(runId)}`),
+    getRunContext: ({ jobId, runId, executionGeneration }) =>
+      request(
+        "GET",
+        `/v1/executor/jobs/${encodeURIComponent(jobId)}/context?${new URLSearchParams({
+          runId,
+          executionGeneration: String(executionGeneration),
+        })}`,
+      ),
+    observe: async (input) => {
+      await request("POST", "/v1/executor/observations", input);
+    },
   };
 };

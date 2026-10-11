@@ -306,4 +306,36 @@ describe("output and credentials", () => {
       ["GET", "/v1/executor/jobs?state=queued&limit=10", "Bearer d-1.secret"],
     ]);
   });
+
+  it("bot create sends instructions inline or from a file, not both", async () => {
+    const h = harness();
+    expect(await h.hive("bot", "create", "--name", "b", "--instructions", "Be brief.")).toBe(0);
+    expect(await h.hive("bot", "create", "--name", "b", "--instructions-file", "-")).toBe(0);
+    expect(h.calls.map((c) => (c.body as { command: Record<string, unknown> }).command)).toEqual([
+      { type: "bot.create", name: "b", instructions: "Be brief." },
+      { type: "bot.create", name: "b", instructions: "" },
+    ]);
+    expect(
+      await h.hive(
+        "bot",
+        "create",
+        "--name",
+        "b",
+        "--instructions",
+        "x",
+        "--instructions-file",
+        "-",
+      ),
+    ).toBe(2);
+  });
+
+  it("executor run passes --provider through and rejects unknown providers", async () => {
+    const h = harness(undefined, { creds: { deviceToken: "d-1.secret" } });
+    const providers: string[] = [];
+    h.deps.runExecutor = async (_cloud, _once, provider) => void providers.push(provider);
+    expect(await h.hive("executor", "run", "--once", "--provider", "claude")).toBe(0);
+    expect(await h.hive("executor", "run", "--once")).toBe(0);
+    expect(await h.hive("executor", "run", "--provider", "codex")).toBe(2);
+    expect(providers).toEqual(["claude", "fake"]);
+  });
 });

@@ -14,7 +14,7 @@ hive workspace create --id <id> --name <name>          # stores apiUrl + workspa
 hive device register --name <n> --os <os> --agent-version <v>
                                                        # prints the token once, stores it for `executor run`
 hive channel create --name <name>
-hive bot create --name <name> [--allowed-device <device-id>]...
+hive bot create --name <name> [--allowed-device <device-id>]... [--instructions <text> | --instructions-file <path|->]
 hive agent send <bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]
 hive event emit <type> [--data-file <path|->] [--subject <kind:id>]
 hive op get <operation-id>
@@ -23,7 +23,7 @@ hive job watch <job-id> [--timeout <s>]                # polls GET /v1/jobs/:id 
 hive inbox list --bot <bot-id>
 hive channel list | hive bot list | hive device list   # bootstrap lists of the workspace
 hive sync changes [--cursor <cursor>]                  # without --cursor: the bootstrap cursor
-hive executor run [--once]                             # Local Executor (fake provider) with the stored token
+hive executor run [--once] [--provider fake|claude]    # Local Executor with the stored token (default fake)
 hive project create --key <KEY> --name <name>
 hive task create (--project <KEY> | --parent <task>) --title <title> [--priority <n>]
 hive task list [--project <KEY>] [--status <status>]
@@ -47,7 +47,8 @@ a fresh UUID per invocation).
   Job, so `--notify --wait` is invalid. A timeout never cancels the Job. The default timeout is 300 s.
 - **`event emit`** reads JSON from `--data-file` (`-` is stdin); without it `data` is `{}`.
 - **`executor run`** wraps `runLoop` from `@hive/executor` with the credentials' `deviceToken`; the journal lives in
-  `<config dir>/hive/executor/`. `FAKE_DELAY_MS` / `FAKE_FAIL=1` tune the fake provider. Before each poll it calls
+  `<config dir>/hive/executor/` (Claude transcripts under `transcripts/`, run cwd under `runs/`; see
+  `apps/executor/README.md`). `FAKE_DELAY_MS` / `FAKE_FAIL=1` tune the fake provider. Before each poll it calls
   `POST /v1/executor/pump`, because no Queue consumer exists yet and `wrangler dev` fires no cron.
 
 ## Credentials

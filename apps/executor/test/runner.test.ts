@@ -3,64 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { fakeAdapter } from "../src/adapters/fake.ts";
-import { CloudError, type CloudClient } from "../src/cloudClient.ts";
 import { fileJournal } from "../src/journal.ts";
 import { type AgentAdapter, type JournalEntry, reconcile, runOnce } from "../src/runner.ts";
-
-const memoryJournal = (entries: JournalEntry[] = []) => ({
-  entries,
-  append: async (entry: JournalEntry) => void entries.push(entry),
-  readAll: async () => [...entries],
-});
-
-const lease = () => new Date(Date.now() + 40).toISOString();
-const stale = () => new CloudError(409, "STALE_GENERATION", "stale", "stale_generation");
-
-// In-memory cloud: one queued Job, a short lease so renewals happen within the fake's delay.
-const fakeCloud = (overrides: Partial<CloudClient> = {}) => {
-  const calls: string[] = [];
-  const submitted: unknown[] = [];
-  const cloud: CloudClient = {
-    heartbeat: async () => void calls.push("heartbeat"),
-    listQueuedJobs: async () => [
-      {
-        id: "job-1",
-        botId: "bot-1",
-        revision: 1,
-        inboxItemId: "inbox-1",
-        placement: {} as never,
-        createdAt: "",
-      },
-    ],
-    claim: async () => {
-      calls.push("claim");
-      return {
-        runId: "run-1",
-        executionId: "exec-1",
-        executionGeneration: 1,
-        leaseExpiresAt: lease(),
-        job: { id: "job-1", botId: "bot-1", inboxItemId: "inbox-1", placement: {} as never },
-      };
-    },
-    renewLease: async () => {
-      calls.push("renew");
-      return { leaseExpiresAt: lease() };
-    },
-    submitResult: async (input) => {
-      calls.push("submit");
-      submitted.push(input);
-    },
-    getRun: async (runId) => ({
-      id: runId,
-      jobId: "job-1",
-      state: "running",
-      executionGeneration: 1,
-      active: true,
-    }),
-    ...overrides,
-  };
-  return { cloud, calls, submitted };
-};
+import { fakeCloud, memoryJournal, stale } from "./helpers.ts";
 
 describe("runOnce", () => {
   it("claims, journals the intent before starting, renews the lease and submits the result", async () => {
@@ -77,7 +22,7 @@ describe("runOnce", () => {
     const result = await runOnce({ cloud, journal, adapter });
 
     expect(result).toEqual({ runId: "run-1", jobId: "job-1", state: "succeeded" });
-    expect(calls.slice(0, 2)).toEqual(["heartbeat", "claim"]);
+    expect(calls.slice(0, 3)).toEqual(["heartbeat", "claim", "context"]);
     expect(calls).toContain("renew");
     expect(calls.at(-1)).toBe("submit");
     expect(submitted).toEqual([

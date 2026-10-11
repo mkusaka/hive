@@ -10,9 +10,11 @@ import {
   type QueuedJob,
   type RunLeaseRenew,
   type RunResultAccepted,
+  type RunContext,
+  type RunObservation,
   type RunResultSubmit,
 } from "@hive/contracts";
-import { appendChange, claimJob, finishRun, renewLease } from "@hive/db";
+import { appendChange, claimJob, finishRun, insertMessage, renewLease } from "@hive/db";
 import type * as v from "valibot";
 import type { Principal } from "./auth/principal.ts";
 import { HttpError } from "./errors.ts";
@@ -30,6 +32,7 @@ type Handler<T extends Command> = (
 /** docs/roadmap.md §1 defaults. */
 export const leaseSeconds = 90;
 const activeRunStates = new Set(["starting", "running", "waiting_approval", "stopping"]);
+const activeRunStatesSql = `(${[...activeRunStates].map((s) => `'${s}'`).join(", ")})`;
 
 /**
  * Placement (§10.2) as a safety constraint: a non-empty `allowedDeviceIds` is always intersected, whatever
@@ -124,14 +127,20 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
   // The trigger item's channel names its change scope; an item without a conversation is workspace-wide.
   const item = await db
     .prepare(
-      `SELECT i.id, c.channel_id FROM runs r
+      `SELECT i.id, i.conversation_id, c.channel_id, b.actor_id FROM runs r
          JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
+         JOIN bots b ON b.workspace_id = j.workspace_id AND b.id = j.bot_id
          JOIN inbox_items i ON i.workspace_id = j.workspace_id AND 'inbox:' || i.id = j.trigger_key
          LEFT JOIN conversations c ON c.workspace_id = i.workspace_id AND c.id = i.conversation_id
         WHERE r.id = ? AND r.workspace_id = ?`,
     )
     .bind(command.runId, workspaceId)
-    .first<{ id: string; channel_id: string | null }>();
+    .first<{
+      id: string;
+      conversation_id: string | null;
+      channel_id: string | null;
+      actor_id: string;
+    }>();
   const itemScope = item?.channel_id ? `channel:${item.channel_id}` : `workspace:${workspaceId}`;
   const inboxOutcome = db
     .prepare(
@@ -173,6 +182,31 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
         }),
       ]
     : [];
+  // The Run's capability decides where the Bot may reply: only in its trigger item's Conversation (§8.1).
+  const { reply } = command;
+  if (reply && (!item?.channel_id || item.conversation_id !== reply.conversationId)) {
+    throw new HttpError("FORBIDDEN", "reply must go to the trigger item's conversation");
+  }
+  const messageId = crypto.randomUUID();
+  const replyMessage =
+    reply && item?.channel_id
+      ? [
+          insertMessage(db, {
+            id: messageId,
+            workspaceId,
+            conversationId: reply.conversationId,
+            actorId: item.actor_id,
+            clientMessageId: `run:${command.runId}`,
+            body: reply.text,
+          }),
+          appendChange(db, {
+            workspaceId,
+            entityKind: "message",
+            entityId: messageId,
+            scope: itemScope,
+          }),
+        ]
+      : [];
   const result = await finishRun(db, {
     runId: command.runId,
     deviceId: device.deviceId,
@@ -184,6 +218,7 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
     statements: item
       ? [
           ...taskResult,
+          ...replyMessage,
           inboxOutcome,
           appendChange(db, {
             workspaceId,
@@ -244,6 +279,119 @@ export const getExecutorRun = async (db: D1Database, device: Device, id: string)
     active: activeRunStates.has(row.state),
   };
   return run;
+};
+
+/** Fenced: the device's own active Run of `jobId` at `executionGeneration`, else 404 / 409. */
+const fencedRun = async (
+  db: D1Database,
+  device: Device,
+  fence: { runId: string; executionGeneration: number; jobId?: string },
+) => {
+  const run = await db
+    .prepare(
+      "SELECT job_id, state, execution_generation FROM runs WHERE id = ? AND workspace_id = ? AND device_id = ?",
+    )
+    .bind(fence.runId, device.workspaceIds[0], device.deviceId)
+    .first<{ job_id: string; state: string; execution_generation: number }>();
+  if (!run || (fence.jobId !== undefined && run.job_id !== fence.jobId)) {
+    throw new HttpError("NOT_FOUND", "run not found");
+  }
+  if (run.execution_generation !== fence.executionGeneration || !activeRunStates.has(run.state)) {
+    throw staleGeneration();
+  }
+  return run;
+};
+
+/** Run context (SDK-01): Bot instructions, Task, recent Conversation and the trigger item's body. */
+export const getRunContext = async (
+  db: D1Database,
+  device: Device,
+  input: { jobId: string; runId: string; executionGeneration: number },
+): Promise<RunContext> => {
+  await fencedRun(db, device, input);
+  const workspaceId = device.workspaceIds[0];
+  const row = await db
+    .prepare(
+      `SELECT b.id AS bot_id, b.name, b.instructions, t.key, t.title, t.description,
+              i.id AS item_id, i.conversation_id, c.channel_id,
+              COALESCE(m.body, e.data) AS body
+         FROM jobs j
+         JOIN bots b ON b.workspace_id = j.workspace_id AND b.id = j.bot_id
+         LEFT JOIN tasks t ON t.workspace_id = j.workspace_id AND t.id = j.task_id
+         LEFT JOIN inbox_items i ON i.workspace_id = j.workspace_id AND 'inbox:' || i.id = j.trigger_key
+         LEFT JOIN conversations c ON c.workspace_id = i.workspace_id AND c.id = i.conversation_id
+         LEFT JOIN events e ON e.workspace_id = i.workspace_id AND e.id = i.input_id
+         LEFT JOIN messages m ON m.workspace_id = e.workspace_id AND e.subject_kind = 'message'
+                             AND m.id = e.subject_id
+        WHERE j.workspace_id = ? AND j.id = ?`,
+    )
+    .bind(workspaceId, input.jobId)
+    .first<{
+      bot_id: string;
+      name: string;
+      instructions: string;
+      key: string | null;
+      title: string | null;
+      description: string | null;
+      item_id: string | null;
+      conversation_id: string | null;
+      channel_id: string | null;
+      body: string | null;
+    }>();
+  if (!row) throw new HttpError("NOT_FOUND", "job not found");
+  let conversation: RunContext["conversation"] = null;
+  if (row.conversation_id && row.channel_id) {
+    const { results } = await db
+      .prepare(
+        `SELECT actorKind, actorId, body, createdAt FROM (
+           SELECT a.kind AS actorKind, a.id AS actorId, m.body, m.created_at AS createdAt, m.seq
+             FROM messages m JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+            WHERE m.workspace_id = ? AND m.conversation_id = ? ORDER BY m.seq DESC LIMIT 20
+         ) ORDER BY seq`,
+      )
+      .bind(workspaceId, row.conversation_id)
+      .all<NonNullable<RunContext["conversation"]>["recent"][number]>();
+    conversation = {
+      id: row.conversation_id,
+      channelId: row.channel_id,
+      recent: results,
+    };
+  }
+  return {
+    bot: { id: row.bot_id, name: row.name, instructions: row.instructions },
+    task:
+      row.key === null
+        ? null
+        : { key: row.key, title: row.title ?? "", description: row.description ?? "" },
+    conversation,
+    inboxItem: row.item_id ? { id: row.item_id, body: row.body ?? "" } : null,
+  };
+};
+
+/** Executor observations (§9.2 step 7). Only `runtime.run.started` is stored, fenced like a renew. */
+export const recordObservation = async (db: D1Database, device: Device, input: RunObservation) => {
+  const providerSessionId = input.payload?.providerSessionId;
+  if (input.kind !== "runtime.run.started") return { status: 202 as const, body: { ok: true } };
+  if (typeof providerSessionId !== "string" || providerSessionId === "") {
+    throw new HttpError("INVALID_INPUT", "payload.providerSessionId is required");
+  }
+  const { meta } = await db
+    .prepare(
+      `UPDATE runs SET provider_session_id = ?, updated_at = ?
+        WHERE id = ? AND workspace_id = ? AND device_id = ? AND execution_generation = ?
+          AND state IN ${activeRunStatesSql}`,
+    )
+    .bind(
+      providerSessionId,
+      new Date().toISOString(),
+      input.runId,
+      device.workspaceIds[0],
+      device.deviceId,
+      input.executionGeneration,
+    )
+    .run();
+  if (meta.changes === 0) await fencedRun(db, device, input);
+  return { status: 200 as const, body: { ok: true } };
 };
 
 export const heartbeat = async (db: D1Database, device: Device) => {

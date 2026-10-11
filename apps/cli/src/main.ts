@@ -4,6 +4,7 @@ import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { text } from "node:stream/consumers";
+import { claudeAdapter } from "@hive/executor/adapters/claude";
 import { fakeAdapter } from "@hive/executor/adapters/fake";
 import { fileJournal } from "@hive/executor/journal";
 import { runLoop } from "@hive/executor/runner";
@@ -49,15 +50,18 @@ process.exitCode = await run(process.argv.slice(2), {
   readInput: (path) => (path === "-" ? text(process.stdin) : readFile(path, "utf8")),
   stdout: (line) => console.log(line),
   stderr: (line) => console.error(line),
-  runExecutor: async (cloud, once) =>
+  runExecutor: async (cloud, once, provider) =>
     runLoop(
       {
         cloud,
         journal: await fileJournal(join(dir, "executor")),
-        adapter: fakeAdapter({
-          delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
-          fail: process.env.FAKE_FAIL === "1",
-        }),
+        adapter:
+          provider === "claude"
+            ? claudeAdapter({ stateDir: join(dir, "executor") })
+            : fakeAdapter({
+                delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
+                fail: process.env.FAKE_FAIL === "1",
+              }),
       },
       // docs/roadmap.md §1: executor Job reconcile every 30 s (no WebSocket yet).
       { once, pollMs: 30_000 },

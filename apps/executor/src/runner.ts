@@ -2,6 +2,7 @@
 // result, renewing the lease while the agent runs. Web-standard APIs only; the journal is injected.
 // Claims, runs and reconciles are sequential on purpose: one Run at a time per executor (capacity 1).
 /* oxlint-disable no-await-in-loop */
+import type { RunContext } from "@hive/contracts";
 import { CloudError, type CloudClient } from "./cloudClient.ts";
 
 export type JournalEntry =
@@ -22,15 +23,27 @@ export type Journal = {
 };
 
 // The subset of the §20.4 adapter contract the runner uses.
-export type LaunchContext = {
+export type ClaimedRun = {
   runId: string;
   jobId: string;
   executionGeneration: number;
   inboxItemId: string | null;
 };
+export type LaunchContext = ClaimedRun & {
+  /** From `GET /v1/executor/jobs/:id/context`, fetched after the claim. */
+  context: RunContext;
+  /** Sends a fenced runtime observation for this Run (§9.2 step 7). */
+  observe(kind: string, payload: Record<string, unknown>): Promise<void>;
+};
 export type RunningAgent = {
   requestStop(reason: string): Promise<void>;
-  waitForExit(): Promise<{ code: number | null; reason: string; summary: string }>;
+  /** `replyText` is posted to the trigger Conversation as the Bot's message. */
+  waitForExit(): Promise<{
+    code: number | null;
+    reason: string;
+    summary: string;
+    replyText?: string;
+  }>;
 };
 export type AgentAdapter = { start(input: LaunchContext): Promise<RunningAgent> };
 
@@ -43,9 +56,14 @@ const isStale = (error: unknown) =>
  * Runs one claimed (or resumed) Run to its result. Records the launch intent before starting the agent and
  * renews the lease every quarter of its remaining time. A stale generation stops the agent and submits nothing.
  */
-const execute = async (deps: RunnerDeps, ctx: LaunchContext, leaseExpiresAt: string) => {
+const execute = async (deps: RunnerDeps, claimed: ClaimedRun, leaseExpiresAt: string) => {
   const { cloud, journal } = deps;
-  const fence = { runId: ctx.runId, executionGeneration: ctx.executionGeneration };
+  const fence = { runId: claimed.runId, executionGeneration: claimed.executionGeneration };
+  const ctx: LaunchContext = {
+    ...claimed,
+    context: await cloud.getRunContext({ jobId: claimed.jobId, ...fence }),
+    observe: (kind, payload) => cloud.observe({ ...fence, kind, payload }),
+  };
   await journal.append({ kind: "intent", runId: ctx.runId });
   const agent = await deps.adapter.start(ctx);
 
@@ -62,6 +80,7 @@ const execute = async (deps: RunnerDeps, ctx: LaunchContext, leaseExpiresAt: str
   const exit = await agent.waitForExit().finally(() => clearInterval(timer));
 
   const outcome = exit.code === 0 ? "succeeded" : "failed";
+  const conversation = ctx.context.conversation;
   if (!stale) {
     try {
       await cloud.submitResult({
@@ -69,6 +88,9 @@ const execute = async (deps: RunnerDeps, ctx: LaunchContext, leaseExpiresAt: str
         state: outcome,
         summary: exit.summary,
         ...(outcome === "failed" ? { error: exit.reason } : {}),
+        ...(exit.replyText && conversation
+          ? { reply: { conversationId: conversation.id, text: exit.replyText } }
+          : {}),
       });
     } catch (error) {
       if (!isStale(error)) throw error;
@@ -125,7 +147,7 @@ export const runOnce = async (deps: RunnerDeps) => {
         throw error;
       });
     if (!claim) continue;
-    const ctx: LaunchContext = {
+    const ctx: ClaimedRun = {
       runId: claim.runId,
       jobId: claim.job.id,
       executionGeneration: claim.executionGeneration,

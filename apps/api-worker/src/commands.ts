@@ -285,9 +285,16 @@ const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env
         .bind(actorId, workspaceId, command.name),
       db
         .prepare(
-          "INSERT INTO bots (id, workspace_id, actor_id, name, placement_policy) VALUES (?, ?, ?, ?, ?)",
+          "INSERT INTO bots (id, workspace_id, actor_id, name, placement_policy, instructions) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(botId, workspaceId, actorId, command.name, JSON.stringify(command.placementPolicy)),
+        .bind(
+          botId,
+          workspaceId,
+          actorId,
+          command.name,
+          JSON.stringify(command.placementPolicy),
+          command.instructions,
+        ),
     ],
     { operationId: env.operationId, status: "accepted", botId },
     [{ entityKind: "bot", entityId: botId, revision: 1, scope: `workspace:${workspaceId}` }],

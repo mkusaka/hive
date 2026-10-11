@@ -13,13 +13,18 @@ Updated per ticket. See [the ticket DAG](#ticket-dag) for dependencies.
 | EXEC-01   | done    | `job.claim` / `run.lease.renew` / `run.result.submit`, heartbeat, `apps/executor` poll runner + journal + fake adapter; no supervisor                                                                                   |
 | CLI-01    | done    | `apps/cli` `hive` (workspace/device/channel/bot, agent send --wait, event emit, op/job/inbox, executor run), `ACCESS_DEV_JWKS` + `dev-token.ts`; **Phase 1 complete**; no OAuth login / op store / offline queue        |
 | SYNC-01   | done    | `change_log` in command batches, `GET /v1/sync/changes` (cursor, auth epoch, 410), list routes, Realtime DO; G-04 not run; no revocation                                                                                |
-| SDK-01    | pending |                                                                                                                                                                                                                         |
+| SDK-01    | done    | Claude adapter (SDK 0.3.289, no tools), JSONL transcript journal, run context route, Bot reply, `runtime.run.started` observation; no R2 / SessionStore / tool broker / Codex                                           |
 | UI-01     | done    | `apps/desktop` Electron + React: Channel / Inbox / Activity / Devices views, sync cursor + Realtime via main, typed IPC; no OAuth login, no approval view, no Run inspector, no threads                                 |
 | WORK-01   | done    | Projects, Tasks, dependency DAG (cycle check incl. parent/child), `job.start`, Execution → Task, Task Results, `declaration` completion; no human/checks/children policies, `task.replan`, delegation, Git/PR collector |
 | INTEG-01  | pending |                                                                                                                                                                                                                         |
 | MOBILE-01 | pending |                                                                                                                                                                                                                         |
 
-Gates G-01..G-10: **none executed yet.**
+Gates: **G-01 executed 2026-10-11, passed** on the owner's Mac: `hive agent send` → `hive executor run --once
+--provider claude` → reply posted in the channel. The SDK subprocess authenticated with the Claude subscription
+login of the inherited `CLAUDE_CONFIG_DIR` (no extra env, no API key): `system/init.apiKeySource` was `none`
+(OAuth) and the stream carried a `rate_limit_event` with subscription windows (`five_hour`, `seven_day`), which
+identifies the billing mode. Result: 1 turn, 1.5 s SDK duration, 5 s executor wall time, 2 input / 12 output /
+582 cache-creation tokens, estimated list cost 0.012 USD. G-02..G-10 not executed.
 
 ## 1. Initial defaults (§29)
 
@@ -50,7 +55,7 @@ are not baked into settings; the runbook records the values in effect when adopt
 
 ## 2. Verification gates (§30.1)
 
-> **Not yet executed.** Every gate requires the owner's real accounts, Cloudflare environment or devices.
+> **Only G-01 executed (2026-10-11, passed; see Status).** Every gate requires the owner's real accounts, Cloudflare environment or devices.
 > A capability whose gate has not passed is shown as unavailable in UI / adapters. An option existing in an
 > SDK does not count as accepted.
 
@@ -218,17 +223,17 @@ Android OAuth risk is retired in Phase 0.
 
 ### 7.1 Ticket DAG (§33.1)
 
-| Ticket    | Deliverable                                           | Depends on        |
-| --------- | ----------------------------------------------------- | ----------------- |
-| BOOT-01   | Monorepo / contracts / CI / local environments        | —                 |
-| AUTH-01   | Access user login / device identity / principal model | BOOT-01           |
-| DB-01     | Migrations / critical atomic repository / receipts    | BOOT-01           |
-| EVENT-01  | Event schema / ingest / outbox / consumer receipts    | AUTH-01, DB-01    |
-| EXEC-01   | Inbox / Job / claim / lease / fake executor           | EVENT-01          |
-| CLI-01    | send / emit / start / watch / JSON contract           | AUTH-01, EXEC-01  |
-| SYNC-01   | Change log / HTTP cursor / Realtime DO                | DB-01, AUTH-01    |
-| SDK-01    | Claude adapter / local journal / SessionStore test    | EXEC-01           |
-| UI-01     | Electron Channel / Activity / Approval views          | SYNC-01, SDK-01   |
-| WORK-01   | Project / Task / Assignment / DAG / Execution links   | EXEC-01           |
-| INTEG-01  | GitHub + Slack normalization / Subscription UI        | EVENT-01, WORK-01 |
-| MOBILE-01 | Android auth / sync / push / approval                 | AUTH-01, SYNC-01  |
+| Ticket    | Deliverable                                           | Depends on                                                                                                                                                                    |
+| --------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| BOOT-01   | Monorepo / contracts / CI / local environments        | —                                                                                                                                                                             |
+| AUTH-01   | Access user login / device identity / principal model | BOOT-01                                                                                                                                                                       |
+| DB-01     | Migrations / critical atomic repository / receipts    | BOOT-01                                                                                                                                                                       |
+| EVENT-01  | Event schema / ingest / outbox / consumer receipts    | AUTH-01, DB-01                                                                                                                                                                |
+| EXEC-01   | Inbox / Job / claim / lease / fake executor           | EVENT-01                                                                                                                                                                      |
+| CLI-01    | send / emit / start / watch / JSON contract           | AUTH-01, EXEC-01                                                                                                                                                              |
+| SYNC-01   | Change log / HTTP cursor / Realtime DO                | DB-01, AUTH-01                                                                                                                                                                |
+| SDK-01    | done                                                  | Claude adapter (SDK 0.3.289, no tools), JSONL transcript journal, run context route, Bot reply, `runtime.run.started` observation; no R2 / SessionStore / tool broker / Codex |
+| UI-01     | Electron Channel / Activity / Approval views          | SYNC-01, SDK-01                                                                                                                                                               |
+| WORK-01   | Project / Task / Assignment / DAG / Execution links   | EXEC-01                                                                                                                                                                       |
+| INTEG-01  | GitHub + Slack normalization / Subscription UI        | EVENT-01, WORK-01                                                                                                                                                             |
+| MOBILE-01 | Android auth / sync / push / approval                 | AUTH-01, SYNC-01                                                                                                                                                              |

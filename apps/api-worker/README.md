@@ -5,30 +5,32 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 
 ## Routes
 
-| Route                                            | Auth                                   | Purpose                                                                                        |
-| ------------------------------------------------ | -------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `GET /healthz`                                   | none                                   | Liveness                                                                                       |
-| `GET /v1/me`                                     | Access assertion (user)                | Returns the user principal (CLI login check)                                                   |
-| `POST /v1/commands`                              | Access assertion (user)                | Command intake (see below)                                                                     |
-| `GET /v1/operations/:id`                         | Access assertion (user)                | Receipt of the user's command; for `agent.send` also the inbox item, routing status and Job id |
-| `GET /v1/jobs/:id`                               | Access assertion (user)                | A Job in one of the user's Workspaces                                                          |
-| `GET /v1/inbox?botId=`                           | Access assertion (user)                | The Bot's inbox items (first 100, no cursor yet)                                               |
-| `GET /v1/channels?workspaceId=`                  | Access assertion (user)                | Channels the user is a member of, with the main `conversationId` (max 500)                     |
-| `GET /v1/channels/:id/messages`                  | Access assertion (user)                | Newest-first messages of a member channel (limit 1..200, default 50; 404 if not a member)      |
-| `GET /v1/bots?workspaceId=`                      | Access assertion (user)                | Bots of the Workspace (max 500)                                                                |
-| `GET /v1/devices?workspaceId=`                   | Access assertion (user)                | Devices of the Workspace, no credentials (max 500)                                             |
-| `GET /v1/jobs?limit=`                            | Access assertion (user)                | Newest-first Jobs (limit 1..200, default 50)                                                   |
-| `GET /v1/projects?workspaceId=`                  | Access assertion (user)                | Projects of the Workspace (max 500)                                                            |
-| `GET /v1/tasks?workspaceId=&projectKey=&status=` | Access assertion (user)                | Tasks with computed `display` and `prerequisites` (max 500); see Work below                    |
-| `GET /v1/tasks/:id`                              | Access assertion (user)                | A Task with prerequisites, dependents, Results and Jobs                                        |
-| `GET /v1/sync/changes?cursor=`                   | Access assertion (user)                | Permitted changes after the cursor (limit 1..500, default 100); see Sync below                 |
-| `GET /v1/realtime?workspaceId=`                  | Access assertion, or device Bearer     | WebSocket upgrade to the Workspace's Realtime DO; see Realtime below                           |
-| `GET /v1/executor/me`                            | `Authorization: Bearer <device-token>` | Returns the device principal                                                                   |
-| `POST /v1/executor/pump`                         | `Authorization: Bearer <device-token>` | Runs the outbox pump once; returns `{processed, dead}`                                         |
-| `POST /v1/executor/commands`                     | `Authorization: Bearer <device-token>` | Executor command intake (see below)                                                            |
-| `POST /v1/executor/heartbeat`                    | `Authorization: Bearer <device-token>` | Sets `devices.last_heartbeat_at` (plain update, no receipt)                                    |
-| `GET /v1/executor/jobs?state=queued&limit=`      | `Authorization: Bearer <device-token>` | Queued Jobs in the device's Workspace it is eligible for (limit 1..100, default 50)            |
-| `GET /v1/executor/runs/:id`                      | `Authorization: Bearer <device-token>` | The device's own Run: state, generation, `active` (startup reconcile)                          |
+| Route                                                           | Auth                                   | Purpose                                                                                        |
+| --------------------------------------------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `GET /healthz`                                                  | none                                   | Liveness                                                                                       |
+| `GET /v1/me`                                                    | Access assertion (user)                | Returns the user principal (CLI login check)                                                   |
+| `POST /v1/commands`                                             | Access assertion (user)                | Command intake (see below)                                                                     |
+| `GET /v1/operations/:id`                                        | Access assertion (user)                | Receipt of the user's command; for `agent.send` also the inbox item, routing status and Job id |
+| `GET /v1/jobs/:id`                                              | Access assertion (user)                | A Job in one of the user's Workspaces                                                          |
+| `GET /v1/inbox?botId=`                                          | Access assertion (user)                | The Bot's inbox items (first 100, no cursor yet)                                               |
+| `GET /v1/channels?workspaceId=`                                 | Access assertion (user)                | Channels the user is a member of, with the main `conversationId` (max 500)                     |
+| `GET /v1/channels/:id/messages`                                 | Access assertion (user)                | Newest-first messages of a member channel (limit 1..200, default 50; 404 if not a member)      |
+| `GET /v1/bots?workspaceId=`                                     | Access assertion (user)                | Bots of the Workspace (max 500)                                                                |
+| `GET /v1/devices?workspaceId=`                                  | Access assertion (user)                | Devices of the Workspace, no credentials (max 500)                                             |
+| `GET /v1/jobs?limit=`                                           | Access assertion (user)                | Newest-first Jobs (limit 1..200, default 50)                                                   |
+| `GET /v1/projects?workspaceId=`                                 | Access assertion (user)                | Projects of the Workspace (max 500)                                                            |
+| `GET /v1/tasks?workspaceId=&projectKey=&status=`                | Access assertion (user)                | Tasks with computed `display` and `prerequisites` (max 500); see Work below                    |
+| `GET /v1/tasks/:id`                                             | Access assertion (user)                | A Task with prerequisites, dependents, Results and Jobs                                        |
+| `GET /v1/sync/changes?cursor=`                                  | Access assertion (user)                | Permitted changes after the cursor (limit 1..500, default 100); see Sync below                 |
+| `GET /v1/realtime?workspaceId=`                                 | Access assertion, or device Bearer     | WebSocket upgrade to the Workspace's Realtime DO; see Realtime below                           |
+| `GET /v1/executor/me`                                           | `Authorization: Bearer <device-token>` | Returns the device principal                                                                   |
+| `POST /v1/executor/pump`                                        | `Authorization: Bearer <device-token>` | Runs the outbox pump once; returns `{processed, dead}`                                         |
+| `POST /v1/executor/commands`                                    | `Authorization: Bearer <device-token>` | Executor command intake (see below)                                                            |
+| `POST /v1/executor/heartbeat`                                   | `Authorization: Bearer <device-token>` | Sets `devices.last_heartbeat_at` (plain update, no receipt)                                    |
+| `GET /v1/executor/jobs?state=queued&limit=`                     | `Authorization: Bearer <device-token>` | Queued Jobs in the device's Workspace it is eligible for (limit 1..100, default 50)            |
+| `GET /v1/executor/runs/:id`                                     | `Authorization: Bearer <device-token>` | The device's own Run: state, generation, `active` (startup reconcile)                          |
+| `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=` | `Authorization: Bearer <device-token>` | Run context for the adapter's prompt (see Executor commands)                                   |
+| `POST /v1/executor/observations`                                | `Authorization: Bearer <device-token>` | Runtime observations; stores `runtime.run.started`'s provider session id                       |
 
 - **User auth.** `Cf-Access-Jwt-Assertion` is verified with `jose` against
   `https://<ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs` (issuer `https://<ACCESS_TEAM_DOMAIN>`, audience
@@ -44,7 +46,8 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 - **Actors.** A user's `actors` row is created by `workspace.create` together with the membership (the only path
   that creates a membership today), unique per `(workspace_id, user_id)`. Messages and channel membership use it.
 - **`channel.create`** creates the channel, its main conversation and an `owner` channel membership for the caller.
-  **`bot.create`** creates the Bot and its actor; it joins no channel. A duplicate name is 422.
+  **`bot.create`** creates the Bot and its actor; it joins no channel. A duplicate name is 422. Optional
+  `instructions` (≤ 64 KiB, default `""`) is the Bot's system prompt for its runs.
 - **`agent.send`** requires channel membership (403) and a Bot in the Workspace (404). One batch commits the
   Message, the `agent.message.sent` Event, the Bot's inbox item (lane = channel, purpose `agent.send`,
   `delivery_mode` wake/notify), an `event.route` outbox row and the receipt. The response has `jobId: null` and
@@ -80,7 +83,22 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 - **`run.result.submit {runId, executionGeneration, state, summary ≤ 8 KiB, error?}`.** `finishRun` stores the
   summary / error on the Run and, in the same batch, sets the Job's trigger inbox item (`jobs.trigger_key =
 inbox:<id>`) to `processed` (succeeded) or `failed`, plus the `run.finished` outbox row. A stale fence is 409
-  `STALE_GENERATION`; a replay with the same key returns `{ok: true}` again.
+  `STALE_GENERATION`; a replay with the same key returns `{ok: true}` again. Optional `reply {conversationId,
+text}` inserts a message from the Bot's actor (`client_message_id = run:<runId>`) plus its `change_log` row
+  (`channel:<id>`) in the same batch. The reply must go to the trigger inbox item's Conversation (403 otherwise),
+  so a Task Job without an item cannot reply. `reply` is not part of the receipt digest: a replay with the same
+  key and a different reply is accepted as a replay and inserts nothing.
+
+Executor reads and observations, outside the command envelope:
+
+- **`GET /v1/executor/jobs/:id/context?runId=&executionGeneration=`.** Fenced like a renew: the Run must be this
+  device's (404 otherwise), of this Job (404) and active at that generation (409 `STALE_GENERATION`). Returns
+  `{bot: {id, name, instructions}, task: {key, title, description} | null, conversation: {id, channelId, recent}
+| null, inboxItem: {id, body} | null}`. `recent` is the Conversation's last 20 messages, oldest first, as
+  `{actorKind, actorId, body, createdAt}`. The item body is the trigger message's text, else the event's data JSON.
+- **`POST /v1/executor/observations {runId, executionGeneration, kind, payload}`.** Only `runtime.run.started` is
+  stored: `payload.providerSessionId` goes to `runs.provider_session_id` with the same fence (409 when stale, 422
+  when missing). Repeating it is harmless. Any other `kind` returns 202 and is dropped.
 
 ## Work
 

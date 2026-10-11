@@ -43,6 +43,13 @@
       "when": 1791683869503,
       "tag": "0005_execution_task_fk",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1791684818683,
+      "tag": "0006_bot_instructions_provider_session",
+      "breakpoints": true
     }
   ]
 }

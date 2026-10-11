@@ -213,6 +213,105 @@ describe("executor lease and result", () => {
     expect(await conflict.json()).toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
   });
 
+  it("serves the fenced run context: Bot instructions, conversation and the item body", async () => {
+    const s = await setup();
+    const { botId } = await s.ok({
+      type: "bot.create",
+      name: "greeter",
+      instructions: "Reply in one short sentence.",
+    });
+    const job = await queuedJob(s, botId as string);
+    const device = executor(s.deviceToken, s.workspaceId);
+    const run = await (await device.command(claim(job.jobId))).json<Claimed>();
+    const path = (jobId: string, generation: number) =>
+      `/v1/executor/jobs/${jobId}/context?runId=${run.runId}&executionGeneration=${generation}`;
+
+    const res = await device.get(path(job.jobId, run.executionGeneration));
+    expect(res.status).toBe(200);
+    const context = await res.json<Json>();
+    expect(context).toMatchObject({
+      bot: { id: botId, name: "greeter", instructions: "Reply in one short sentence." },
+      task: null,
+      conversation: {
+        channelId: s.channelId,
+        recent: [expect.objectContaining({ actorKind: "user", body: "check PR #123" })],
+      },
+      inboxItem: { id: job.inboxItemId, body: "check PR #123" },
+    });
+    expect((await device.get(path(job.jobId, 2))).status).toBe(409);
+    expect((await device.get(path("other-job", 1))).status).toBe(404);
+    // Not this device's Run.
+    const { deviceToken } = await s.ok(register);
+    const other = executor(deviceToken as string, s.workspaceId);
+    expect((await other.get(path(job.jobId, 1))).status).toBe(404);
+  });
+
+  it("posts the reply as the Bot's message with a change row; replay inserts nothing more", async () => {
+    const { s, device, fence, jobId } = await claimed();
+    const context = await (
+      await device.get(
+        `/v1/executor/jobs/${jobId}/context?runId=${fence.runId}&executionGeneration=1`,
+      )
+    ).json<{ conversation: { id: string } }>();
+    const submit = (conversationId: string) => ({
+      type: "run.result.submit",
+      ...fence,
+      state: "succeeded",
+      summary: "Hello!",
+      reply: { conversationId, text: "Hello!" },
+    });
+
+    expect((await device.command(submit("other-conversation"), "reply-0")).status).toBe(403);
+    expect((await device.command(submit(context.conversation.id), "reply-1")).status).toBe(200);
+    expect((await device.command(submit(context.conversation.id), "reply-1")).status).toBe(200);
+
+    const message = await db
+      .prepare(
+        `SELECT m.id, m.body, m.client_message_id, a.kind FROM messages m
+           JOIN actors a ON a.id = m.actor_id JOIN bots b ON b.actor_id = a.id
+          WHERE b.id = ?`,
+      )
+      .bind(s.botId)
+      .all<Json>();
+    expect(message.results).toEqual([
+      expect.objectContaining({
+        body: "Hello!",
+        client_message_id: `run:${fence.runId}`,
+        kind: "bot",
+      }),
+    ]);
+    expect(
+      await count(
+        "change_log WHERE entity_kind = 'message' AND entity_id = ? AND scope = ?",
+        message.results[0]!.id,
+        `channel:${s.channelId}`,
+      ),
+    ).toBe(1);
+    const listed = await (
+      await s.user.get(`/v1/channels/${s.channelId}/messages?workspaceId=${s.workspaceId}`)
+    ).json<{ messages: Json[] }>();
+    expect(listed.messages.map((m) => m.body)).toEqual(["Hello!", "check PR #123"]);
+  });
+
+  it("stores runtime.run.started's provider session id, fenced; other kinds are accepted and dropped", async () => {
+    const { s, fence } = await claimed();
+    const observe = (body: unknown) =>
+      call("/v1/executor/observations", { Authorization: `Bearer ${s.deviceToken}` }, body);
+    const started = {
+      ...fence,
+      kind: "runtime.run.started",
+      payload: { providerSessionId: "session-1" },
+    };
+    expect((await observe(started)).status).toBe(200);
+    expect((await observe(started)).status).toBe(200);
+    expect(
+      await count("runs WHERE id = ? AND provider_session_id = 'session-1'", fence.runId),
+    ).toBe(1);
+    expect((await observe({ ...started, executionGeneration: 2 })).status).toBe(409);
+    expect((await observe({ ...started, kind: "runtime.tool.used" })).status).toBe(202);
+    expect((await observe({ ...started, payload: {} })).status).toBe(422);
+  });
+
   it("records the heartbeat", async () => {
     const s = await setup();
     const ok = await call(

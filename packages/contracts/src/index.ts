@@ -104,10 +104,14 @@ export const PlacementPolicy = v.strictObject({
 });
 export type PlacementPolicy = v.InferOutput<typeof PlacementPolicy>;
 
+const MessageText = v.pipe(v.string(), v.minLength(1), v.maxLength(64 * 1024));
+
 export const BotCreate = v.strictObject({
   type: v.literal("bot.create"),
   name: Name,
   placementPolicy: v.optional(PlacementPolicy, {}),
+  /** The Bot's system prompt for its runs. */
+  instructions: v.optional(v.pipe(v.string(), v.maxLength(64 * 1024)), ""),
 });
 
 // docs/architecture.md §5.3, §7.2. Direct delivery to a Bot's Inbox; lane = channel.
@@ -117,7 +121,7 @@ export const AgentSend = v.strictObject({
   channelId: ChannelId,
   message: v.strictObject({
     kind: v.picklist(["request", "notification"]),
-    text: v.pipe(v.string(), v.minLength(1), v.maxLength(64 * 1024)),
+    text: MessageText,
   }),
   delivery: v.picklist(["wake", "notify"]),
 });
@@ -263,6 +267,10 @@ export const RunResultSubmit = v.strictObject({
     v.check((s) => utf8Bytes(s) <= 8 * 1024, "summary must be at most 8 KiB"),
   ),
   error: v.optional(v.pipe(v.string(), v.maxLength(8 * 1024))),
+  /** Posted as a message from the Bot in the trigger item's Conversation, in the same batch. */
+  reply: v.optional(
+    v.strictObject({ conversationId: v.pipe(v.string(), v.minLength(1)), text: MessageText }),
+  ),
 });
 
 export const ExecutorCommand = v.variant("type", [JobClaim, RunLeaseRenew, RunResultSubmit]);
@@ -294,6 +302,31 @@ export type QueuedJob = {
 };
 
 /** `GET /v1/executor/runs/:id`: the device's own Run, for reconcile after a restart. */
+/** `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=`: what the adapter builds its prompt from. */
+export type RunContext = {
+  bot: { id: string; name: string; instructions: string };
+  task: { key: string; title: string; description: string } | null;
+  conversation: {
+    id: string;
+    channelId: string;
+    /** The last 20 messages, oldest first. */
+    recent: { actorKind: string; actorId: string; body: string; createdAt: string }[];
+  } | null;
+  inboxItem: { id: string; body: string } | null;
+};
+
+/**
+ * `POST /v1/executor/observations` (§9.2 step 7). Only `runtime.run.started` with
+ * `payload.providerSessionId` is stored; other kinds are accepted (202) and dropped.
+ */
+export const RunObservation = v.strictObject({
+  runId: RunId,
+  executionGeneration: Generation,
+  kind: Name,
+  payload: v.optional(v.record(v.string(), v.unknown()), {}),
+});
+export type RunObservation = v.InferInput<typeof RunObservation>;
+
 export type ExecutorRun = {
   id: string;
   jobId: string;

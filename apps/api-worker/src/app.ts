@@ -1,4 +1,4 @@
-import { parse } from "@hive/contracts";
+import { parse, RunObservation } from "@hive/contracts";
 import { type Context, Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { JWTVerifyGetKey } from "jose";
@@ -11,8 +11,10 @@ import {
   type Device,
   ExecutorEnvelope,
   getExecutorRun,
+  getRunContext,
   heartbeat,
   listQueuedJobs,
+  recordObservation,
   runExecutorCommand,
 } from "./executor.ts";
 import { pump } from "./pump.ts";
@@ -161,6 +163,26 @@ export const createApp = ({
   app.get("/v1/executor/runs/:id", async (c) =>
     c.json(await getExecutorRun(c.env.DB, device(c), c.req.param("id"))),
   );
+  app.get("/v1/executor/jobs/:id/context", async (c) => {
+    const runId = c.req.query("runId");
+    const executionGeneration = Number(c.req.query("executionGeneration"));
+    if (!runId || !Number.isInteger(executionGeneration)) {
+      throw new HttpError("INVALID_INPUT", "runId and executionGeneration are required");
+    }
+    return c.json(
+      await getRunContext(c.env.DB, device(c), {
+        jobId: c.req.param("id"),
+        runId,
+        executionGeneration,
+      }),
+    );
+  });
+  app.post("/v1/executor/observations", async (c) => {
+    const parsed = parse(RunObservation, await c.req.json().catch(() => null));
+    if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
+    const { status, body } = await recordObservation(c.env.DB, device(c), parsed.value);
+    return c.json(body, status);
+  });
 
   app.get("/v1/operations/:id", async (c) => {
     const { userId, workspaceIds } = user(c);

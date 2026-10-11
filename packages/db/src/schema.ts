@@ -238,6 +238,8 @@ export const bots = sqliteTable(
     actorId: text("actor_id").notNull(),
     name: text("name").notNull(),
     placementPolicy: text("placement_policy", { mode: "json" }).notNull(),
+    /** System prompt for the Bot's runs (SDK-01). */
+    instructions: text("instructions").notNull().default(""),
     configRevision: integer("config_revision").notNull().default(1),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
@@ -572,6 +574,8 @@ export const runs = sqliteTable(
     // Submitted by the executor with the terminal state (run.result.submit).
     resultSummary: text("result_summary"),
     resultError: text("result_error"),
+    // From the executor's `runtime.run.started` observation (§9.2 step 7); e.g. the Claude session id.
+    providerSessionId: text("provider_session_id"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },

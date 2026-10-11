@@ -18,11 +18,18 @@ export const deviceRegister = (
 export const channelCreate = (c: Client, e: Envelope, name: string) =>
   c.command(e, { type: "channel.create", name });
 
-export const botCreate = (c: Client, e: Envelope, name: string, allowedDeviceIds: string[] = []) =>
+export const botCreate = (
+  c: Client,
+  e: Envelope,
+  name: string,
+  allowedDeviceIds: string[] = [],
+  instructions?: string,
+) =>
   c.command(e, {
     type: "bot.create",
     name,
     ...(allowedDeviceIds.length > 0 ? { placementPolicy: { allowedDeviceIds } } : {}),
+    ...(instructions === undefined ? {} : { instructions }),
   });
 
 export const agentSend = (
