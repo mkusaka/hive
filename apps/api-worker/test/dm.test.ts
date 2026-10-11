@@ -169,7 +169,7 @@ describe("bots as channel members", () => {
     expect(forbidden.status).toBe(403);
   });
 
-  it("message.post auto-joins a mentioned non-member Bot; a member Bot is not woken unless mentioned", async () => {
+  it("message.post auto-joins a mentioned non-member Bot; a member Bot is then woken unmentioned (ROUTE-02)", async () => {
     const s = await setup();
     await s.ok({
       type: "message.post",
@@ -182,8 +182,8 @@ describe("bots as channel members", () => {
     ]);
     expect(await count("inbox_items WHERE workspace_id = ?", s.workspaceId)).toBe(1);
     const plain = await s.ok({ type: "message.post", channelId: s.channelId, text: "no mention" });
-    expect(plain.inboxItemIds).toEqual([]);
-    expect(await count("inbox_items WHERE workspace_id = ?", s.workspaceId)).toBe(1);
+    expect(plain.inboxItemIds).toHaveLength(1);
+    expect(await count("inbox_items WHERE workspace_id = ?", s.workspaceId)).toBe(2);
     // channel.create's row plus one join: the second mention adds no channel change row.
     await s.ok({ type: "message.post", channelId: s.channelId, text: `<@bot:${s.botId}> again` });
     expect(

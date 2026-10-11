@@ -18,12 +18,16 @@ import {
   type RunResultSubmit,
   type ToolPolicy,
   renderMentions,
+  tokenizeMentions,
 } from "@hive/contracts";
 import {
   appendChange,
+  appendJobChangeIfCreated,
+  busyInConversation,
   claimJob,
   confirmRunStopped,
   finishRun,
+  insertEvent,
   insertMessage,
   renewLease,
   setJobsWaitingDevice,
@@ -32,6 +36,14 @@ import type * as v from "valibot";
 import { hashSecret, newDeviceSecret } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
 import { capabilityExpiresAt, insertCapability } from "./auth/run.ts";
+import {
+  chainJobs,
+  deliveryStatements,
+  groupRecipients,
+  joinChannel,
+  maxCorrelatedJobs,
+  maxHops,
+} from "./commands.ts";
 import { HttpError } from "./errors.ts";
 import { constraintReasons, type PlacementDevice, refusal, shouldWait } from "./placement.ts";
 import { indexLater, relatedQuery, searchDocuments } from "./search.ts";
@@ -315,13 +327,19 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
   if (command.waitingFor && !cancel) {
     return submitWaiting(db, device, env, command.waitingFor.requestMessageId);
   }
+  if (command.pass && (command.state !== "succeeded" || command.reply)) {
+    throw new HttpError("INVALID_INPUT", "pass is a succeeded result without reply");
+  }
   const state = cancel ? "cancelled" : (command.state as "succeeded" | "failed");
-  // The Job's input items: its trigger item, or every member of its sealed Inbox batch (one lane, so one
-  // Conversation), plus the replies to its requests (§8.2). The channel names an item's change scope; an item without
-  // a conversation is workspace-wide.
+  // The Job's input items, its trigger item first: the trigger item, or every member of its sealed Inbox batch (one
+  // lane, so one Conversation), plus the replies to its requests (§8.2), plus the group deliveries to this Bot in the
+  // trigger's Conversation that got no Job of their own because it was busy (ROUTE-02): their messages were in this
+  // Run's `since`. The channel names an item's change scope; an item without a conversation is workspace-wide.
   const { results: items } = await db
     .prepare(
-      `SELECT i.id, i.conversation_id, c.channel_id, b.actor_id FROM runs r
+      `SELECT i.id, i.conversation_id, c.channel_id, c.kind, i.hop, b.id AS bot_id, b.actor_id,
+              COALESCE(j.correlation_id, j.id) AS correlation_id, r.created_at AS run_created_at
+         FROM runs r
          JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
          JOIN bots b ON b.workspace_id = j.workspace_id AND b.id = j.bot_id
          JOIN inbox_items i ON i.workspace_id = j.workspace_id
@@ -329,17 +347,28 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
                                 OR (i.purpose = 'agent.reply' AND i.input_id IN (
                                       SELECT m.id FROM messages m JOIN messages q
                                           ON q.workspace_id = m.workspace_id AND q.id = m.reply_to_message_id
-                                       WHERE q.workspace_id = j.workspace_id AND q.job_id = j.id)))
+                                       WHERE q.workspace_id = j.workspace_id AND q.job_id = j.id))
+                                OR (i.purpose = 'agent.send' AND i.bot_id = j.bot_id AND i.state = 'pending'
+                                    AND i.delivery_id IS NOT NULL AND i.created_at < r.created_at
+                                    AND i.conversation_id = (SELECT conversation_id FROM inbox_items
+                                                              WHERE id = substr(j.trigger_key, 7))
+                                    AND NOT EXISTS (SELECT 1 FROM jobs x WHERE x.workspace_id = i.workspace_id
+                                                       AND x.trigger_key = 'inbox:' || i.id)))
          LEFT JOIN conversations c ON c.workspace_id = i.workspace_id AND c.id = i.conversation_id
         WHERE r.id = ? AND r.workspace_id = ?
-        ORDER BY i.created_at, i.id`,
+        ORDER BY 'inbox:' || i.id = j.trigger_key DESC, i.created_at, i.id`,
     )
     .bind(command.runId, workspaceId)
     .all<{
       id: string;
       conversation_id: string | null;
       channel_id: string | null;
+      kind: string | null;
+      hop: number;
+      bot_id: string;
       actor_id: string;
+      correlation_id: string;
+      run_created_at: string;
     }>();
   const item = items[0];
   const scopeOf = (i: { channel_id: string | null } | undefined) =>
@@ -391,6 +420,41 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
     throw new HttpError("FORBIDDEN", "reply must go to the trigger item's conversation");
   }
   const messageId = crypto.randomUUID();
+  // A Bot's reply in a Channel's main conversation is a group post for the other members (ROUTE-02): `@name` becomes a
+  // mention token, and each woken Bot's delivery carries hop + 1 and the chain's correlation. Past the §8.2 limits the
+  // reply is still posted but wakes nobody.
+  const group = reply && item?.kind === "channel" ? item : null;
+  const body =
+    group && reply
+      ? tokenizeMentions(
+          reply.text,
+          (
+            await db
+              .prepare("SELECT id, name FROM bots WHERE workspace_id = ?")
+              .bind(workspaceId)
+              .all<{ id: string; name: string }>()
+          ).results,
+        )
+      : reply?.text;
+  const hop = (group?.hop ?? 0) + 1;
+  const fanOut =
+    group &&
+    body &&
+    hop <= maxHops &&
+    (await chainJobs(db, workspaceId, group.correlation_id)) < maxCorrelatedJobs
+      ? await groupRecipients(db, {
+          workspaceId,
+          channelId: group.channel_id!,
+          conversationId: group.conversation_id!,
+          text: body,
+          authorBotId: group.bot_id,
+        })
+      : null;
+  const receivedAt = new Date().toISOString();
+  const deliveries = (fanOut?.recipients ?? []).map((botId) => ({
+    botId,
+    inboxItemId: crypto.randomUUID(),
+  }));
   const replyMessage =
     reply && item?.channel_id
       ? [
@@ -400,7 +464,7 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
             conversationId: reply.conversationId,
             actorId: item.actor_id,
             clientMessageId: `run:${command.runId}`,
-            body: reply.text,
+            body: body!,
           }),
           appendChange(db, {
             workspaceId,
@@ -409,6 +473,80 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
             scope: itemScope,
           }),
           indexLater(db, workspaceId, "message", messageId),
+          ...deliveries.flatMap((d) =>
+            deliveryStatements(db, workspaceId, {
+              from: { kind: "bot", id: item.bot_id },
+              correlationId: item.correlation_id,
+              hop,
+              coalesce: true,
+              messageId,
+              botId: d.botId,
+              channelId: item.channel_id!,
+              conversationId: reply.conversationId,
+              kind: "request",
+              delivery: "wake",
+              inboxItemId: d.inboxItemId,
+              receivedAt,
+            }).concat(
+              appendChange(db, {
+                workspaceId,
+                entityKind: "inbox_item",
+                entityId: d.inboxItemId,
+                scope: itemScope,
+              }),
+            ),
+          ),
+          ...(fanOut?.joining.length
+            ? [joinChannel(db, workspaceId, item.channel_id!, fanOut.joining)]
+            : []),
+        ]
+      : [];
+  // Pass (ROUTE-02): nothing is posted; the Run keeps `outcome = pass` and the observation is an Event.
+  const passed =
+    command.pass && !cancel
+      ? [
+          db
+            .prepare("UPDATE runs SET outcome = 'pass' WHERE id = ? AND workspace_id = ?")
+            .bind(command.runId, workspaceId),
+          insertEvent(db, {
+            id: crypto.randomUUID(),
+            workspaceId,
+            type: "runtime.run.passed",
+            schemaVersion: 1,
+            sourceKind: "system",
+            actorKind: "bot",
+            actorId: item?.bot_id ?? "",
+            subjectKind: "run",
+            subjectId: command.runId,
+            data: { runId: command.runId, conversationId: item?.conversation_id ?? null },
+            correlationId: item?.correlation_id ?? command.runId,
+            occurredAt: receivedAt,
+            receivedAt,
+          }),
+        ]
+      : [];
+  // Coalescing (ROUTE-02): group deliveries that reached this Bot's Conversation while this Run worked get one
+  // follow-up Job (triggered by the newest), unless the Bot is busy there again. Placed after finishRun's Job update.
+  const followUpId = crypto.randomUUID();
+  const followUp =
+    item?.kind === "channel"
+      ? [
+          db
+            .prepare(
+              `INSERT INTO jobs (id, workspace_id, bot_id, state, trigger_key, correlation_id, placement)
+               SELECT ?1, i.workspace_id, i.bot_id, 'queued', 'inbox:' || i.id, e.correlation_id, b.placement_policy
+                 FROM inbox_items i
+                 JOIN bots b ON b.workspace_id = i.workspace_id AND b.id = i.bot_id
+                 JOIN events e ON e.workspace_id = i.workspace_id AND e.id = i.input_id
+                WHERE i.workspace_id = ?2 AND i.bot_id = ?3 AND i.conversation_id = ?4 AND i.purpose = 'agent.send'
+                  AND i.state = 'pending' AND i.delivery_id IS NOT NULL AND i.created_at >= ?5
+                  AND NOT EXISTS (SELECT 1 FROM jobs x WHERE x.workspace_id = i.workspace_id
+                                     AND x.trigger_key = 'inbox:' || i.id)
+                  AND NOT ${busyInConversation("?2", "?3", "?4")}
+                ORDER BY i.created_at DESC, i.id DESC LIMIT 1`,
+            )
+            .bind(followUpId, workspaceId, item.bot_id, item.conversation_id, item.run_created_at),
+          appendJobChangeIfCreated(db, workspaceId, followUpId),
         ]
       : [];
   const result = await finishRun(db, {
@@ -422,6 +560,8 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
     statements: [
       ...taskResult,
       ...replyMessage,
+      ...passed,
+      ...followUp,
       inboxOutcome,
       revokeCapability(db, command.runId),
       ...items.map((i) =>
@@ -516,6 +656,21 @@ const fencedRun = async (
   return run;
 };
 
+/** A message of `since` as stored, with its speaker and the quoted message's (ROUTE-02). */
+type SinceRow = {
+  id: string;
+  body: string;
+  created_at: string;
+  kind: string;
+  name: string;
+  self: number;
+  quote: string | null;
+  q_kind: string | null;
+  q_name: string | null;
+  q_self: number | null;
+};
+const speakerKind = (actorKind: string): "bot" | "human" => (actorKind === "bot" ? "bot" : "human");
+
 /**
  * Run context (SDK-01): Bot instructions, Task, recent Conversation and the trigger item's body (with its sender
  * Bot for a bot-to-bot message), or for a batch Job every member's body (its Conversation is the batch lane's), plus
@@ -531,7 +686,7 @@ export const getRunContext = async (
   const workspaceId = device.workspaceIds[0]!;
   const row = await db
     .prepare(
-      `SELECT b.id AS bot_id, b.name, b.instructions, b.tool_policy, j.placement, t.id AS task_id, t.key, t.title, t.description,
+      `SELECT b.id AS bot_id, b.actor_id, b.name, b.instructions, b.tool_policy, j.placement, t.id AS task_id, t.key, t.title, t.description,
               j.inbox_batch_id, i.id AS item_id, c.id AS conversation_id, c.channel_id, c.kind AS conversation_kind,
               m.id AS message_id, m.kind AS message_kind, fb.id AS from_bot_id, fb.name AS from_bot_name,
               COALESCE(m.body, CASE e.source_kind WHEN 'routine' THEN json_extract(e.data, '$.inputText') END,
@@ -555,6 +710,7 @@ export const getRunContext = async (
     .bind(workspaceId, input.jobId)
     .first<{
       bot_id: string;
+      actor_id: string;
       name: string;
       instructions: string;
       tool_policy: string;
@@ -671,6 +827,49 @@ export const getRunContext = async (
       recent: results,
     };
   }
+  // Group chat (ROUTE-02): the other member Bots, and what was posted since this Bot's previous Run here.
+  let peers: RunContext["peers"] = [];
+  let posted: SinceRow[] = [];
+  if (conversation?.kind === "channel") {
+    const { results: members } = await db
+      .prepare(
+        `SELECT b.id, b.name, b.instructions FROM channel_members m
+           JOIN bots b ON b.workspace_id = m.workspace_id AND b.actor_id = m.actor_id
+          WHERE m.workspace_id = ? AND m.channel_id = ? AND b.id <> ? ORDER BY b.name`,
+      )
+      .bind(workspaceId, conversation.channelId, row.bot_id)
+      .all<{ id: string; name: string; instructions: string }>();
+    peers = members.map((b) => ({
+      id: b.id,
+      name: b.name,
+      description: (b.instructions.trim().split("\n")[0] ?? "").slice(0, 120),
+    }));
+    ({ results: posted } = await db
+      .prepare(
+        `SELECT * FROM (
+           SELECT m.id, m.seq, m.body, m.created_at, a.kind, COALESCE(b.name, a.display_name) AS name,
+                  a.id = ?5 AS self, q.body AS quote, qa.kind AS q_kind,
+                  COALESCE(qb.name, qa.display_name) AS q_name, qa.id = ?5 AS q_self
+             FROM messages m
+             JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
+             LEFT JOIN bots b ON b.workspace_id = a.workspace_id AND b.actor_id = a.id
+             LEFT JOIN messages q ON q.workspace_id = m.workspace_id AND q.id = m.reply_to_message_id
+             LEFT JOIN actors qa ON qa.workspace_id = q.workspace_id AND qa.id = q.actor_id
+             LEFT JOIN bots qb ON qb.workspace_id = qa.workspace_id AND qb.actor_id = qa.id
+            WHERE m.workspace_id = ?1 AND m.conversation_id = ?2
+              AND m.created_at > COALESCE((
+                    SELECT MAX(r.created_at) FROM runs r
+                      JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
+                      JOIN inbox_items i ON i.workspace_id = j.workspace_id AND i.id = substr(j.trigger_key, 7)
+                     WHERE r.workspace_id = ?1 AND j.bot_id = ?3 AND j.trigger_key LIKE 'inbox:%'
+                       AND i.conversation_id = ?2 AND r.kind = 'root'
+                       AND r.created_at < (SELECT created_at FROM runs WHERE id = ?4)), '')
+            ORDER BY m.seq DESC LIMIT 50
+         ) ORDER BY seq`,
+      )
+      .bind(workspaceId, conversation.id, row.bot_id, input.runId, row.actor_id)
+      .all<SinceRow>());
+  }
   const { results: replies } = await db
     .prepare(
       `SELECT m.id, m.reply_to_message_id, b.id AS bot_id, b.name, m.body, m.created_at
@@ -759,6 +958,23 @@ export const getRunContext = async (
     conversation.recent = conversation.recent.map((m) => ({ ...m, body: named(m.body) }));
   }
   parentMessages = parentMessages.map((m) => ({ ...m, body: named(m.body) }));
+  const since: RunContext["since"] = posted.map((m) => ({
+    id: m.id,
+    speakerKind: speakerKind(m.kind),
+    speakerName: m.name,
+    isSelf: m.self === 1,
+    body: named(m.body),
+    createdAt: m.created_at,
+    replyTo:
+      m.quote === null
+        ? null
+        : {
+            speakerKind: speakerKind(m.q_kind!),
+            speakerName: m.q_name!,
+            isSelf: m.q_self === 1,
+            quote: named(m.quote.slice(0, 200)),
+          },
+  }));
   if (batch) batch.items = batch.items.map((i) => ({ ...i, body: named(i.body) }));
   return {
     previousProviderSessionId: previous?.provider_session_id ?? null,
@@ -780,6 +996,8 @@ export const getRunContext = async (
           },
     conversation,
     parentMessages,
+    peers,
+    since,
     inboxItem: row.item_id
       ? {
           id: row.item_id,

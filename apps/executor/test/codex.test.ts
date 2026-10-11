@@ -220,4 +220,14 @@ describe("codexAdapter", () => {
     });
     expect(lines.some((l) => l.dir === "out" && l.msg?.method === "turn/interrupt")).toBe(true);
   });
+
+  it("marks the exit as pass after hive_pass (ROUTE-02)", async () => {
+    const { api } = fakeRunApi();
+    const { agent } = await start("pass", { run: api });
+    expect(await agent.waitForExit()).toMatchObject({
+      code: 0,
+      pass: true,
+      replyText: "Not for me.",
+    });
+  });
 });

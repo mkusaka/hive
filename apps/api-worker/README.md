@@ -18,6 +18,7 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/inbox?botId=`                                          | Access assertion (user)           | The Bot's inbox items (first 100, no cursor yet)                                                                                                                                               |
 | `GET /v1/channels?workspaceId=`                                 | Access assertion (user)           | Channels the user is a member of, with the main `conversationId`, `topic` and `memberCount` (max 500)                                                                                          |
 | `GET /v1/sidebar?workspaceId=`                                  | Access assertion (user)           | The caller's own sidebar document `{workspaceName, prefs: {pinned, hidden, groups}, revision}`; the empty default at revision 0 when none                                                      |
+| `GET /v1/channels/:id/presence?workspaceId=`                    | Access assertion (user)           | Members only: each member Bot's `state` from its Jobs triggered in the Channel: `working` (active), `reading` (queued / waiting_device), `idle` (ROUTE-02)                                     |
 | `GET /v1/channels/:id/members`                                  | Access assertion (user)           | The channel's members (`role` owner / member; users and Bots), with `kind`, `name` (a Bot's current name), `userId`, `botId` (404 if not a member)                                             |
 | `GET /v1/dms?workspaceId=`                                      | Access assertion (user)           | The caller's direct messages by Bot name: `id` = `conversationId`, `botId`, `name`, `createdAt`, `lastMessage` (as on channels)                                                                |
 | `GET /v1/conversations/:id/messages?workspaceId=&limit=`        | Access assertion (user)           | A DM's or a thread's messages, newest first (who may read the DM / the thread's parent, 404 otherwise); a thread's response adds `root` (its root message)                                     |
@@ -98,11 +99,15 @@ token). The Worker falls back to `Authorization: Bearer <token>` for local dev a
   Message, the `agent.message.sent` Event, the Bot's inbox item (lane = channel, purpose `agent.send`,
   `delivery_mode` wake/notify), an `event.route` outbox row and the receipt. The response has `jobId: null` and
   `routingStatus: "pending"`; the Job appears after routing (`GET /v1/operations/:id`).
-- **`message.post`** `{channelId | conversationId, text, mentions?}` requires channel membership (403) or being the
-  DM's user (404). It commits one Message
-  (body kept with its `<@bot:ID>` tokens) and, for each distinct mentioned Bot, the `agent.send` request / `wake`
-  delivery rows above (Event, inbox item, outbox), so routing creates one Job per Bot. The response has
-  `inboxItemIds` (empty: posted, nobody woken). An unknown Bot id in a token, or `mentions` not equal to the tokens,
+- **`message.post`** `{channelId | conversationId, text, mentions?, replyToMessageId?}` requires channel membership
+  (403) or being the DM's user (404). It commits one Message (body kept with its `<@bot:ID>` tokens) and, per woken
+  Bot, the `agent.send` request / `wake` delivery rows above (Event, inbox item, outbox), so routing creates one Job
+  per Bot. In a Channel's main conversation (group chat, ROUTE-02) every member Bot is woken; mentions narrow that
+  to the mentioned Bots, `<@everyone>` is every member, and `replyToMessageId` (a message of the same conversation,
+  404 otherwise) on a Bot's message addresses that Bot. Those deliveries coalesce: a Bot with a queued / active Job
+  triggered in the conversation gets no second Job (its inbox item stays for `since`), and the Run's result queues
+  one follow-up Job when posts arrived while it worked. The response has `inboxItemIds` (empty: posted, nobody
+  woken). An unknown Bot id in a token, or `mentions` not equal to the tokens,
   is 422. Run contexts show tokens as `@name`. A mentioned Bot that is not a member joins the channel in the same
   batch (`channel` change row). In a DM the DM's Bot is always the one recipient; a mention of another Bot is 422.
   With **`threadOf`** (a message of that Channel / DM, else 404) the message goes to the root's thread
@@ -158,7 +163,12 @@ inbox:<id>`) to `processed` (succeeded) or `failed`, plus the `run.finished` out
 text}` inserts a message from the Bot's actor (`client_message_id = run:<runId>`) plus its `change_log` row
   (`channel:<id>`) in the same batch. The reply must go to the trigger inbox item's Conversation (403 otherwise),
   so a Task Job without an item cannot reply. `reply` is not part of the receipt digest: a replay with the same
-  key and a different reply is accepted as a replay and inserts nothing. A `failed` result for a Job with a cancel
+  key and a different reply is accepted as a replay and inserts nothing. A reply in a Channel's main conversation is
+  a group post for the other member Bots (ROUTE-02): `@name` becomes a token, and each delivery carries `hop + 1` and
+  the Job's correlation id; past 4 hops or 20 correlated Jobs it wakes nobody. `pass: true` (only with `succeeded`
+  and no `reply`, else 422) posts nothing, sets `runs.outcome = 'pass'` and records a `runtime.run.passed` Event. In a
+  Channel's main conversation the same batch queues the Bot's coalescing follow-up Job and settles the deliveries this
+  Run read through `since`. A `failed` result for a Job with a cancel
   request finishes `cancelled`: Run and Job `cancelled`, Execution `interrupted`, inbox item `failed`, no Task
   Result.
 
@@ -171,7 +181,9 @@ Executor reads and observations, outside the command envelope:
   `{actorKind, actorId, body, createdAt}`. The item body is the trigger message's text, else the event's data JSON.
   A batch Job (`jobs.inbox_batch_id`) has `inboxItem: null` and `batch: {id, items: [{id, body}]}` (oldest
   first); its `conversation` is the batch lane's. `run.result.submit` then settles every batch member and may
-  reply in that Conversation.
+  reply in that Conversation. In a Channel's main conversation the context also has `peers` (other member Bots with
+  the first line of their instructions) and `since` (≤ 50 messages after this Bot's previous Run there, with
+  `speakerKind`, `speakerName`, `isSelf`, `replyTo` quote); both are empty elsewhere.
 - **`POST /v1/executor/observations {runId, executionGeneration, kind, payload}`.** `runtime.run.started`:
   `payload.providerSessionId` goes to `runs.provider_session_id`, `started_at` is set once and a `starting` Run
   becomes `running`, with the same fence (409 when stale, 422 when missing). `runtime.run.stopped` with
@@ -350,7 +362,7 @@ member).
   | `bot.create`                               | bot (workspace)                                                          |
   | `sidebar.update`                           | sidebar, entity id = the user (workspace)                                |
   | `agent.send`                               | message, inbox item (channel)                                            |
-  | `message.post`                             | message, one inbox item per mention (channel)                            |
+  | `message.post`                             | message, one inbox item per woken Bot (channel)                          |
   | event route                                | inbox item (channel), Job (workspace) for `wake`                         |
   | `job.claim`                                | Job, Run (workspace)                                                     |
   | `run.result.submit`                        | Run, Job (workspace), trigger inbox item (its channel)                   |

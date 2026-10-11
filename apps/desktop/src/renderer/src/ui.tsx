@@ -55,6 +55,7 @@ const icons = {
   close: "M6 6l12 12 M18 6L6 18",
   copy: "M11 9h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2z M5 15V5a2 2 0 0 1 2-2h8",
   send: "M12 19V5 M5 12l7-7 7 7",
+  reply: "M9 14L4 9l5-5 M4 9h10a6 6 0 0 1 6 6v4",
   more: "M5 12h.01 M12 12h.01 M19 12h.01",
   pause: "M9 5v14 M15 5v14",
   play: "M7 5l12 7-12 7z",

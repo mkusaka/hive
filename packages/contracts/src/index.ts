@@ -231,14 +231,34 @@ const mentionPattern = /<@bot:([^>\s]+)>/g;
 export const mentionedBotIds = (text: string) => [
   ...new Set(Array.from(text.matchAll(mentionPattern), (m) => m[1]!)),
 ];
-/** Tokens → `@name`, `@unknown` for an id `names` does not know. */
+/** Addresses every member Bot of the Channel (ROUTE-02); `@everyone` / `@all` in the composer. */
+export const everyoneToken = "<@everyone>";
+/** Tokens → `@name`, `@unknown` for an id `names` does not know; `<@everyone>` → `@everyone`. */
 export const renderMentions = (text: string, names: ReadonlyMap<string, string>) =>
-  text.replaceAll(mentionPattern, (_, botId: string) => `@${names.get(botId) ?? "unknown"}`);
+  text
+    .replaceAll(mentionPattern, (_, botId: string) => `@${names.get(botId) ?? "unknown"}`)
+    .replaceAll(everyoneToken, "@everyone");
+const escapeRegExp = (s: string) => s.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * `@name` of a known Bot (longest names first, not followed by a name character) → its token; `@everyone` / `@all`
+ * → `<@everyone>`. What a Run writes (it reads names) and what the CLI's `--resolve-names` sends.
+ */
+export const tokenizeMentions = (text: string, bots: readonly { id: string; name: string }[]) => {
+  let out = text.replaceAll(/(?<!\w)@(?:everyone|all)(?![\w-])/g, everyoneToken);
+  for (const bot of bots.toSorted((a, b) => b.name.length - a.name.length)) {
+    out = out.replaceAll(
+      new RegExp(`(?<!\\w)@${escapeRegExp(bot.name)}(?![\\w-])`, "g"),
+      mentionToken(bot.id),
+    );
+  }
+  return out;
+};
 
 /**
- * A user's Channel message (docs/architecture.md §7.2). Every Bot mentioned with a token gets the Inbox item + Job that
- * `agent.send` with `request` / `wake` gives (and joins the Channel); no mention = only posted. `mentions`, when given,
- * must equal the tokens. With `conversationId` (a DM) instead of `channelId`, the DM's Bot is always the recipient.
+ * A user's Channel message (docs/architecture.md §7.2). In a Channel's main conversation every member Bot gets the
+ * Inbox item + Job that `agent.send` with `request` / `wake` gives (ROUTE-02, group chat); a `<@bot:ID>` mention or a
+ * Reply on a Bot's message narrows that to the addressed Bots (a mentioned non-member joins), `<@everyone>` is every
+ * member; a Bot with a queued or active Job there gets no second Job. `mentions`, when given, must equal the tokens. With `conversationId` (a DM) instead of `channelId`, the DM's Bot is always the recipient.
  * `threadOf` (a message of that Channel / DM) posts the reply in the message's thread, created on the first reply;
  * in a Channel thread every Bot that already took part in it is woken too, mentioned or not.
  */
@@ -250,6 +270,8 @@ export const MessagePost = v.pipe(
     threadOf: v.optional(v.pipe(v.string(), v.minLength(1))),
     text: MessageText,
     mentions: v.optional(v.array(BotId)),
+    /** A Reply on a message of this conversation: on a Bot's message, it addresses that Bot (ROUTE-02). */
+    replyToMessageId: v.optional(v.pipe(v.string(), v.minLength(1))),
   }),
   v.check(
     (c) => (c.channelId === undefined) !== (c.conversationId === undefined),
@@ -672,6 +694,11 @@ export const RunResultSubmit = v.strictObject({
   reply: v.optional(
     v.strictObject({ conversationId: v.pipe(v.string(), v.minLength(1)), text: MessageText }),
   ),
+  /**
+   * The Bot chose not to answer (`hive_pass`, or a Run without final text; ROUTE-02): a `succeeded` Run with no
+   * reply. The cloud records `runtime.run.passed` and posts nothing.
+   */
+  pass: v.optional(v.boolean()),
 });
 
 export const ExecutorCommand = v.variant("type", [JobClaim, RunLeaseRenew, RunResultSubmit]);
@@ -937,6 +964,15 @@ export type QueuedJob = {
 };
 
 type ContextMessage = { actorKind: string; actorId: string; body: string; createdAt: string };
+type Speaker = { speakerKind: "human" | "bot"; speakerName: string; isSelf: boolean };
+/** A group message as a member Bot reads it (Grok Bot's room turn `new_messages`). */
+export type GroupMessage = Speaker & {
+  id: string;
+  body: string;
+  createdAt: string;
+  /** The message it replies to, quoted (at most 200 chars). */
+  replyTo: (Speaker & { quote: string }) | null;
+};
 
 /** `GET /v1/executor/runs/:id`: the device's own Run, for reconcile after a restart. */
 /** `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=`: what the adapter builds its prompt from. */
@@ -956,6 +992,13 @@ export type RunContext = {
   } | null;
   /** A thread's parent Channel / DM: up to 20 messages before the root, oldest first (read-only context). */
   parentMessages: ContextMessage[];
+  /**
+   * In a Channel's main conversation (group chat, ROUTE-02): the other member Bots (`description` = first line of their
+   * instructions, at most 120 chars) and the messages since this Bot's previous Run there (at most 50, oldest first).
+   * Empty elsewhere.
+   */
+  peers: { id: string; name: string; description: string }[];
+  since: GroupMessage[];
   /** `fromBot` is set when another Bot sent the message (kind `request` / `notification`). */
   inboxItem: {
     id: string;

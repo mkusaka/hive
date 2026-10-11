@@ -31,9 +31,31 @@ describe("runOnce", () => {
         executionGeneration: 1,
         state: "succeeded",
         summary: "fake: handled inbox item inbox-1",
+        // No final text in a Channel is a pass (ROUTE-02).
+        pass: true,
       },
     ]);
     expect(journal.entries.map((e) => e.kind)).toEqual(["claim", "intent", "result"]);
+  });
+
+  it("submits a pass without reply when the agent passed, even with final text", async () => {
+    const { cloud, submitted } = fakeCloud();
+    const adapter: AgentAdapter = {
+      start: async () => ({
+        requestStop: async () => {},
+        waitForExit: async () => ({
+          code: 0,
+          reason: "exited",
+          summary: "s",
+          replyText: "Not for me.",
+          pass: true,
+        }),
+      }),
+    };
+    await runOnce({ cloud, journal: memoryJournal(), adapter });
+    expect(submitted).toEqual([
+      { runId: "run-1", executionGeneration: 1, state: "succeeded", summary: "s", pass: true },
+    ]);
   });
 
   it("submits failed with the reason when the agent exits non-zero", async () => {

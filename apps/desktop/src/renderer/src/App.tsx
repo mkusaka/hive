@@ -29,6 +29,7 @@ export const App = () => {
   const [channels, setChannels] = useState<Row[]>([]);
   const [dms, setDms] = useState<Row[]>([]);
   const [messages, setMessages] = useState<Row[]>([]);
+  const [presence, setPresence] = useState<Row[]>([]);
   const [threads, setThreads] = useState<Row[]>([]);
   // The open Thread panel's replies, oldest first.
   const [replies, setReplies] = useState<Row[]>([]);
@@ -130,6 +131,13 @@ export const App = () => {
     load("bots", inWorkspace("bots", ws), "bots", setBots);
     load("devices", inWorkspace("devices", ws), "devices", setDevices);
     load("jobs", inWorkspace("jobs", ws, { limit: "50" }), "jobs", setJobs);
+    // Who is reading / working in the open Channel follows its Bots' Jobs (ROUTE-02).
+    if ((keys.has("jobs") || keys.has("messages")) && ch && !dm)
+      tasks.push(
+        get(inWorkspace(`channels/${encodeURIComponent(ch)}/presence`, ws)).then((body) =>
+          setPresence(body.presence as Row[]),
+        ),
+      );
     load(
       "approvals",
       inWorkspace("approvals", ws, { state: "pending" }),
@@ -381,6 +389,7 @@ export const App = () => {
             openChannelPanel={(tab) => setPanel({ kind: "channel", tab })}
             starred={side.prefs.pinned.some((i) => i.kind === current.kind && i.id === current.id)}
             toggleStar={() => updateSidebar(togglePin(side.prefs, current))}
+            presence={dmId ? [] : presence}
           />
         )}
         {view === "threads" && (
@@ -477,7 +486,8 @@ export const App = () => {
                           .then(setJobDetail, (e) => setError(String(e)))
                       }
                     >
-                      <Badge state={j.state} /> <span className="mono">{j.id}</span>
+                      <Badge state={j.outcome === "pass" ? "passed" : j.state} />{" "}
+                      <span className="mono">{j.id}</span>
                       {j.cancelRequestedAt ? " (cancel requested)" : ""}
                     </button>
                     {["queued", "waiting_device", "active"].includes(String(j.state)) &&
@@ -501,7 +511,8 @@ export const App = () => {
                         className={r.id === runId ? "active" : ""}
                         onClick={() => setRunId(r.id)}
                       >
-                        Run {text(r.generation)} <Badge state={r.state} />{" "}
+                        Run {text(r.generation)}{" "}
+                        <Badge state={r.outcome === "pass" ? "passed" : r.state} />{" "}
                         <span className="mono">{r.id}</span>
                       </button>
                     </li>
@@ -595,6 +606,7 @@ export const App = () => {
           close={() => setPanel(null)}
           tab={panel?.kind === "channel" ? panel.tab : "about"}
           setTab={(tab) => setPanel({ kind: "channel", tab })}
+          presence={presence}
         />
       )}
     </div>

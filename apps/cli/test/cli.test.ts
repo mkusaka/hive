@@ -85,7 +85,7 @@ describe("argv → request", () => {
     const post = (...flags: string[]) =>
       h.hive("message", "post", "--channel", "ch-1", "--text", "@coder-2 @coder hi", ...flags);
     expect(await post()).toBe(0);
-    expect(await post("--resolve-names")).toBe(0);
+    expect(await post("--resolve-names", "--reply-to", "m-1")).toBe(0);
     expect(h.calls.map((c) => [c.method, c.path])).toEqual([
       ["POST", "/v1/commands"],
       ["GET", "/v1/bots?workspaceId=ws-1"],
@@ -97,7 +97,12 @@ describe("argv → request", () => {
         .map((c) => (c.body as { command: unknown }).command),
     ).toEqual([
       { type: "message.post", channelId: "ch-1", text: "@coder-2 @coder hi" },
-      { type: "message.post", channelId: "ch-1", text: "<@bot:b-2> <@bot:b-1> hi" },
+      {
+        type: "message.post",
+        channelId: "ch-1",
+        replyToMessageId: "m-1",
+        text: "<@bot:b-2> <@bot:b-1> hi",
+      },
     ]);
   });
 

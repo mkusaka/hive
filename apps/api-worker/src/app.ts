@@ -45,6 +45,7 @@ import {
   listJobs,
   listMessages,
   listProjects,
+  channelPresence,
   listChannelMembers,
   listRoutines,
   listSubscriptions,
@@ -420,6 +421,15 @@ export const createApp = ({
 
   app.get("/v1/channels", async (c) =>
     c.json(await listChannels(c.env.DB, workspaceParam(c), user(c).userId)),
+  );
+  app.get("/v1/channels/:id/presence", async (c) =>
+    c.json(
+      await channelPresence(c.env.DB, {
+        workspaceId: workspaceParam(c),
+        userId: user(c).userId,
+        channelId: c.req.param("id"),
+      }),
+    ),
   );
   app.get("/v1/channels/:id/members", async (c) =>
     c.json(

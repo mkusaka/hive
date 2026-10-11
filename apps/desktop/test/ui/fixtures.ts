@@ -175,6 +175,8 @@ export const routes = (): Routes => ({
       },
     ],
   },
+  "/v1/channels/ch-1/presence": { presence: [{ botId: "bot-1", name: "coder", state: "idle" }] },
+  "/v1/channels/ch-2/presence": { presence: [] },
   "/v1/channels/ch-1/members": {
     members: [
       {

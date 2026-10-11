@@ -37,6 +37,8 @@ type AgentMessageSent = {
   channelId: string | null;
   conversationId: string;
   delivery: "wake" | "notify";
+  /** A group delivery in a Channel's main conversation (ROUTE-02): no Job while the Bot is busy there. */
+  coalesce?: boolean;
 };
 
 export type EventRow = {
@@ -180,6 +182,7 @@ export const routeEvent = async (db: D1Database, eventId: string): Promise<Notif
     purpose: "agent.send",
     deliveryMode: data.delivery,
     scope,
+    coalesce: data.coalesce,
   });
   if (!routed.routed) return null;
   return routed.jobId

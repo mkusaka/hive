@@ -19,7 +19,8 @@ const inboxItemColumns = `i.id, i.workspace_id AS workspaceId, i.bot_id AS botId
 
 /**
  * The receipt of one of the user's own commands, plus current routing state for an agent.send (`jobId`) or a
- * message.post (`jobIds`, one per mentioned Bot, null until routed).
+ * message.post (`jobIds`, one per woken Bot; null until routed, and stays null for a delivery coalesced into the Bot's
+ * busy Job, ROUTE-02). `routingStatus` is `routed` once every delivery was routed.
  */
 export const getOperation = async (db: D1Database, userId: string, wsIds: string[], id: string) => {
   if (wsIds.length === 0) throw notFound("operation");
@@ -43,14 +44,19 @@ export const getOperation = async (db: D1Database, userId: string, wsIds: string
     const ids = response.inboxItemIds;
     const { results } = await db
       .prepare(
-        `SELECT i.id, j.id AS jobId FROM inbox_items i
+        `SELECT i.id, i.delivery_id AS deliveryId, j.id AS jobId FROM inbox_items i
            LEFT JOIN jobs j ON j.workspace_id = i.workspace_id AND j.trigger_key = 'inbox:' || i.id
           WHERE i.id IN (${placeholders(ids)})`,
       )
       .bind(...ids)
-      .all<{ id: string; jobId: string | null }>();
-    const jobIds = ids.map((itemId) => results.find((r) => r.id === itemId)?.jobId ?? null);
-    return { ...base, routingStatus: jobIds.includes(null) ? "pending" : "routed", jobIds };
+      .all<{ id: string; deliveryId: string | null; jobId: string | null }>();
+    const rows = ids.map((itemId) => results.find((r) => r.id === itemId));
+    const routed = rows.every((r) => r?.deliveryId);
+    return {
+      ...base,
+      routingStatus: routed ? "routed" : "pending",
+      jobIds: rows.map((r) => r?.jobId ?? null),
+    };
   }
   if (!response.inboxItemId) return base;
   const item = await db
@@ -103,7 +109,7 @@ export const getJob = async (db: D1Database, wsIds: string[], id: string) => {
   const { results: runs } = await db
     .prepare(
       `SELECT id, state, execution_generation AS generation, lease_expires_at AS leaseExpiresAt,
-              device_id AS deviceId, started_at AS startedAt, result_error AS error
+              device_id AS deviceId, started_at AS startedAt, result_error AS error, outcome
          FROM runs WHERE workspace_id = ? AND job_id = ? AND kind = 'root' ORDER BY execution_generation`,
     )
     .bind(job.workspaceId, id)
@@ -170,7 +176,7 @@ export const getSidebar = async (db: D1Database, workspaceId: string, userId: st
 };
 
 /** The Channel's members (role `owner` / `member`); Bots carry `botId` and their current name. Callers must be members. */
-export const listChannelMembers = async (
+const requireMember = async (
   db: D1Database,
   input: { workspaceId: string; userId: string; channelId: string },
 ) => {
@@ -183,6 +189,13 @@ export const listChannelMembers = async (
     .bind(input.workspaceId, input.channelId, input.userId)
     .first();
   if (!member) throw notFound("channel");
+};
+
+export const listChannelMembers = async (
+  db: D1Database,
+  input: { workspaceId: string; userId: string; channelId: string },
+) => {
+  await requireMember(db, input);
   const { results } = await db
     .prepare(
       `SELECT a.id AS actorId, a.kind, COALESCE(b.name, a.display_name) AS name, a.user_id AS userId,
@@ -196,6 +209,34 @@ export const listChannelMembers = async (
     .bind(input.workspaceId, input.channelId)
     .all();
   return { members: results };
+};
+
+/** SQL: member Bot `b` of Channel `m.channel_id` has a Job in `states` triggered by a delivery in that Channel. */
+const jobsIn = (states: string) => `EXISTS (SELECT 1 FROM jobs j
+    JOIN inbox_items i ON i.workspace_id = j.workspace_id AND i.id = substr(j.trigger_key, 7)
+   WHERE j.workspace_id = b.workspace_id AND j.bot_id = b.id AND j.trigger_key LIKE 'inbox:%'
+     AND i.lane = m.channel_id AND j.state IN ${states})`;
+
+/**
+ * Per member Bot (by name), from its Jobs triggered by a delivery in this Channel (ROUTE-02): `working` (a Run is
+ * active), `reading` (queued or waiting for a device), else `idle`. `typing` is reserved. Callers must be members.
+ */
+export const channelPresence = async (
+  db: D1Database,
+  input: { workspaceId: string; userId: string; channelId: string },
+) => {
+  await requireMember(db, input);
+  const { results } = await db
+    .prepare(
+      `SELECT b.id AS botId, b.name,
+              CASE WHEN ${jobsIn("('active')")} THEN 'working'
+                   WHEN ${jobsIn("('queued', 'waiting_device')")} THEN 'reading' ELSE 'idle' END AS state
+         FROM channel_members m JOIN bots b ON b.workspace_id = m.workspace_id AND b.actor_id = m.actor_id
+        WHERE m.workspace_id = ? AND m.channel_id = ? ORDER BY b.name LIMIT 500`,
+    )
+    .bind(input.workspaceId, input.channelId)
+    .all();
+  return { presence: results };
 };
 
 /** The caller's DMs by Bot name: `id` = `conversationId`, the Bot (`botId`, `name`) and `lastMessage` like a channel. */
@@ -307,7 +348,9 @@ export const listJobs = async (
   const { results } = await db
     .prepare(
       `SELECT id, bot_id AS botId, task_id AS taskId, state, revision, trigger_key AS triggerKey,
-              cancel_requested_at AS cancelRequestedAt, created_at AS createdAt, updated_at AS updatedAt
+              cancel_requested_at AS cancelRequestedAt, created_at AS createdAt, updated_at AS updatedAt,
+              (SELECT outcome FROM runs r WHERE r.workspace_id = jobs.workspace_id AND r.job_id = jobs.id
+                ORDER BY r.execution_generation DESC LIMIT 1) AS outcome
          FROM jobs WHERE workspace_id = ? AND (? IS NULL OR state = ?)
         ORDER BY created_at DESC, id DESC LIMIT ?`,
     )
@@ -334,7 +377,7 @@ const threadSummaries = (parent: string) => `SELECT t.root_message_id, t.id AS c
  GROUP BY t.id`;
 
 const messageColumns = `m.id, m.conversation_id AS conversationId, m.seq, m.actor_id AS actorId, a.user_id AS userId,
-  m.body, m.created_at AS createdAt`;
+  m.body, m.reply_to_message_id AS replyToMessageId, m.created_at AS createdAt`;
 
 type Thread = {
   conversationId: string;

@@ -8,7 +8,7 @@ import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import type { SuggestionProps } from "@tiptap/suggestion";
 import { Fragment, useEffect, useRef, useState } from "react";
-import { type Inline, parseMarkdown, toMarkdown } from "./format.ts";
+import { everyone, type Inline, parseMarkdown, toMarkdown } from "./format.ts";
 import { Avatar, Icon, type Row, text } from "./ui.tsx";
 
 /** Bot id → name, for mention tokens. */
@@ -18,7 +18,7 @@ export const Inlines = ({ inlines, names }: { inlines: Inline[]; names: Names })
   inlines.map((part, i) =>
     part.kind === "mention" ? (
       <span key={i} className="mention">
-        @{names.get(part.id) ?? "unknown"}
+        @{part.id === everyone ? everyone : (names.get(part.id) ?? "unknown")}
       </span>
     ) : part.kind === "bold" ? (
       <strong key={i}>{part.text}</strong>
@@ -85,16 +85,27 @@ const byDay = (messages: Row[]) => {
   return days;
 };
 
-/** `jobIds`: null while routing is pending, then one per mentioned Bot (empty: nobody was mentioned). */
-type Operation = { operationId: string; jobIds: string[] | null; error?: string };
+/**
+ * `jobIds`: null while routing is pending, then the Jobs of the woken Bots (empty: nobody was woken); `busy` counts
+ * deliveries that got no Job because the Bot was already working in this channel (ROUTE-02).
+ */
+type Operation = { operationId: string; jobIds: string[] | null; busy?: number; error?: string };
 
-/** The Bots the `@` suggestion offers for `query` (name prefix); in a DM only its Bot, the implicit recipient. */
-export const mentionItems = (bots: Row[], query: string, dmBot: string | null) =>
-  bots.filter(
-    (b) =>
-      (dmBot === null || b.id === dmBot) &&
-      String(b.name).toLowerCase().startsWith(query.toLowerCase()),
-  );
+/**
+ * The Bots the `@` suggestion offers for `query` (name prefix); in a DM only its Bot, the implicit recipient. With
+ * `group` (a Channel's main conversation) `@everyone` comes last, also for the prefix of `all`.
+ */
+export const mentionItems = (bots: Row[], query: string, dmBot: string | null, group = false) => {
+  const q = query.toLowerCase();
+  return [
+    ...bots.filter(
+      (b) => (dmBot === null || b.id === dmBot) && String(b.name).toLowerCase().startsWith(q),
+    ),
+    ...(group && (everyone.startsWith(q) || "all".startsWith(q))
+      ? [{ id: everyone, name: everyone }]
+      : []),
+  ];
+};
 
 type Suggestion = SuggestionProps<Row, { id: string; label: string }>;
 
@@ -111,6 +122,10 @@ export const Composer = (props: {
   label: string;
   /** After an accepted post, with the conversation it landed in. */
   onPosted?: (conversationId: string) => void;
+  /** Offer `@everyone` (a Channel's main conversation). */
+  group?: boolean;
+  /** A Reply on this message (ROUTE-02): sent as `replyToMessageId`, shown above the editor until cleared. */
+  replyTo?: { id: string; name: string; clear: () => void } | null;
 }) => {
   const [suggestion, setSuggestion] = useState<Suggestion | null>(null);
   const [active, setActive] = useState(0);
@@ -139,7 +154,7 @@ export const Composer = (props: {
         suggestion: {
           items: ({ query }) => {
             const p = live.current.props;
-            return mentionItems(p.bots, query, p.dmBot);
+            return mentionItems(p.bots, query, p.dmBot, p.group);
           },
           render: () => ({
             onStart: (s) => {
@@ -194,10 +209,16 @@ export const Composer = (props: {
       operationId,
       idempotencyKey: crypto.randomUUID(),
       workspaceId: props.ws,
-      command: { type: "message.post", ...props.target, text: draft },
+      command: {
+        type: "message.post",
+        ...props.target,
+        ...(props.replyTo ? { replyToMessageId: props.replyTo.id } : {}),
+        text: draft,
+      },
     });
     if (!result.ok) return setOp({ operationId, jobIds: null, error: result.error.message });
     editor?.chain().clearContent(true).focus().run();
+    props.replyTo?.clear();
     if (typeof result.value.conversationId === "string")
       props.onPosted?.(result.value.conversationId);
     const woken = (result.value.inboxItemIds as unknown[] | undefined)?.length ?? 0;
@@ -208,8 +229,15 @@ export const Composer = (props: {
       await new Promise((resolve) => setTimeout(resolve, 2000));
       const res = await window.hive.api.get(`/v1/operations/${encodeURIComponent(operationId)}`);
       const jobIds = res.ok ? (res.value.jobIds as (string | null)[] | undefined) : undefined;
-      if (jobIds?.every((id) => typeof id === "string"))
-        return setOp({ operationId, jobIds: jobIds as string[] });
+      if (
+        jobIds?.every((id) => typeof id === "string") ||
+        (res.ok && res.value.routingStatus === "routed")
+      )
+        return setOp({
+          operationId,
+          jobIds: (jobIds ?? []).filter((id) => typeof id === "string"),
+          busy: (jobIds ?? []).filter((id) => id === null).length,
+        });
     }
   };
 
@@ -240,6 +268,19 @@ export const Composer = (props: {
           void send();
         }}
       >
+        {props.replyTo && (
+          <div className="replying">
+            Replying to {props.replyTo.name}
+            <button
+              type="button"
+              className="icon"
+              aria-label="Cancel reply"
+              onClick={props.replyTo.clear}
+            >
+              <Icon name="close" />
+            </button>
+          </div>
+        )}
         {matches.length > 0 && (
           <ul className="mentions" role="listbox" aria-label="Mention a Bot">
             {matches.map((b, i) => (
@@ -270,20 +311,38 @@ export const Composer = (props: {
             {op.error ??
               (op.jobIds === null
                 ? "accepted, routing pending"
-                : op.jobIds.length === 0
-                  ? "posted, no Bot mentioned"
-                  : op.jobIds.map((id, i) => (
-                      <Fragment key={id}>
-                        {i === 0 ? (op.jobIds!.length > 1 ? "jobs " : "job ") : ", "}
-                        <span className="mono">{id}</span>
-                      </Fragment>
-                    )))}
+                : op.jobIds.length === 0 && !op.busy
+                  ? "posted, no Bot woken"
+                  : [
+                      ...op.jobIds.map((id, i) => (
+                        <Fragment key={id}>
+                          {i === 0 ? (op.jobIds!.length > 1 ? "jobs " : "job ") : ", "}
+                          <span className="mono">{id}</span>
+                        </Fragment>
+                      )),
+                      op.busy
+                        ? `${op.jobIds.length ? "; " : ""}${op.busy} busy ${op.busy === 1 ? "Bot reads" : "Bots read"} it in the current Job`
+                        : "",
+                    ])}
           </>
         )}
       </p>
     </>
   );
 };
+
+/** Mention tokens as `@name` (plain text: the clipboard, a reply quote). */
+const renderTokens = (body: string, names: Names) =>
+  body
+    .replaceAll(/<@bot:([^>\s]+)>/g, (_, id: string) => `@${names.get(id) ?? "unknown"}`)
+    .replaceAll("<@everyone>", "@everyone");
+
+/** "You", a Bot's name or the actor id's start. */
+const authorName = (m: Row, botByActor: Map<string, Row>, me: string | null) =>
+  text(
+    botByActor.get(String(m.actorId))?.name ??
+      (me && m.userId === me ? "You" : String(m.actorId).slice(0, 8)),
+  );
 
 const time = (at: unknown) =>
   new Date(String(at)).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
@@ -304,6 +363,10 @@ const Message = (props: {
   openBot: (id: string) => void;
   /** Reply in thread / the footer; absent inside a thread. */
   openThread?: (m: Row) => void;
+  /** Reply (a quote that addresses a Bot's message to that Bot); only in a Channel's main conversation. */
+  reply?: (m: Row) => void;
+  /** The message this one replies to, when loaded. */
+  quoted?: Row;
 }) => {
   const { m } = props;
   const botByActor = new Map(props.bots.map((b) => [String(b.actorId), b]));
@@ -322,6 +385,12 @@ const Message = (props: {
         )}
         <time>{time(m.createdAt)}</time>
       </div>
+      {props.quoted && (
+        <p className="reply-quote ellipsis">
+          Replying to {authorName(props.quoted, botByActor, props.me)}:{" "}
+          {renderTokens(String(props.quoted.body ?? ""), names)}
+        </p>
+      )}
       <div className="bubble">
         <Markdown source={String(m.body ?? "")} names={names} />
       </div>
@@ -342,6 +411,11 @@ const Message = (props: {
         </button>
       )}
       <div className="hover-actions">
+        {props.reply && (
+          <button title="Reply" aria-label="Reply" onClick={() => props.reply?.(m)}>
+            <Icon name="reply" />
+          </button>
+        )}
         {props.openThread && (
           <button
             title="Reply in thread"
@@ -355,12 +429,7 @@ const Message = (props: {
           title="Copy"
           aria-label="Copy"
           onClick={() =>
-            void navigator.clipboard.writeText(
-              String(m.body ?? "").replaceAll(
-                /<@bot:([^>\s]+)>/g,
-                (_, id: string) => `@${names.get(id) ?? "unknown"}`,
-              ),
-            )
+            void navigator.clipboard.writeText(renderTokens(String(m.body ?? ""), names))
           }
         >
           <Icon name="copy" />
@@ -385,8 +454,12 @@ export const ChannelView = (props: {
   openChannelPanel: (tab: "about" | "members") => void;
   starred: boolean;
   toggleStar: () => void;
+  /** `GET /v1/channels/:id/presence`: per member Bot `reading` / `working` / `idle` (ROUTE-02). */
+  presence: Row[];
 }) => {
   const end = useRef<HTMLDivElement>(null);
+  const [replyTo, setReplyTo] = useState<Row | null>(null);
+  useEffect(() => setReplyTo(null), [props.channel?.id]);
   // Braces: Chromium's scrollIntoView returns a Promise, which React would call as the cleanup.
   useEffect(() => {
     void end.current?.scrollIntoView({ block: "end" });
@@ -402,6 +475,8 @@ export const ChannelView = (props: {
     ).values(),
   ];
 
+  const byId = new Map(props.messages.map((m) => [m.id, m]));
+  const active = props.presence.filter((p) => p.state === "reading" || p.state === "working");
   const name = text(props.channel?.name);
   const title = props.dm ? name : `#${name}`;
   if (!props.channel) return <div className="empty">No channel yet.</div>;
@@ -439,6 +514,15 @@ export const ChannelView = (props: {
               aria-label={`${memberCount} ${memberCount === 1 ? "member" : "members"}`}
               onClick={() => props.openChannelPanel("members")}
             >
+              {active.map((p) => (
+                <span
+                  key={String(p.botId)}
+                  className={`presence ${text(p.state)}`}
+                  title={`${text(p.name)} is ${text(p.state)}`}
+                >
+                  <Avatar id={String(p.botId)} name={String(p.name)} size={16} />
+                </span>
+              ))}
               <Icon name="users" /> {memberCount}
             </button>
             <button
@@ -472,6 +556,8 @@ export const ChannelView = (props: {
                 me={props.me}
                 openBot={props.openBot}
                 openThread={props.openThread}
+                reply={props.dm ? undefined : setReplyTo}
+                quoted={m.replyToMessageId ? byId.get(String(m.replyToMessageId)) : undefined}
               />
             ))}
           </section>
@@ -485,6 +571,14 @@ export const ChannelView = (props: {
         dmBot={props.dm ? dmBot : null}
         placeholder={`Message ${title}`}
         label="Message"
+        group={!props.dm}
+        replyTo={
+          replyTo && {
+            id: replyTo.id,
+            name: authorName(replyTo, botByActor, props.me),
+            clear: () => setReplyTo(null),
+          }
+        }
       />
     </div>
   );

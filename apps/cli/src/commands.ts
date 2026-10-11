@@ -1,7 +1,7 @@
 // Command bodies and watch loops (docs/architecture.md §22.3, §23). Web-standard APIs only: the api-worker
 // end-to-end test calls these inside workerd.
 /* oxlint-disable no-await-in-loop */
-import { mentionToken } from "@hive/contracts";
+import { tokenizeMentions } from "@hive/contracts";
 import { type Client, CliError, invalid } from "./client.ts";
 
 export type Envelope = { operationId: string; idempotencyKey: string; workspaceId: string };
@@ -147,12 +147,18 @@ export const agentSend = (
     delivery: input.notify ? "notify" : "wake",
   });
 
-/** With `resolveNames`, every `@name` of a Workspace Bot (longest names first) becomes its `<@bot:ID>` token. */
+/**
+ * With `resolveNames`, every `@name` of a Workspace Bot becomes its `<@bot:ID>` token and `@everyone` / `@all` the
+ * `<@everyone>` token (contracts `tokenizeMentions`).
+ */
 export const messagePost = async (
   c: Client,
   e: Envelope,
   input: {
-    target: ({ channelId: string } | { conversationId: string }) & { threadOf?: string };
+    target: ({ channelId: string } | { conversationId: string }) & {
+      threadOf?: string;
+      replyToMessageId?: string;
+    };
     text: string;
     resolveNames: boolean;
   },
@@ -160,8 +166,7 @@ export const messagePost = async (
   let text = input.text;
   if (input.resolveNames) {
     const { bots } = (await listBots(c, e.workspaceId)) as { bots: { id: string; name: string }[] };
-    for (const bot of bots.toSorted((a, b) => b.name.length - a.name.length))
-      text = text.replaceAll(`@${bot.name}`, mentionToken(bot.id));
+    text = tokenizeMentions(text, bots);
   }
   return c.command(e, { type: "message.post", ...input.target, text });
 };

@@ -33,6 +33,18 @@ const fromBot: RunContext = {
 const names = (ctx: RunContext) => hiveTools(ctx, fakeRunApi().api).map((t) => t.name);
 
 describe("hive tools", () => {
+  it("offers hive_pass in a Channel / DM, not to a bot request; calling it tells onPass", async () => {
+    let passed = false;
+    const tools = hiveTools(context, fakeRunApi().api, { onPass: () => (passed = true) });
+    expect(textOf(await handler(tools, "hive_pass")({}))).toBe('{"passed":true}');
+    expect(passed).toBe(true);
+    const pair: RunContext = {
+      ...fromBot,
+      conversation: { ...context.conversation!, kind: "bot_pair" },
+    };
+    expect(names(pair)).not.toContain("hive_pass");
+  });
+
   it("call /v1/run/commands with the capability, never the device token", async () => {
     const requests: { url: string; auth: string | null; body: unknown }[] = [];
     const cloud = createCloudClient({
@@ -86,6 +98,7 @@ describe("hive tools", () => {
       "hive_send_request",
       "hive_notify",
       "hive_wait_for_reply",
+      "hive_pass",
       "hive_memory_write",
       "hive_memory_search",
     ]);
@@ -353,6 +366,7 @@ describe("claudeAdapter with hive tools", () => {
       "mcp__hive__hive_send_request",
       "mcp__hive__hive_notify",
       "mcp__hive__hive_wait_for_reply",
+      "mcp__hive__hive_pass",
       "mcp__hive__hive_memory_write",
       "mcp__hive__hive_memory_search",
     ]);

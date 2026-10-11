@@ -844,6 +844,9 @@ export const runs = sqliteTable(
     // Submitted by the executor with the terminal state (run.result.submit).
     resultSummary: text("result_summary"),
     resultError: text("result_error"),
+    // `pass`: a `succeeded` Run whose Bot chose not to answer (ROUTE-02, `runtime.run.passed`); null otherwise. No CHECK:
+    // adding one to an existing SQLite table makes drizzle-kit recreate `runs`.
+    outcome: text("outcome"),
     // From the executor's `runtime.run.started` observation (§9.2 step 7); e.g. the Claude session id.
     providerSessionId: text("provider_session_id"),
     // Set by the same observation; null means the launch was never confirmed (§10.4 "unknown after launch intent").

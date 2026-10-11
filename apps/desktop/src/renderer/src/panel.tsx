@@ -183,6 +183,8 @@ export const ChannelPanel = (props: {
   close: () => void;
   tab: ChannelTab;
   setTab: (tab: ChannelTab) => void;
+  /** The open Channel's Bot presence (ROUTE-02), shown in Members. */
+  presence: Row[];
 }) => {
   const { tab, setTab } = props;
   const [members, setMembers] = useState<Row[]>([]);
@@ -260,6 +262,9 @@ export const ChannelPanel = (props: {
                 >
                   <Avatar id={String(m.botId)} name={String(m.name)} size={28} /> {label}
                 </button>
+                <span className="meta presence-state">
+                  {text(props.presence.find((p) => p.botId === m.botId)?.state ?? "idle")}
+                </span>
                 <button
                   className="icon"
                   aria-label={`${label} actions`}

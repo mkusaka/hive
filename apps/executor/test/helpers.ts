@@ -25,6 +25,8 @@ export const context: RunContext = {
     recent: [{ actorKind: "user", actorId: "actor-1", body: "Say hello.", createdAt: "" }],
   },
   parentMessages: [],
+  peers: [],
+  since: [],
   inboxItem: {
     id: "inbox-1",
     body: "Say hello.",

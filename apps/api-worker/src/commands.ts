@@ -28,6 +28,7 @@ import {
   JobStart,
   MemoryDelete,
   MemoryWrite,
+  everyoneToken,
   mentionedBotIds,
   MessagePost,
   type MessagePostAccepted,
@@ -641,12 +642,19 @@ const channelMember = async (
   return member;
 };
 
-/** Event, Inbox item and outbox row delivering a user's channel message to one Bot; routing creates the Job later. */
-const deliveryStatements = (
+/**
+ * Event, Inbox item and outbox row delivering a channel message to one Bot; routing creates the Job later. `from` is the
+ * sender (a user, or a Bot whose Run replied, ROUTE-02); `hop` and `correlationId` carry a Bot chain (§8.2).
+ * `coalesce`: a group delivery that gets no Job while the Bot is busy in the conversation.
+ */
+export const deliveryStatements = (
   db: D1Database,
-  env: Envelope,
+  workspaceId: string,
   input: {
-    userId: string;
+    from: { kind: "user" | "bot"; id: string };
+    correlationId: string;
+    hop?: number;
+    coalesce?: boolean;
     messageId: string;
     botId: string;
     channelId: string;
@@ -657,7 +665,6 @@ const deliveryStatements = (
     receivedAt: string;
   },
 ) => {
-  const { workspaceId } = env;
   const eventId = crypto.randomUUID();
   return [
     insertEvent(db, {
@@ -665,9 +672,9 @@ const deliveryStatements = (
       workspaceId,
       type: "agent.message.sent",
       schemaVersion: 1,
-      sourceKind: "cli",
-      actorKind: "user",
-      actorId: input.userId,
+      sourceKind: input.from.kind === "bot" ? "bot" : "cli",
+      actorKind: input.from.kind,
+      actorId: input.from.id,
       subjectKind: "message",
       subjectId: input.messageId,
       // Read by the event router (pump.ts); the message text stays in `messages`.
@@ -679,8 +686,10 @@ const deliveryStatements = (
         conversationId: input.conversationId,
         inboxItemId: input.inboxItemId,
         delivery: input.delivery,
+        ...(input.hop ? { hop: input.hop } : {}),
+        ...(input.coalesce ? { coalesce: true } : {}),
       },
-      correlationId: env.operationId,
+      correlationId: input.correlationId,
       occurredAt: input.receivedAt,
       receivedAt: input.receivedAt,
     }),
@@ -693,9 +702,62 @@ const deliveryStatements = (
       lane: input.channelId,
       purpose: "agent.send",
       deliveryMode: input.delivery,
+      hop: input.hop,
     }),
     enqueueOutbox(db, { workspaceId, topic: "event.route", payload: { eventId } }),
   ];
+};
+
+/**
+ * Group chat in a Channel's main conversation (ROUTE-02): the Bots a post wakes. Every member Bot by default;
+ * `<@bot:ID>` mentions and a Reply on a Bot's message narrow it to the addressed Bots, `<@everyone>` is every member
+ * again. The author Bot is never woken. `joining`: mentioned Bots that are not members (actor ids); `unknown`: tokens
+ * naming no Bot of the Workspace. Used by message.post and by a Run's reply (executor.ts).
+ */
+export const groupRecipients = async (
+  db: D1Database,
+  input: {
+    workspaceId: string;
+    channelId: string;
+    conversationId: string;
+    text: string;
+    replyToMessageId?: string;
+    authorBotId?: string;
+  },
+) => {
+  const mentioned = mentionedBotIds(input.text);
+  const { results: bots } = await db
+    .prepare(
+      `SELECT b.id, b.actor_id, EXISTS (SELECT 1 FROM channel_members m WHERE m.workspace_id = b.workspace_id
+                AND m.channel_id = ?1 AND m.actor_id = b.actor_id) AS member
+         FROM bots b WHERE b.workspace_id = ?2
+          AND (b.id IN (SELECT value FROM json_each(?3))
+               OR b.actor_id IN (SELECT actor_id FROM channel_members WHERE workspace_id = ?2 AND channel_id = ?1))
+        ORDER BY b.name`,
+    )
+    .bind(input.channelId, input.workspaceId, JSON.stringify(mentioned))
+    .all<{ id: string; actor_id: string; member: number }>();
+  const replied = input.replyToMessageId
+    ? await db
+        .prepare(
+          `SELECT b.id FROM messages m JOIN bots b ON b.workspace_id = m.workspace_id AND b.actor_id = m.actor_id
+            WHERE m.workspace_id = ? AND m.id = ? AND m.conversation_id = ?`,
+        )
+        .bind(input.workspaceId, input.replyToMessageId, input.conversationId)
+        .first<{ id: string }>()
+    : null;
+  const known = mentioned.filter((id) => bots.some((b) => b.id === id));
+  const addressed = [...known, ...(replied ? [replied.id] : [])];
+  const members = bots.filter((b) => b.member).map((b) => b.id);
+  const recipients =
+    input.text.includes(everyoneToken) || addressed.length === 0
+      ? [...new Set([...members, ...known])]
+      : [...new Set(addressed)];
+  return {
+    recipients: recipients.filter((id) => id !== input.authorBotId),
+    joining: bots.filter((b) => !b.member && known.includes(b.id)).map((b) => b.actor_id),
+    unknown: mentioned.filter((id) => !known.includes(id)),
+  };
 };
 
 /** §11.1: Message, Inbox item, Event, Change Log, Outbox and Receipt in one batch. Routing creates the Job later. */
@@ -733,8 +795,9 @@ const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env
         clientMessageId: env.idempotencyKey,
         body: command.message.text,
       }),
-      ...deliveryStatements(db, env, {
-        userId: user.userId,
+      ...deliveryStatements(db, workspaceId, {
+        from: { kind: "user", id: user.userId },
+        correlationId: env.operationId,
         messageId,
         botId: command.recipientBotId,
         channelId: command.channelId,
@@ -777,12 +840,12 @@ const dmParticipant = async (
 const threadId = (rootMessageId: string) => `thread-${rootMessageId}`;
 
 /**
- * One message. In a Channel, each Bot mentioned by a `<@bot:ID>` token gets the delivery of a waking `agent.send`
- * request and joins the Channel when it is not a member. In a DM the DM's Bot is the one recipient; a mention of
- * another Bot is 422. A token naming no Bot of the Workspace, or `mentions` differing from the tokens, is 422.
- * With `threadOf` the message goes to the root message's thread (created here on the first reply, same batch); in a
- * Channel thread the Bots that took part in it (posted there, the root included, or were delivered a message there)
- * are woken as well.
+ * One message. In a Channel's main conversation the group rule picks the woken Bots (`groupRecipients`, ROUTE-02) and a
+ * mentioned non-member joins. In a DM the DM's Bot is the one recipient; a mention of another Bot is 422. A token
+ * naming no Bot of the Workspace, or `mentions` differing from the tokens, is 422. `replyToMessageId` must be a message
+ * of the addressed conversation. With `threadOf` the message goes to the root message's thread (created here on the
+ * first reply, same batch); in a Channel thread the mentioned Bots and those that took part in it (posted there, the
+ * root included, or were delivered a message there) are woken.
  */
 const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user, env) => {
   const { workspaceId, command } = env;
@@ -812,29 +875,34 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
     : null;
   if (command.threadOf && !root) throw new HttpError("NOT_FOUND", "thread root message not found");
   const conversationId = root ? threadId(root.id) : parent.conversation_id;
+  if (command.replyToMessageId) {
+    const quoted = await db
+      .prepare("SELECT 1 FROM messages WHERE workspace_id = ? AND id = ? AND conversation_id = ?")
+      .bind(workspaceId, command.replyToMessageId, conversationId)
+      .first();
+    if (!quoted) throw new HttpError("NOT_FOUND", "replyToMessageId is not in this conversation");
+  }
   let joining: string[] = [];
   let recipients = botIds;
+  const group = !parent.dm_bot_id && !root;
   if (parent.dm_bot_id) {
     if (botIds.some((id) => id !== parent.dm_bot_id)) {
       throw new HttpError("INVALID_INPUT", "a DM can only mention its own bot");
     }
     recipients = [parent.dm_bot_id];
   } else {
-    if (botIds.length > 0) {
-      const { results } = await db
-        .prepare(
-          `SELECT b.id, b.actor_id, EXISTS (SELECT 1 FROM channel_members m WHERE m.workspace_id = b.workspace_id
-                    AND m.channel_id = ? AND m.actor_id = b.actor_id) AS member
-             FROM bots b WHERE b.workspace_id = ? AND b.id IN (${botIds.map(() => "?").join(", ")})`,
-        )
-        .bind(parent.channel_id, workspaceId, ...botIds)
-        .all<{ id: string; actor_id: string; member: number }>();
-      const unknown = botIds.filter((id) => !results.some((r) => r.id === id));
-      if (unknown.length > 0) {
-        throw new HttpError("INVALID_INPUT", `unknown bot in mention: ${unknown.join(", ")}`);
-      }
-      joining = results.filter((r) => !r.member).map((r) => r.actor_id);
+    const wake = await groupRecipients(db, {
+      workspaceId,
+      channelId: parent.channel_id,
+      conversationId,
+      text: command.text,
+      replyToMessageId: command.replyToMessageId,
+    });
+    if (wake.unknown.length > 0) {
+      throw new HttpError("INVALID_INPUT", `unknown bot in mention: ${wake.unknown.join(", ")}`);
     }
+    joining = wake.joining;
+    recipients = wake.recipients;
     if (root) {
       const { results } = await db
         .prepare(
@@ -891,10 +959,13 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
         actorId: parent.actor_id,
         clientMessageId: env.idempotencyKey,
         body: command.text,
+        replyToMessageId: command.replyToMessageId,
       }),
       ...deliveries.flatMap((d) =>
-        deliveryStatements(db, env, {
-          userId: user.userId,
+        deliveryStatements(db, workspaceId, {
+          from: { kind: "user", id: user.userId },
+          correlationId: env.operationId,
+          coalesce: group,
           messageId,
           botId: d.botId,
           channelId: parent.channel_id,
@@ -905,16 +976,7 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
           receivedAt,
         }),
       ),
-      ...(joining.length > 0
-        ? [
-            db
-              .prepare(
-                `INSERT INTO channel_members (workspace_id, channel_id, actor_id, role)
-                 SELECT ?, ?, value, 'member' FROM json_each(?) WHERE true ON CONFLICT DO NOTHING`,
-              )
-              .bind(workspaceId, parent.channel_id, JSON.stringify(joining)),
-          ]
-        : []),
+      ...(joining.length > 0 ? [joinChannel(db, workspaceId, parent.channel_id, joining)] : []),
       indexLater(db, workspaceId, "message", messageId),
     ],
     response,
@@ -927,6 +989,20 @@ const messagePost: Handler<v.InferOutput<typeof MessagePost>> = async (db, user,
     ],
   );
 };
+
+/** Adds Bots (actor ids) to a Channel as members; an existing member is kept. */
+export const joinChannel = (
+  db: D1Database,
+  workspaceId: string,
+  channelId: string,
+  actorIds: string[],
+) =>
+  db
+    .prepare(
+      `INSERT INTO channel_members (workspace_id, channel_id, actor_id, role)
+       SELECT ?, ?, value, 'member' FROM json_each(?) WHERE true ON CONFLICT DO NOTHING`,
+    )
+    .bind(workspaceId, channelId, JSON.stringify(actorIds));
 
 const eventEmit: Handler<v.InferOutput<typeof EventEmit>> = async (db, user, env) => {
   const { workspaceId, command } = env;
@@ -2846,16 +2922,21 @@ const botPairId = (a: string, b: string) => `botpair:${[a, b].toSorted().join(":
 const chainLimit = (message: string, reason: string) =>
   new HttpError("INVALID_INPUT", message, false, reason);
 
+/** The Jobs of one chain (§8.2): those carrying its correlation id, and the Job that started it. */
+export const chainJobs = async (db: D1Database, workspaceId: string, correlationId: string) =>
+  (
+    await db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM jobs WHERE workspace_id = ? AND (correlation_id = ? OR id = ?)",
+      )
+      .bind(workspaceId, correlationId, correlationId)
+      .first<{ n: number }>()
+  )?.n ?? 0;
+
 /** At most `maxCorrelatedJobs` Jobs per chain (§8.2), for a Run that is about to add one. */
 const checkChainBudget = async (db: D1Database, run: Run) => {
   // ponytail: checked before the batch, so concurrent requests of one chain can overshoot by a few Jobs.
-  const related = await db
-    .prepare(
-      "SELECT COUNT(*) AS n FROM jobs WHERE workspace_id = ? AND (correlation_id = ? OR id = ?)",
-    )
-    .bind(run.workspaceId, run.correlationId, run.correlationId)
-    .first<{ n: number }>();
-  if ((related?.n ?? 0) >= maxCorrelatedJobs) {
+  if ((await chainJobs(db, run.workspaceId, run.correlationId)) >= maxCorrelatedJobs) {
     throw chainLimit(`bot-to-bot chain exceeds ${maxCorrelatedJobs} jobs`, "budget_exceeded");
   }
 };

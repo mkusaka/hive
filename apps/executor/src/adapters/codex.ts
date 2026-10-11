@@ -283,8 +283,13 @@ export const codexAdapter = ({
       }
     };
 
+    let passed = false;
     const tools = ctx.run
-      ? hiveTools(ctx.context, ctx.run, { signal: abort.signal, pollMs: approvalPollMs })
+      ? hiveTools(ctx.context, ctx.run, {
+          signal: abort.signal,
+          pollMs: approvalPollMs,
+          onPass: () => (passed = true),
+        })
       : [];
     const gate = approvalGate({
       policy,
@@ -473,7 +478,7 @@ export const codexAdapter = ({
         await file.close();
       }
     };
-    const exited = run();
+    const exited = run().then((exit) => ({ ...exit, ...(passed ? { pass: true } : {}) }));
     return { requestStop: stop, waitForExit: () => exited };
   },
 });

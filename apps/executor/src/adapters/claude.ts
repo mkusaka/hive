@@ -39,15 +39,26 @@ export const systemPrompt = ({ bot }: LaunchContext["context"]) =>
 const promptLine = (m: { actorKind: string; actorId: string; body: string }) =>
   `[${m.actorKind} ${m.actorId}] ${m.body}`;
 
+const speaker = (m: { speakerKind: string; speakerName: string; isSelf: boolean }) =>
+  `${m.speakerKind} ${m.speakerName}${m.isSelf ? " (you)" : ""}`;
+
+/** The group chat rule every member Bot of a Channel gets (ROUTE-02). */
+export const groupRule =
+  "Reply only if this message is for you or you own the next step; otherwise pass (call hive_pass and end your " +
+  "turn). Prefer a single owner. Do not repeat what a peer already said.";
+
 /**
- * User message: Task, a thread's parent messages, recent conversation (oldest first), Memory, Related search hits,
- * then the trigger item's body (naming the sending Bot), the batch's items or a Delegation's instructions, then replies
- * to this Job's earlier requests.
+ * User message: Task, a thread's parent messages, recent conversation (oldest first), in a Channel the group block
+ * (peers, messages since your last turn, the group rule), Memory, Related search hits, then the trigger item's body
+ * (naming the sending Bot), the batch's items or a Delegation's instructions, then replies to this Job's earlier
+ * requests.
  */
 export const userPrompt = ({
   task,
   conversation,
   parentMessages,
+  peers,
+  since,
   inboxItem,
   batch,
   replies,
@@ -70,6 +81,23 @@ export const userPrompt = ({
     parts.push(
       `${conversation.kind === "thread" ? "Thread (root message first)" : "Recent conversation"}:\n${lines.join("\n")}`,
     );
+  }
+  if (conversation?.kind === "channel") {
+    const lines = [
+      "Group conversation. Every member Bot reads every post in this channel.",
+      `Other member Bots:${peers.length ? "" : " none"}`,
+      ...peers.map((p) => `- ${p.name}${p.description ? `: ${p.description}` : ""}`),
+    ];
+    if (since.length) {
+      lines.push(
+        "New since your last turn:",
+        ...since.map(
+          (m) =>
+            `[${speaker(m)}]${m.replyTo ? ` (replying to ${speaker(m.replyTo)}: "${m.replyTo.quote}")` : ""} ${m.body}`,
+        ),
+      );
+    }
+    parts.push([...lines, groupRule].join("\n"));
   }
   if (memories.length) {
     parts.push(`Memory:\n${memories.map((m) => `- (${m.scopeKind}) ${m.content}`).join("\n")}`);
@@ -196,8 +224,14 @@ export const claudeAdapter = ({
 
     const abort = new AbortController();
     let stopReason: string | undefined;
+    // ponytail: a pass is known only in this process; a Run resumed from a finished transcript posts its text.
+    let passed = false;
     const tools = ctx.run
-      ? hiveTools(ctx.context, ctx.run, { signal: abort.signal, pollMs: approvalPollMs })
+      ? hiveTools(ctx.context, ctx.run, {
+          signal: abort.signal,
+          pollMs: approvalPollMs,
+          onPass: () => (passed = true),
+        })
       : [];
     const hive = tools.map((t) => toolName(t.name));
     // tool_use id → requestMessageId of `hive_wait_for_reply` calls not yet answered.
@@ -288,17 +322,19 @@ export const claudeAdapter = ({
         await file.close();
       }
     };
-    const exited = run().then((exit) =>
-      mirrorErrors
-        ? {
-            ...exit,
-            summary: truncate(
-              `${exit.summary}; session mirror degraded: ${mirrorErrors} mirror_error`,
-              kib8,
-            ),
-          }
-        : exit,
-    );
+    const exited = run()
+      .then((exit) => ({ ...exit, ...(passed ? { pass: true } : {}) }))
+      .then((exit) =>
+        mirrorErrors
+          ? {
+              ...exit,
+              summary: truncate(
+                `${exit.summary}; session mirror degraded: ${mirrorErrors} mirror_error`,
+                kib8,
+              ),
+            }
+          : exit,
+      );
     return {
       requestStop: async (reason) => {
         stopReason = reason;

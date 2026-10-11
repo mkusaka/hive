@@ -397,6 +397,44 @@ button.icon.active {
   background: var(--hover);
   color: var(--text);
 }
+/* Group chat presence (ROUTE-02): member Bots reading (Job queued) or working (Run active), with a subtle pulse. */
+.presence {
+  display: inline-flex;
+  border-radius: 50%;
+  animation: presence-pulse 1.6s ease-in-out infinite;
+}
+.presence.reading {
+  opacity: 0.6;
+}
+@keyframes presence-pulse {
+  50% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .presence {
+    animation: none;
+  }
+}
+.presence-state {
+  margin-left: auto;
+  margin-right: 8px;
+}
+.replying {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.reply-quote {
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: var(--text-3);
+}
 button.pill:hover {
   background: var(--hover);
 }

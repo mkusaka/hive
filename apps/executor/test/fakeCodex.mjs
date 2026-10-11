@@ -82,6 +82,11 @@ const play = () => {
         () => {},
       );
       break;
+    case "pass":
+      ask("t2", "item/tool/call", { callId: "c2", tool: "hive_pass", arguments: {} }, () =>
+        done("Not for me."),
+      );
+      break;
     case "crash":
       process.exit(3);
       break;

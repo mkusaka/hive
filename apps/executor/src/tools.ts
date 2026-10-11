@@ -110,13 +110,14 @@ const integrationId = z
   .describe("Integration id; omit when the workspace has one of this kind");
 
 /**
- * The tools this Run may use: `hive_reply` only for a request from another Bot, task tools only for a Task Job, effect
- * tools only for kinds the Bot's policy does not deny. `signal` (the Run's stop) ends an effect tool's wait.
+ * The tools this Run may use: `hive_reply` only for a request from another Bot, `hive_pass` only in a Channel, thread
+ * or DM, task tools only for a Task Job, effect tools only for kinds the Bot's policy does not deny. `signal` (the Run's
+ * stop) ends an effect tool's wait; `onPass` is told when the Bot passed (the adapter marks its exit, ROUTE-02).
  */
 export const hiveTools = (
   context: RunContext,
   run: RunApi,
-  opts: { signal?: AbortSignal; pollMs?: number } = {},
+  opts: { signal?: AbortSignal; pollMs?: number; onPass?: () => void } = {},
 ) => {
   const tools: SdkMcpToolDefinition<any>[] = [
     tool(
@@ -140,6 +141,20 @@ export const hiveTools = (
       async () => result({ waiting: true }),
     ),
   ];
+  if (context.conversation && context.conversation.kind !== "bot_pair") {
+    tools.push(
+      tool(
+        "hive_pass",
+        "Stay silent in this conversation: nothing you write afterwards is posted. Call it when the message is not " +
+          "for you or another member owns the next step, then end your turn.",
+        {},
+        async () => {
+          opts.onPass?.();
+          return result({ passed: true });
+        },
+      ),
+    );
+  }
   const item = context.inboxItem;
   if (item?.kind === "request" && item.fromBot && item.messageId) {
     const requestMessageId = item.messageId;

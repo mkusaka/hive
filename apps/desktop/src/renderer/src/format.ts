@@ -2,10 +2,13 @@
 // schedule lines and avatar colors.
 import type { JSONContent } from "@tiptap/core";
 
+/** The mention id of `<@everyone>`: every member Bot of the Channel (ROUTE-02). */
+export const everyone = "everyone";
+
 export type Inline =
   | { kind: "text" | "bold" | "italic" | "code"; text: string }
   | { kind: "link"; text: string; url: string }
-  /** A `<@bot:ID>` token (contracts `mentionToken`); the view shows the Bot's name. */
+  /** A `<@bot:ID>` token (contracts `mentionToken`); the view shows the Bot's name. `<@everyone>` has id `everyone`. */
   | { kind: "mention"; id: string };
 export type Block =
   | { kind: "p"; inlines: Inline[] }
@@ -13,7 +16,7 @@ export type Block =
   | { kind: "code"; text: string };
 
 const inlinePattern =
-  /\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\)|<@bot:([^>\s]+)>|(?<!\w)_([^_\n]+)_(?!\w)/g;
+  /\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\)|<@bot:([^>\s]+)>|<@(everyone)>|(?<!\w)_([^_\n]+)_(?!\w)/g;
 
 /** `**bold**`, `_italic_`, `` `code` ``, `[text](url)` and mention tokens; everything else is text. */
 export const parseInline = (text: string): Inline[] => {
@@ -23,8 +26,9 @@ export const parseInline = (text: string): Inline[] => {
     if (m.index > last) out.push({ kind: "text", text: text.slice(last, m.index) });
     if (m[1] !== undefined) out.push({ kind: "bold", text: m[1] });
     else if (m[2] !== undefined) out.push({ kind: "code", text: m[2] });
-    else if (m[5] !== undefined) out.push({ kind: "mention", id: m[5] });
-    else if (m[6] !== undefined) out.push({ kind: "italic", text: m[6] });
+    else if (m[5] !== undefined || m[6] !== undefined)
+      out.push({ kind: "mention", id: (m[5] ?? m[6])! });
+    else if (m[7] !== undefined) out.push({ kind: "italic", text: m[7] });
     else out.push({ kind: "link", text: m[3]!, url: m[4]! });
     last = m.index + m[0].length;
   }
@@ -77,7 +81,8 @@ const marks: Record<string, string> = { bold: "**", italic: "_", code: "`" };
 const inlineMarkdown = (nodes: JSONContent[] = []) =>
   nodes
     .map((n) => {
-      if (n.type === "mention") return `<@bot:${String(n.attrs?.id)}>`;
+      if (n.type === "mention")
+        return n.attrs?.id === everyone ? "<@everyone>" : `<@bot:${String(n.attrs?.id)}>`;
       if (n.type === "hardBreak") return "\n";
       return (n.marks ?? []).reduce((out, m) => {
         const wrap = marks[m.type];

@@ -57,14 +57,14 @@ describe("chat", () => {
     expect(authors).toEqual(["You", "C coder"]);
   });
 
-  it("posts message.post on Enter; without a mention it says nobody was woken", async () => {
+  it("posts message.post on Enter; with no Bot woken it says so", async () => {
     const { hive, user } = renderApp({ command: accepted([]) });
     await screen.findByText("please fix the build");
     const box = editor();
     expect(placeholder(box)).toBe("Message #general");
     await user.type(box, "hello{Enter}");
     expect(hive.sent("message.post")).toEqual([post("hello")]);
-    expect(await screen.findByText(/posted, no Bot mentioned/)).toBeTruthy();
+    expect(await screen.findByText(/posted, no Bot woken/)).toBeTruthy();
     // Cleared and still focused: the placeholder is back.
     expect(box.textContent).toBe("");
     expect(placeholder(box)).toBe("Message #general");
@@ -89,6 +89,7 @@ describe("chat", () => {
     expect(options()).toEqual([
       ["C coder", "true"],
       ["R reviewer", "false"],
+      ["E everyone", "false"],
     ]);
     await user.type(box, "cod");
     expect(options()).toEqual([["C coder", "true"]]);
@@ -208,7 +209,10 @@ describe("chat", () => {
     const { hive } = renderApp();
     await screen.findByText("please fix the build");
     const count = (path: string) => hive.calls.get.filter((p) => p.startsWith(path)).length;
-    const before = { channels: count("/v1/channels?"), messages: count("/v1/channels/ch-1/") };
+    const before = {
+      channels: count("/v1/channels?"),
+      messages: count("/v1/channels/ch-1/messages"),
+    };
     hive.routes["/v1/sync/changes"] = (q) =>
       q.get("cursor")
         ? {
@@ -231,7 +235,7 @@ describe("chat", () => {
     act(() => hive.emit({ type: "sync.changed", cursor: "C1", scopes: ["channel:ch-1"] }));
     expect(await screen.findByText("a new reply")).toBeTruthy();
     expect(count("/v1/channels?")).toBe(before.channels + 1);
-    expect(count("/v1/channels/ch-1/")).toBe(before.messages + 1);
+    expect(count("/v1/channels/ch-1/messages")).toBe(before.messages + 1);
   });
 
   it("groups messages by day under a date pill", async () => {

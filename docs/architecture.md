@@ -430,14 +430,16 @@ Implemented as (MENTION-01): a user's channel message addresses Bots with mentio
 `<@U123>` shape, namespaced for a later `<@user:ID>`) stored in the body; names are resolved only for display.
 `message.post {channelId, text, mentions?}` writes one message and, per mentioned Bot, the same `agent.message.sent`
 Event + `wake` Inbox item (purpose `agent.send`) + outbox row as a `request` `agent.send`, so routing gives one Job per
-Bot; no mention = only posted. A token naming no Bot of the Workspace, or `mentions` differing from the tokens, is 422.
+Bot; no mention = only posted (superseded for Channels by ROUTE-02 below). A token naming no Bot of the Workspace, or
+`mentions` differing from the tokens, is 422.
 The run context renders tokens as `@<bot name>` (`@unknown` for a missing Bot). `agent.send` stays for the CLI,
 bot-to-bot and integrations.
 
 Implemented as (DM-01): Slack's two conversation kinds. **Channels** have members, and Bots are real members:
 `channel.join` / `channel.leave {channelId, botId}` (callers must be members; `channel` change row), and a
 `message.post` mentioning a non-member Bot adds it in the same batch (one `INSERT … SELECT FROM json_each`, one
-`channel` change row). Membership never routes: a member Bot wakes only when mentioned or sent to. **Direct messages**
+`channel` change row). Membership routes since ROUTE-02 (below): a member Bot reads every post of the Channel's main
+conversation. **Direct messages**
 are `conversations.kind = 'dm'` with `dm_user_id` + `dm_bot_id` (migration 0021, partial UNIQUE on
 `(workspace_id, dm_user_id, dm_bot_id) WHERE kind = 'dm'`). Like a bot pair, a DM is backed by a member-less Channel
 row sharing its id `dm-<userId>-<botId>` (`channel_id` is NOT NULL and the table cannot be rebuilt on D1), so it is
@@ -465,6 +467,40 @@ before the root (read-only context in the prompt); the Bot's reply goes to the t
 parent's rule (Channel member / DM user). Parent message lists carry a per-message `thread` summary
 (`conversationId`, `replyCount`, `lastReplyAt`, ≤ 5 participant actor ids) from one grouped subquery; the Channel's
 `lastMessage` preview ignores replies. `GET /v1/threads?participant=me` lists threads the user started or replied in.
+
+Implemented as (ROUTE-02): a Channel's main conversation is a **group chat** with Grok Bot semantics; DMs and threads
+keep their wake rules. One function (`groupRecipients`, api-worker `commands.ts`) decides who a post wakes, for a
+user's `message.post` and for a Run's reply alike:
+
+1. A post with no mention wakes **every member Bot** (`channel_members` with a Bot actor), one delivery each in the
+   `message.post` batch; a Channel without member Bots only posts. `<@bot:ID>` mentions narrow it to those Bots (a
+   non-member joins, as before), `<@everyone>` (composer `@everyone` / `@all`) is every member, and a Reply
+   (`message.post.replyToMessageId`, a message of the same conversation, stored as `reply_to_message_id`) on a Bot's
+   message addresses that Bot. A Reply on a human message is a plain post.
+2. The run context of a Channel Run adds `peers` (the other member Bots: id, name, first line of instructions ≤ 120
+   chars) and `since`: up to 50 messages posted after this Bot's previous Run in the conversation, each with
+   `speakerKind` (`human` | `bot`), `speakerName`, `isSelf` and a `replyTo` quote. The prompt gets a "Group
+   conversation" block with the peers, `since` and the rule "Reply only if this message is for you or you own the next
+   step; otherwise pass. Prefer a single owner. Do not repeat what a peer already said."
+3. **Pass**: a Run in a Channel, thread or DM may call the in-run tool `hive_pass`; a Run that neither passes nor has
+   final text passes too. The runner submits `run.result.submit {pass: true}` without `reply`; the Worker posts
+   nothing, sets `runs.outcome = 'pass'` (migration 0023) and records a `runtime.run.passed` Event (subject the Run,
+   no routing). Activity shows such a Job / Run as `passed`.
+4. A Bot's reply posted into the Channel's main conversation is a group post for the **other** members: `@name` in the
+   reply becomes a mention token (contracts `tokenizeMentions`), each delivery's Inbox item carries `hop + 1` and the
+   chain's correlation id (the triggering Job's), and the author is never woken. Past max 4 hops or 20 correlated Jobs
+   (§8.2) the reply is posted and wakes nobody.
+5. **Coalescing**: a group delivery to a Bot that already has a `queued` / `waiting_device` / `active` /
+   `waiting_input` Job triggered in the same conversation gets its Inbox item but no Job (the conditional
+   `INSERT … SELECT … WHERE NOT busy` runs in the routing batch, so it is atomic with the busy check). The Bot's next
+   Run reads those messages through `since`. When a Run in that conversation finishes, the same `finishRun` batch
+   queues one follow-up Job for the newest delivery that arrived after the Run was created, unless the Bot is busy
+   there again; deliveries already covered by `since` are marked handled with the Run's input items. No new table.
+   `GET /v1/operations/:id` is `routed` once every delivery routed; a coalesced one keeps `jobId: null`.
+6. **Presence**: `GET /v1/channels/:id/presence` gives each member Bot `working` (a Job triggered in the Channel is
+   `active`), `reading` (`queued` / `waiting_device`) or `idle`; `typing` is reserved. The chat header shows reading /
+   working Bots as pulsing blobs on the member count, and Members shows the state.
+7. Bot-to-bot `agent.send` stays private in the `bot_pair` conversation and out of the Channel transcript.
 
 ### 7.3 Concurrency (§10.3)
 
@@ -518,6 +554,11 @@ the Task's `scope_revision` at delegation. The pump closes a delegation when its
 - Native subagent traffic is the exception, but claiming shared Tasks, formal Bot messages and external side
   effects still go through cloud authorization. Runtime parent/child relations and results are synced later as
   observations.
+
+Implemented as (ROUTE-02): a Bot's reply in a Channel's group chat is a bot-to-bot step too. Each delivery it causes
+carries `hop + 1` and the triggering Job's correlation id; the reply wakes nobody once the hop would pass 4 or the chain
+already has 20 Jobs. Unlike `agent.send`, hitting a limit is not an error: the reply is still posted. Coalescing
+(§7.2) bounds a round to at most one Job per member Bot.
 
 ## 9. Job / Run / Execution (§12)
 

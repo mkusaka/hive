@@ -48,7 +48,7 @@ export type RunningAgent = {
   requestStop(reason: string): Promise<void>;
   /**
    * `replyText` is posted to the trigger Conversation as the Bot's message. `waitingFor`: the agent stopped to wait
-   * for the reply to that request (§8.2); the Run is submitted as `waiting`.
+   * for the reply to that request (§8.2); the Run is submitted as `waiting`. `pass`: the agent called `hive_pass`.
    */
   waitForExit(): Promise<{
     code: number | null;
@@ -56,6 +56,7 @@ export type RunningAgent = {
     summary: string;
     replyText?: string;
     waitingFor?: { requestMessageId: string };
+    pass?: boolean;
   }>;
 };
 export type AgentAdapter = { start(input: LaunchContext): Promise<RunningAgent> };
@@ -149,11 +150,14 @@ const execute = async (
   const outcome =
     exit.code !== 0 || cancelled ? "failed" : exit.waitingFor ? "waiting" : "succeeded";
   const conversation = ctx.context.conversation;
-  // A Bot answers a bot request with its reply tool, so the final text is posted only in a Channel or a DM.
-  const reply =
-    outcome === "succeeded" && exit.replyText && conversation && conversation.kind !== "bot_pair"
-      ? { reply: { conversationId: conversation.id, text: exit.replyText } }
-      : {};
+  // A Bot answers a bot request with its reply tool, so the final text is posted only in a Channel, thread or DM.
+  // There, `hive_pass` or no final text is a pass (ROUTE-02): nothing is posted.
+  const chat = outcome === "succeeded" && conversation && conversation.kind !== "bot_pair";
+  const reply = !chat
+    ? {}
+    : exit.pass || !exit.replyText
+      ? { pass: true }
+      : { reply: { conversationId: conversation.id, text: exit.replyText } };
   if (!stale) {
     try {
       await cloud.submitResult({

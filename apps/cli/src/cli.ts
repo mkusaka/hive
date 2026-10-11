@@ -468,11 +468,12 @@ const specs: Record<string, Spec> = {
   },
   "message post": {
     usage:
-      "(--channel <channel-id> | --conversation <dm-conversation-id>) [--thread-of <message-id>] --text <text with <@bot:ID> tokens> [--resolve-names]",
+      "(--channel <channel-id> | --conversation <dm-conversation-id>) [--thread-of <message-id>] [--reply-to <message-id>] --text <text with <@bot:ID> tokens> [--resolve-names]",
     options: {
       channel: str,
       conversation: str,
       "thread-of": str,
+      "reply-to": str,
       text: str,
       "resolve-names": flag,
     },
@@ -481,11 +482,13 @@ const specs: Record<string, Spec> = {
       if ((channel === undefined) === (conversation === undefined))
         throw invalid("exactly one of --channel / --conversation is required");
       const threadOf = c.values["thread-of"] as string | undefined;
+      const replyTo = c.values["reply-to"] as string | undefined;
       c.print(
         await cmd.messagePost(c.client(), c.envelope(), {
           target: {
             ...(channel ? { channelId: channel } : { conversationId: conversation! }),
             ...(threadOf ? { threadOf } : {}),
+            ...(replyTo ? { replyToMessageId: replyTo } : {}),
           },
           text: need(c.values, "text"),
           resolveNames: c.values["resolve-names"] === true,

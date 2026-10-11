@@ -52,7 +52,7 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK), `codex` 
   restart: the token is returned once and not journaled) there are no hive tools and no approvals.
 - **Hive tools.** `hive_send_request {botId | botName, text}`, `hive_notify {botId | botName, text}`,
   `hive_wait_for_reply {requestMessageId}`, `hive_reply {text}` (only when the trigger item is a request from another
-  Bot), `hive_task_get {taskId}` and `hive_task_update {status?: "completed", assignee?}` (only for a Task Job),
+  Bot), `hive_pass {}` (only in a Channel, thread or DM; no cloud call, ROUTE-02), `hive_task_get {taskId}` and `hive_task_update {status?: "completed", assignee?}` (only for a Task Job),
   `hive_memory_write {content, scope: bot | task | channel}` (the scope id is the context's Bot, Task or
   Conversation channel; `task` / `channel` only when the context has one) and `hive_memory_search {q}`
   (`GET /v1/run/search`, the Run's scopes only). They
@@ -65,6 +65,13 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK), `codex` 
   "Replies to your requests". A Bot's final text is posted into a Channel or a `dm` conversation (DM-01) the same way, never into a bot pair.
   A thread Run (THREAD-01) posts into its thread; its prompt has "Earlier in the channel, before this thread
   (read-only context)" (`parentMessages`) and then "Thread (root message first)" instead of "Recent conversation".
+- **Group chat (ROUTE-02).** A Run in a Channel's main conversation gets a "Group conversation" block: the other
+  member Bots (`peers`), the messages since its last turn there (`since`, with speaker, "(you)" and reply quotes) and
+  the rule "Reply only if this message is for you or you own the next step; otherwise pass … Prefer a single owner.
+  Do not repeat what a peer already said." `hive_pass` marks the exit `pass` (both adapters, through the tools'
+  `onPass`); the runner then submits `pass: true` without a reply, and so does a succeeded Run in a Channel, thread or
+  DM without final text. A pass is known only in the running process: a Run resumed from a finished transcript posts
+  its text.
 - **Transcript journal.** Every SDK message is appended to `<state-dir>/transcripts/<runId>.jsonl` and fsynced
   before it is processed (§13.3: a durable local journal outside the SDK config dir). The SDK also keeps its own
   session files under `CLAUDE_CONFIG_DIR`.

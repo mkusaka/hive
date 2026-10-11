@@ -148,6 +148,32 @@ describe("claudeAdapter", () => {
     expect(options.resume).toBeUndefined();
   });
 
+  it("prompts a Channel Run with the group block: peers, messages since its last turn and the rule", () => {
+    const prompt = userPrompt({
+      ...context,
+      peers: [{ id: "bot-2", name: "reviewer", description: "Reviews code." }],
+      since: [
+        {
+          id: "m-1",
+          speakerKind: "bot",
+          speakerName: "reviewer",
+          isSelf: false,
+          body: "LGTM",
+          createdAt: "",
+          replyTo: { speakerKind: "human", speakerName: "Mina", isSelf: false, quote: "review?" },
+        },
+      ],
+    });
+    expect(prompt).toContain(
+      "Other member Bots:\n- reviewer: Reviews code.\nNew since your last turn:\n" +
+        '[bot reviewer] (replying to human Mina: "review?") LGTM\n' +
+        "Reply only if this message is for you or you own the next step; otherwise pass",
+    );
+    // A DM has no group block.
+    const dm = userPrompt({ ...context, conversation: { ...context.conversation!, kind: "dm" } });
+    expect(dm).not.toContain("Group conversation");
+  });
+
   it("prompts a thread Run with the parent's messages before the root, then the thread", () => {
     const prompt = userPrompt({
       ...context,

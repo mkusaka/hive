@@ -1,6 +1,14 @@
 import * as v from "valibot";
 import { describe, expect, it } from "vitest";
-import { BotCreate, EventEmit, eventEnvelope, parse, PlacementPolicy } from "./index.ts";
+import {
+  BotCreate,
+  EventEmit,
+  eventEnvelope,
+  parse,
+  PlacementPolicy,
+  renderMentions,
+  tokenizeMentions,
+} from "./index.ts";
 
 const placement = (p: object) => parse(PlacementPolicy, p).ok;
 const BuildFailed = eventEnvelope(v.strictObject({ command: v.string(), exitCode: v.number() }));
@@ -75,5 +83,19 @@ describe("command schemas", () => {
     // 3 bytes per char: under 64 Ki characters but over 64 KiB.
     expect(emit({ type: "custom.x", data: "あ".repeat(22_000) }).ok).toBe(false);
     expect(emit({ type: "custom.x", data: "a".repeat(60_000) }).ok).toBe(true);
+  });
+});
+
+describe("mentions", () => {
+  it("tokenizes @names (longest first, whole names only) and @everyone / @all; renders them back", () => {
+    const bots = [
+      { id: "b-1", name: "coder" },
+      { id: "b-2", name: "coder-2" },
+    ];
+    const text = tokenizeMentions("@coder-2 @coder, @coderx @all hi@coder @everyone", bots);
+    expect(text).toBe("<@bot:b-2> <@bot:b-1>, @coderx <@everyone> hi@coder <@everyone>");
+    expect(renderMentions(text, new Map(bots.map((b) => [b.id, b.name])))).toBe(
+      "@coder-2 @coder, @coderx @everyone hi@coder @everyone",
+    );
   });
 });

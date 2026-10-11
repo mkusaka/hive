@@ -1,4 +1,4 @@
-// message.post: one channel message, one waking delivery per `<@bot:ID>` mention (MENTION-01).
+// message.post: one channel message, one waking delivery per `<@bot:ID>` mention (MENTION-01; ROUTE-02 in group.test.ts).
 import { describe, expect, it } from "vitest";
 import { claim, count, envelope, executor, type Json, setup } from "./helpers.ts";
 
@@ -54,7 +54,7 @@ describe("message.post", () => {
     expect(context.conversation.recent.at(-1)!.body).toBe("@coder @reviewer say hi, @coder");
   });
 
-  it("only posts a message without mentions", async () => {
+  it("only posts a message in a channel with no member Bots", async () => {
     const s = await posted();
     const request = s.post("no mention here");
     const res = await s.user.command(request);

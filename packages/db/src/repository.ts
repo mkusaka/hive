@@ -815,6 +815,15 @@ export const appendChange = (
       input.scope,
     );
 
+/** `appendChange` for a Job that a conditional INSERT may not have created (ROUTE-02 coalescing). */
+export const appendJobChangeIfCreated = (db: D1Database, workspaceId: string, jobId: string) =>
+  db
+    .prepare(
+      `INSERT INTO change_log (workspace_id, entity_kind, entity_id, op, revision, scope)
+       SELECT ?1, 'job', ?2, 'upsert', 1, 'workspace:' || ?1 WHERE EXISTS (SELECT 1 FROM jobs WHERE id = ?2)`,
+    )
+    .bind(workspaceId, jobId);
+
 // ------------------------------------------------------------------ Outbox
 
 /** Returns a statement to include in the batch that commits the state change. */
@@ -1148,9 +1157,20 @@ export const recordEventRouted = (
   input: { workspaceId: string; eventId: string },
 ) => routeOnce(db, input.workspaceId, input.eventId, []);
 
+/**
+ * SQL: Bot `bot` has a queued or active Job (or one waiting for a Bot's reply) whose trigger item is in Conversation
+ * `conv`. Its next Run reads what arrived meanwhile (`since`), so a group post gets no second Job (ROUTE-02).
+ */
+export const busyInConversation = (ws: string, bot: string, conv: string) => `EXISTS (
+  SELECT 1 FROM jobs bj JOIN inbox_items bi ON bi.workspace_id = bj.workspace_id AND bi.id = substr(bj.trigger_key, 7)
+   WHERE bj.workspace_id = ${ws} AND bj.bot_id = ${bot} AND bj.trigger_key LIKE 'inbox:%'
+     AND bi.conversation_id = ${conv} AND bj.state IN ('queued', 'waiting_device', 'active', 'waiting_input'))`;
+
 export type Recipient = InboxInput & {
   /** Change-log scope of the inbox item. */
   scope: string;
+  /** A group delivery: no Job while the Bot is busy in the Conversation (`busyInConversation`). */
+  coalesce?: boolean;
   matchedSubscriptionIds?: string[];
   /** `batch` mode: the open batch to create if (bot, lane) has none. */
   batch?: { sealAt: string; maxItems: number };
@@ -1237,20 +1257,29 @@ const deliveryStatements = (
     }),
     ...(jobId
       ? [
-          createJob(db, {
-            id: jobId,
-            workspaceId: input.workspaceId,
-            botId: input.botId,
-            triggerKey: `inbox:${input.id}`,
-            correlationId: input.correlationId,
-          }),
-          appendChange(db, {
-            workspaceId: input.workspaceId,
-            entityKind: "job",
-            entityId: jobId,
-            revision: 1,
-            scope: `workspace:${input.workspaceId}`,
-          }),
+          input.coalesce
+            ? db
+                .prepare(
+                  `INSERT INTO jobs (id, workspace_id, bot_id, state, trigger_key, correlation_id, placement)
+                   SELECT ?1, ?2, ?3, 'queued', ?4, ?5, placement_policy FROM bots
+                    WHERE workspace_id = ?2 AND id = ?3 AND NOT ${busyInConversation("?2", "?3", "?6")}`,
+                )
+                .bind(
+                  jobId,
+                  input.workspaceId,
+                  input.botId,
+                  `inbox:${input.id}`,
+                  input.correlationId ?? null,
+                  input.conversationId,
+                )
+            : createJob(db, {
+                id: jobId,
+                workspaceId: input.workspaceId,
+                botId: input.botId,
+                triggerKey: `inbox:${input.id}`,
+                correlationId: input.correlationId,
+              }),
+          appendJobChangeIfCreated(db, input.workspaceId, jobId),
         ]
       : []),
   ];
@@ -1295,7 +1324,12 @@ export const routeToRecipients = async (
 /** A single recipient (agent.send). */
 export const createDeliveryAndInbox = async (
   db: D1Database,
-  input: InboxInput & { eventId: string; scope: string; correlationId?: string },
+  input: InboxInput & {
+    eventId: string;
+    scope: string;
+    correlationId?: string;
+    coalesce?: boolean;
+  },
 ): Promise<{ routed: false } | { routed: true; deliveryId: string; jobId: string | null }> => {
   const { workspaceId, eventId, correlationId, ...recipient } = input;
   const result = await routeToRecipients(db, {
