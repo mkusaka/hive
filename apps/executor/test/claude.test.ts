@@ -115,9 +115,11 @@ describe("claudeAdapter", () => {
     expect(prompt).toContain("Request:\nSay hello.");
     expect(prompt).toContain("[user actor-1] Say hello.");
     expect(options).toMatchObject({
+      // The default policy: no native tool exists, every one is disallowed too.
       tools: [],
       allowedTools: [],
-      permissionMode: "dontAsk",
+      disallowedTools: ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
+      permissionMode: "default",
       settingSources: [],
       cwd: join(dir, "runs", "run-1"),
     });

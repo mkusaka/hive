@@ -90,7 +90,7 @@ export const setup = async () => {
   const pump = async () => {
     const res = await call("/v1/executor/pump", { Authorization: `Bearer ${deviceToken}` }, {});
     expect(res.status).toBe(200);
-    return res.json<{ processed: number; dead: number }>();
+    return res.json<{ processed: number; dead: number; approvalsExpired: number }>();
   };
   const send = (delivery = "wake", idempotencyKey?: string) =>
     envelope(

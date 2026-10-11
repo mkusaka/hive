@@ -25,13 +25,14 @@ bun run --cwd apps/desktop build   # out/{main,preload,renderer}
 
 ## Views
 
-| View     | Data                                                                                                                                                                                     |
-| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Channel  | Channels, the selected channel's latest 50 messages oldest first, Bot picker, composer                                                                                                   |
-| Inbox    | `GET /v1/inbox?botId=` for the picked Bot, with state badges                                                                                                                             |
-| Activity | `GET /v1/jobs?limit=50` with state badges (incl. `waiting_device`, `recovery_required`) and a Cancel button for queued / waiting / active Jobs; selecting a Job shows `GET /v1/jobs/:id` |
-| Devices  | Name, OS, last heartbeat, revoked                                                                                                                                                        |
-| Status   | Workspace, WebSocket state (connected / reconnecting), last sync cursor (tail), unsynced hint count                                                                                      |
+| View      | Data                                                                                                                                                                                     |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Channel   | Channels, the selected channel's latest 50 messages oldest first, Bot picker, composer                                                                                                   |
+| Inbox     | `GET /v1/inbox?botId=` for the picked Bot, with state badges                                                                                                                             |
+| Activity  | `GET /v1/jobs?limit=50` with state badges (incl. `waiting_device`, `recovery_required`) and a Cancel button for queued / waiting / active Jobs; selecting a Job shows `GET /v1/jobs/:id` |
+| Approvals | Pending approvals (`GET /v1/approvals?state=pending`): action, argument summary, cwd label, Bot, expires-in; Allow / Deny send `approval.resolve`. The nav shows the pending count       |
+| Devices   | Name, OS, last heartbeat, revoked                                                                                                                                                        |
+| Status    | Workspace, WebSocket state (connected / reconnecting), last sync cursor (tail), unsynced hint count                                                                                      |
 
 The composer sends `agent.send` (`delivery: "wake"`) with a fresh operation id and idempotency key, shows the
 accepted operation, then polls `GET /v1/operations/:id` every 2 s (up to 10 min) until routing created the Job.
@@ -44,7 +45,7 @@ Accepted is not started: the Job id appears only after the outbox pump ran (`hiv
 1. **Bootstrap.** `GET /v1/sync/changes` without a cursor gives the head cursor; then every list is loaded.
 2. **Pull.** `GET /v1/sync/changes?cursor=` while `hasMore`; the scopes of the returned rows choose what to
    refetch: `channel:*` → messages and inbox (plus the channel list for a `channel` row), `workspace:*` → jobs,
-   bots and devices. Pulls are serialized; a hint during a pull runs one more.
+   bots, devices and approvals. Pulls are serialized; a hint during a pull runs one more.
 3. **410 `CURSOR_EXPIRED`** drops the cursor and bootstraps again.
 4. **Triggers.** A `sync.changed` hint, WebSocket (re)connect, window focus and a timer every 50-70 s. The hint's
    own cursor is not used: it only says "something changed".
@@ -67,12 +68,12 @@ img-src 'self'`. `'unsafe-inline'` styles are for Vite's dev-time `<style>` inje
 
 ## IPC surface (`src/shared/api.ts`)
 
-| `window.hive`      | Channel            | Validation / behavior                                                                                        |
-| ------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `api.get(path)`    | `hive:api.get`     | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, no `..` anywhere                                     |
-| `api.command(env)` | `hive:api.command` | `commandEnvelope(variant [AgentSend, JobCancel])` from `@hive/contracts`: only `agent.send` and `job.cancel` |
-| `getConfig()`      | `hive:config`      | `{apiUrl, workspaceId, problem, connection}`; no secrets                                                     |
-| `onRealtime(cb)`   | `hive:realtime`    | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                  |
+| `window.hive`      | Channel            | Validation / behavior                                                                                                                             |
+| ------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `api.get(path)`    | `hive:api.get`     | `/v1/<segments>[?query]`; segments are `[A-Za-z0-9_-]`, no `..` anywhere                                                                          |
+| `api.command(env)` | `hive:api.command` | `commandEnvelope(variant [AgentSend, JobCancel, ApprovalResolve])` from `@hive/contracts`: only `agent.send`, `job.cancel` and `approval.resolve` |
+| `getConfig()`      | `hive:config`      | `{apiUrl, workspaceId, problem, connection}`; no secrets                                                                                          |
+| `onRealtime(cb)`   | `hive:realtime`    | main → renderer: `{type: "connection", state}` and `{type: "sync.changed", cursor, scopes}`                                                       |
 
 `api.*` never rejects: it resolves to `{ok: true, value}` or `{ok: false, error: {code, message, body?}}`, where
 `code` is the `ApiError` code (e.g. `CURSOR_EXPIRED`), `INVALID_ARGS` for rejected arguments, or a CLI client code
@@ -86,7 +87,7 @@ rejection, ApiError mapping, Access header injection).
 
 ## Known gaps
 
-- No OAuth login (G-02), no approval view, no Run inspector, no threads, no local outbox / `queued_local`.
+- No OAuth login (G-02), no Run inspector, no threads, no local outbox / `queued_local`.
 - G-04 (Access + WebSocket from a native client) is not executed: the socket was verified only against
   `wrangler dev` with a dev assertion. A channel created after the socket opened needs a reconnect for its hints
   (scopes are fixed at upgrade); the periodic pull still picks it up.
@@ -94,3 +95,5 @@ rejection, ApiError mapping, Access header injection).
 - Inbox state and Job ids are not linked in the UI; accepted / delivered / started / completed are shown only as
   the raw states of the operation, inbox item and Job.
 - No packaging or installer (electron-builder).
+- Approvals: the Bash command summary is shown as text without a diff view or the full input (it never leaves the
+  device); no OS notification for a new approval.

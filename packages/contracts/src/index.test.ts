@@ -38,7 +38,7 @@ describe("EventEnvelope", () => {
 const emit = (event: object) => parse(EventEmit, { type: "event.emit", event });
 
 describe("command schemas", () => {
-  it("fills placement policy and instructions defaults", () => {
+  it("fills placement policy, instructions and deny-all tool policy defaults", () => {
     expect(parse(BotCreate, { type: "bot.create", name: "coder" })).toEqual({
       ok: true,
       value: {
@@ -54,6 +54,7 @@ describe("command schemas", () => {
           requiredCapabilities: [],
           recovery: "manual",
         },
+        toolPolicy: { tools: {}, cwdMode: "run_scratch" },
       },
     });
   });

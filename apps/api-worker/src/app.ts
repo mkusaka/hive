@@ -22,9 +22,11 @@ import { pump } from "./pump.ts";
 import {
   getJob,
   getOperation,
+  getRunApproval,
   getTask,
   listBotConversations,
   listBots,
+  listApprovals,
   listChannels,
   listDevices,
   listInbox,
@@ -222,6 +224,9 @@ export const createApp = ({
     };
     return c.json(me);
   });
+  app.get("/v1/run/approvals/:id", async (c) =>
+    c.json(await getRunApproval(c.env.DB, runPrincipal(c), c.req.param("id"))),
+  );
   app.get("/v1/run/tasks/:id", async (c) => {
     const run = runPrincipal(c);
     if (!run.scopes.includes("task.read"))
@@ -283,6 +288,9 @@ export const createApp = ({
     c.json(await getTask(c.env.DB, user(c).workspaceIds, c.req.param("id"))),
   );
 
+  app.get("/v1/approvals", async (c) =>
+    c.json(await listApprovals(c.env.DB, workspaceParam(c), c.req.query("state"))),
+  );
   app.get("/v1/routines", async (c) => c.json(await listRoutines(c.env.DB, workspaceParam(c))));
   app.get("/v1/subscriptions", async (c) =>
     c.json(await listSubscriptions(c.env.DB, workspaceParam(c))),

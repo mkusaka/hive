@@ -2,6 +2,7 @@
 // also runs inside workerd tests with an injected `fetch`.
 import type {
   ApiError,
+  ApprovalStatus,
   ExecutorCommand,
   ExecutorRun,
   JobClaimed,
@@ -31,6 +32,8 @@ export class CloudError extends Error {
 export type RunApi = {
   command(body: RunCommand): Promise<Record<string, unknown>>;
   getTask(taskId: string): Promise<Record<string, unknown>>;
+  /** The Run's own approval (§19), polled while a tool call waits for a human. */
+  getApproval(approvalId: string): Promise<ApprovalStatus>;
 };
 
 export type CloudClient = {
@@ -159,6 +162,13 @@ export const createCloudClient = ({
         ),
       getTask: (taskId) =>
         request("GET", `/v1/run/tasks/${encodeURIComponent(taskId)}`, undefined, capabilityToken),
+      getApproval: (approvalId) =>
+        request(
+          "GET",
+          `/v1/run/approvals/${encodeURIComponent(approvalId)}`,
+          undefined,
+          capabilityToken,
+        ),
     }),
   };
 };

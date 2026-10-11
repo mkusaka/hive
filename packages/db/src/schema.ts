@@ -120,6 +120,32 @@ export const devices = sqliteTable(
   (t) => [scoped(t)],
 );
 
+/**
+ * current state (docs/architecture.md §10.1). A device's environment: `name` is the logical environment id a Bot's
+ * placement names (`placementPolicy.environmentId`), so the same environment on several devices makes each eligible.
+ * The checkout root is a local path and stays on the device (the executor's `environments.json`).
+ */
+export const deviceEnvironments = sqliteTable(
+  "device_environments",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    deviceId: text("device_id").notNull(),
+    name: text("name").notNull(),
+    /** Repository identity, e.g. the git remote URL. */
+    repository: text("repository").notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    unique().on(t.deviceId, t.name),
+    foreignKey({
+      columns: [t.workspaceId, t.deviceId],
+      foreignColumns: [devices.workspaceId, devices.id],
+    }),
+  ],
+);
+
 /** current state. Only a hash of the device secret is stored. */
 export const deviceCredentials = sqliteTable(
   "device_credentials",
@@ -254,6 +280,10 @@ export const bots = sqliteTable(
     placementPolicy: text("placement_policy", { mode: "json" }).notNull(),
     /** System prompt for the Bot's runs (SDK-01). */
     instructions: text("instructions").notNull().default(""),
+    /** @hive/contracts `ToolPolicy` (TOOLS-01). The default denies every native tool. */
+    toolPolicy: text("tool_policy", { mode: "json" })
+      .notNull()
+      .default({ tools: {}, cwdMode: "run_scratch" }),
     configRevision: integer("config_revision").notNull().default(1),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
@@ -855,6 +885,43 @@ export const runCapabilities = sqliteTable(
   (t) => [
     index("run_capabilities_run").on(t.runId),
     foreignKey({ columns: [t.workspaceId, t.runId], foreignColumns: [runs.workspaceId, runs.id] }),
+  ],
+);
+
+const approvalStates = ["pending", "approved", "denied", "expired"] as const;
+
+/**
+ * current state (docs/architecture.md §19). A Run's request to use an `ask` tool, bound to its generation and the
+ * SHA-256 of the canonical tool input (`args_hash`); the input itself never leaves the device, only a redacted
+ * `args_summary`. Resolved once from `pending`; `expired` (timeout or a Run that is no longer current) means deny.
+ */
+export const approvals = sqliteTable(
+  "approvals",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    runId: text("run_id").notNull(),
+    executionGeneration: integer("execution_generation").notNull(),
+    jobId: text("job_id").notNull(),
+    botId: text("bot_id").notNull(),
+    actionKind: text("action_kind").notNull(),
+    argsHash: text("args_hash").notNull(),
+    argsSummary: text("args_summary").notNull(),
+    cwdLabel: text("cwd_label").notNull(),
+    state: text("state", { enum: approvalStates }).notNull().default("pending"),
+    requestedAt: text("requested_at").notNull().default(now),
+    expiresAt: text("expires_at").notNull(),
+    resolvedAt: text("resolved_at"),
+    resolvedBy: text("resolved_by").references(() => users.id),
+    decisionReason: text("decision_reason"),
+  },
+  (t) => [
+    index("approvals_state_expires").on(t.state, t.expiresAt),
+    index("approvals_run").on(t.runId),
+    oneOf("approvals_state", t.state, approvalStates),
+    foreignKey({ columns: [t.workspaceId, t.runId], foreignColumns: [runs.workspaceId, runs.id] }),
+    foreignKey({ columns: [t.workspaceId, t.jobId], foreignColumns: [jobs.workspaceId, jobs.id] }),
+    foreignKey({ columns: [t.workspaceId, t.botId], foreignColumns: [bots.workspaceId, bots.id] }),
   ],
 );
 

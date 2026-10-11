@@ -24,11 +24,13 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/tasks?workspaceId=&projectKey=&status=`                | Access assertion (user)                | Tasks with computed `display` and `prerequisites` (max 500); see Work below                     |
 | `GET /v1/tasks/:id`                                             | Access assertion (user)                | A Task with prerequisites, dependents, Results and Jobs                                         |
 | `GET /v1/subscriptions?workspaceId=`                            | Access assertion (user)                | Subscriptions of the Workspace with their spec (max 500); see Subscriptions below               |
+| `GET /v1/approvals?workspaceId=&state=`                         | Access assertion (user)                | Newest-first approvals (max 100), optionally one state; see Tools and approvals                 |
 | `GET /v1/sync/changes?cursor=`                                  | Access assertion (user)                | Permitted changes after the cursor (limit 1..500, default 100); see Sync below                  |
 | `GET /v1/realtime?workspaceId=`                                 | Access assertion, or device Bearer     | WebSocket upgrade to the Workspace's Realtime DO; see Realtime below                            |
 | `POST /v1/run/commands`                                         | `Authorization: Bearer cap.<run>.<s>`  | Run command intake for the in-run hive tools; see Bot messaging                                 |
 | `GET /v1/run/me`                                                | `Authorization: Bearer cap.<run>.<s>`  | The Run principal (`RunPrincipal`)                                                              |
 | `GET /v1/run/tasks/:id`                                         | `Authorization: Bearer cap.<run>.<s>`  | A Task of the Run's own Task's Project (`task.read`; 403 otherwise)                             |
+| `GET /v1/run/approvals/:id`                                     | `Authorization: Bearer cap.<run>.<s>`  | The Run's own approval at its generation (`ApprovalStatus`), polled by the executor             |
 | `GET /v1/executor/me`                                           | `Authorization: Bearer <device-token>` | Returns the device principal                                                                    |
 | `POST /v1/executor/pump`                                        | `Authorization: Bearer <device-token>` | Runs the outbox pump and time-driven work once; returns counts (see Outbox pump)                |
 | `POST /v1/executor/commands`                                    | `Authorization: Bearer <device-token>` | Executor command intake (see below)                                                             |
@@ -48,8 +50,9 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
   `withOperationReceipt`, so a replay with the same key returns the stored response and a different payload under
   the same key is 409 `IDEMPOTENCY_CONFLICT`.
 - **Command types:** `workspace.create`, `device.register`, `device.revoke`, `channel.create`, `bot.create`,
-  `agent.send`, `event.emit`, the Work commands, the Subscription / integration commands, the Routine commands
-  and `job.cancel` / `job.resolve` below.
+  `agent.send`, `event.emit`, the Work commands, the Subscription / integration commands, the Routine commands,
+  `job.cancel` / `job.resolve` below, and `bot.update`, `device.environment.register`, `approval.resolve` (Tools and
+  approvals).
 - **Actors.** A user's `actors` row is created by `workspace.create` together with the membership (the only path
   that creates a membership today), unique per `(workspace_id, user_id)`. Messages and channel membership use it.
 - **`channel.create`** creates the channel, its main conversation and an `owner` channel membership for the caller.
@@ -350,6 +353,37 @@ replyToMessageId?}`. The sender is the Run's Bot. The message goes to the pair's
   `conversations.channel_id`: rebuilding `conversations` fails on D1 once messages reference it (D1 cannot switch
   foreign keys off, and a renamed parent rewrites its children's REFERENCES). Its rows use the `workspace:<id>` scope.
 
+## Tools and approvals
+
+Bot tool policy, device environments and the approval broker (docs/architecture.md §10.1, §19; TOOLS-01, AT-35).
+
+- **Tool policy.** `bots.tool_policy` is `{tools: {Read|Grep|Glob|Edit|Write|Bash: allow|ask|deny}, cwdMode:
+run_scratch|environment}`; a missing tool is `deny`, and the default (`{tools: {}, cwdMode: "run_scratch"}`) denies
+  every native tool. `bot.create {toolPolicy?}` sets it; `bot.update {botId, expectedRevision, instructions?,
+toolPolicy?}` replaces the given fields with a CAS on `config_revision` (409 `stale_revision`) and a `bot` change
+  row. The run context carries `bot.toolPolicy` and `environment` (the Job's placement `environmentId`). The
+  executor reads the policy once per Run, so an update never widens a running one.
+- **Environments.** `device.environment.register {deviceId, name, repository}` on the caller's own unrevoked device
+  (404 otherwise) upserts `device_environments` (unique per device + name; re-registering replaces `repository`).
+  Only the name and the repository identity are stored: the checkout root stays in the executor's
+  `environments.json`. A Bot's `placementPolicy.environmentId` names an environment; its Jobs are listed and
+  claimable (`not_eligible` otherwise) only by devices that registered that name, so the same environment on PC1 and
+  PC2 makes both eligible.
+- **`approval.request`** (run command, `POST /v1/run/commands`): `{actionKind (tool), argsHash (SHA-256 hex of the
+canonical tool input), argsSummary (≤ 2 KiB), cwdLabel}`. One batch inserts a `pending` approval bound to the Run,
+  its generation, Job and Bot, `expires_at` = now + 10 min (roadmap §1), moves the Run to `waiting_approval` (fenced
+  on generation; the lease and the capability keep renewing) and writes `approval` + `run` change rows (scope
+  `workspace:<id>`, so a realtime hint follows). The raw tool input never reaches the cloud. Each call is a new
+  approval; none is reused for another call.
+- **`approval.resolve {approvalId, decision: allow | deny, reason?}`** (any member of the Workspace): one CAS
+  `pending → approved | denied` that also requires `expires_at > now` and the requesting Run still active at the
+  approval's generation. A second resolve is 409 `approval_<state>`; a Run that is no longer current (lease expired,
+  finished, replaced by a newer generation) is 409 `STALE_GENERATION`; a timed-out one is 409 `approval_expired`.
+  `resolved_by` is the user. The Run goes back to `running` in the same batch once it has no pending approval left.
+- **Expiry.** The pump sweeps `pending` approvals past `expires_at` (`decision_reason: timeout`) or whose Run is not
+  current (`run_not_current`) to `expired`, which the executor treats as deny, and resumes their Run
+  (`approvalsExpired` counts Workspaces).
+
 ## Known gaps
 
 - **No Queues yet.** The design (docs/architecture.md §6.1, §6.3) hands outbox rows to Cloudflare Queues and
@@ -393,6 +427,12 @@ replyToMessageId?}`. The sender is the Run's Bot. The message goes to the pair's
   deadline (a request nobody answers leaves the requester `waiting_input` until `job.cancel`), no per-conversation
   token / time budget. The chain budget is checked before the batch, so concurrent requests can overshoot it
   slightly. Limits are fixed at the roadmap defaults (no user setting yet).
+- **Tools and approvals.** No `effects` table / external-write broker (§19); no approver policy (any member may
+  resolve); `argsSummary` is the device's redaction (the Bash command with the cwd replaced by `<cwd>`), visible to
+  every member, so a command line holding a secret is shown. No Slack / mobile approvals. Environment repository
+  identity is not compared across devices, and no environment list route exists. `approval.request` uses a fresh
+  idempotency key per call and the executor never retries it, so a lost response leaves an orphan `pending` approval
+  (and the Run `waiting_approval`) until the 10 min expiry.
 - **Bot channel membership.** `agent.send` does not require the recipient Bot to be a member of the channel;
   `bot.create` adds no membership.
 

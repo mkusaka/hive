@@ -18,19 +18,90 @@ export const deviceRegister = (
 export const channelCreate = (c: Client, e: Envelope, name: string) =>
   c.command(e, { type: "channel.create", name });
 
+/** `toolPolicy`: @hive/contracts ToolPolicy; `environment`: the placement's environment name (§10.1). */
 export const botCreate = (
   c: Client,
   e: Envelope,
   name: string,
   allowedDeviceIds: string[] = [],
   instructions?: string,
+  extra: { toolPolicy?: Json; environment?: string } = {},
 ) =>
   c.command(e, {
     type: "bot.create",
     name,
-    ...(allowedDeviceIds.length > 0 ? { placementPolicy: { allowedDeviceIds } } : {}),
+    ...(allowedDeviceIds.length > 0 || extra.environment
+      ? {
+          placementPolicy: {
+            allowedDeviceIds,
+            ...(extra.environment ? { environmentId: extra.environment } : {}),
+          },
+        }
+      : {}),
     ...(instructions === undefined ? {} : { instructions }),
+    ...(extra.toolPolicy ? { toolPolicy: extra.toolPolicy } : {}),
   });
+
+/** Replaces the given fields at the Bot's current revision (read from the Bot list). */
+export const botUpdate = async (
+  c: Client,
+  e: Envelope,
+  botId: string,
+  change: { instructions?: string; toolPolicy?: Json },
+) => {
+  const { bots } = (await listBots(c, e.workspaceId)) as {
+    bots: { id: string; revision: number }[];
+  };
+  const bot = bots.find((b) => b.id === botId);
+  if (!bot) throw new CliError("NOT_FOUND", 7, `bot not found: ${botId}`);
+  return c.command(e, { type: "bot.update", botId, expectedRevision: bot.revision, ...change });
+};
+
+export const deviceEnvironmentRegister = (
+  c: Client,
+  e: Envelope,
+  input: { deviceId: string; name: string; repository: string },
+) => c.command(e, { type: "device.environment.register", ...input });
+
+// ------------------------------------------------- Approvals (§19)
+
+export const listApprovals = (c: Client, workspaceId: string, state?: string) =>
+  c.get(inWorkspace("approvals", workspaceId, state ? { state } : {}));
+
+export const approvalResolve = (
+  c: Client,
+  e: Envelope,
+  approvalId: string,
+  decision: "allow" | "deny",
+  reason?: string,
+) =>
+  c.command(e, {
+    type: "approval.resolve",
+    approvalId,
+    decision,
+    ...(reason === undefined ? {} : { reason }),
+  });
+
+/** Polls pending approvals until `deadline`, calling `onApproval` once per new one. */
+export const watchApprovals = async (
+  c: Client,
+  workspaceId: string,
+  opts: WaitOptions & { onApproval(approval: Json): void },
+) => {
+  const seen = new Set<string>();
+  for (;;) {
+    const { approvals } = (await listApprovals(c, workspaceId, "pending")) as {
+      approvals: (Json & { id: string })[];
+    };
+    for (const approval of approvals.toReversed()) {
+      if (!seen.has(approval.id)) opts.onApproval(approval);
+      seen.add(approval.id);
+    }
+    const left = opts.deadline - Date.now();
+    if (left <= 0) return;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(opts.pollMs, left)));
+  }
+};
 
 export const agentSend = (
   c: Client,

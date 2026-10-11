@@ -22,6 +22,11 @@ export type Deps = {
   stdout(line: string): void;
   stderr(line: string): void;
   runExecutor(cloud: CloudClient, once: boolean, provider: Provider): Promise<unknown>;
+  /**
+   * Maps an environment name to a local checkout root in the executor's `environments.json` (§10.1). Rejects a path
+   * that is not an existing directory; returns the absolute path stored.
+   */
+  saveEnvironment(name: string, path: string): Promise<string>;
   /** Watch interval; 2 s by default. */
   pollMs?: number;
 };
@@ -66,6 +71,33 @@ const need = (values: Values, name: string) => {
 
 const exitForJob = (job: cmd.Json) => (job.state === "succeeded" ? 0 : 5);
 
+/** `--tools Read=allow,Bash=ask` (+ `--cwd-mode`) → a ToolPolicy; the server validates names and modes. */
+const toolPolicy = (values: Values, current?: cmd.Json) => {
+  const { tools, "cwd-mode": cwdMode } = values;
+  if (tools === undefined && cwdMode === undefined) return undefined;
+  const parsed =
+    typeof tools === "string"
+      ? Object.fromEntries(
+          tools
+            .split(",")
+            .filter(Boolean)
+            .map((pair) => {
+              const [name, mode, ...rest] = pair.split("=");
+              if (!name || !mode || rest.length > 0) throw invalid(`--tools: bad entry ${pair}`);
+              return [name.trim(), mode.trim()];
+            }),
+        )
+      : (current?.tools ?? {});
+  return { tools: parsed, cwdMode: cwdMode ?? current?.cwdMode ?? "run_scratch" };
+};
+
+const instructionsOf = async (c: Ctx) => {
+  const { instructions, "instructions-file": file } = c.values;
+  if (instructions !== undefined && file !== undefined)
+    throw invalid("use --instructions or --instructions-file, not both");
+  return typeof file === "string" ? c.deps.readInput(file) : (instructions as string | undefined);
+};
+
 const specs: Record<string, Spec> = {
   "workspace create": {
     usage: "--id <id> --name <name>",
@@ -104,29 +136,112 @@ const specs: Record<string, Spec> = {
   },
   "bot create": {
     usage:
-      "--name <name> [--allowed-device <device-id>]... [--instructions <text> | --instructions-file <path|->]",
+      "--name <name> [--allowed-device <device-id>]... [--instructions <text> | --instructions-file <path|->] [--tools <Tool=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] [--environment <name>]",
     options: {
       name: str,
       "allowed-device": { type: "string", multiple: true },
       instructions: str,
       "instructions-file": str,
+      tools: str,
+      "cwd-mode": str,
+      environment: str,
     },
     run: async (c) => {
-      const { instructions, "instructions-file": file } = c.values;
-      if (instructions !== undefined && file !== undefined)
-        throw invalid("use --instructions or --instructions-file, not both");
+      const instructions = await instructionsOf(c);
       c.print(
         await cmd.botCreate(
           c.client(),
           c.envelope(),
           need(c.values, "name"),
           c.values["allowed-device"] as string[] | undefined,
-          typeof file === "string"
-            ? await c.deps.readInput(file)
-            : (instructions as string | undefined),
+          instructions,
+          {
+            toolPolicy: toolPolicy(c.values),
+            environment: c.values.environment as string | undefined,
+          },
         ),
       );
     },
+  },
+  "bot update": {
+    usage:
+      "<bot-id> [--instructions <text> | --instructions-file <path|->] [--tools <Tool=allow|ask|deny,...>] [--cwd-mode run_scratch|environment]",
+    args: 1,
+    options: { instructions: str, "instructions-file": str, tools: str, "cwd-mode": str },
+    run: async (c) => {
+      const instructions = await instructionsOf(c);
+      const botId = c.args[0]!;
+      // `--tools` replaces the tool list; an omitted part keeps the Bot's current one.
+      const current =
+        c.values.tools === undefined && c.values["cwd-mode"] === undefined
+          ? undefined
+          : (
+              (await cmd.listBots(c.client(), c.workspace())) as {
+                bots: { id: string; toolPolicy: cmd.Json }[];
+              }
+            ).bots.find((b) => b.id === botId)?.toolPolicy;
+      const policy = toolPolicy(c.values, current);
+      if (instructions === undefined && policy === undefined)
+        throw invalid("nothing to update: give --instructions(-file), --tools or --cwd-mode");
+      c.print(
+        await cmd.botUpdate(c.client(), c.envelope(), botId, {
+          ...(instructions === undefined ? {} : { instructions }),
+          ...(policy ? { toolPolicy: policy } : {}),
+        }),
+      );
+    },
+  },
+  "device env": {
+    usage: "add --name <name> --repo <url> --path <local checkout root>",
+    args: 1,
+    options: { name: str, repo: str, path: str },
+    run: async (c) => {
+      if (c.args[0] !== "add") throw invalid("usage: hive device env add --name --repo --path");
+      const deviceId = c.creds.deviceToken?.split(".")[0];
+      if (!deviceId)
+        throw new CliError("UNAUTHENTICATED", 3, "no deviceToken: run `hive device register`");
+      const name = need(c.values, "name");
+      // Local first: the checkout root never leaves this device, the cloud gets name + repository only.
+      const path = await c.deps.saveEnvironment(name, need(c.values, "path"));
+      c.print({
+        ...(await cmd.deviceEnvironmentRegister(c.client(), c.envelope(), {
+          deviceId,
+          name,
+          repository: need(c.values, "repo"),
+        })),
+        localPath: path,
+      });
+    },
+  },
+  "approval list": {
+    usage: "[--state pending|approved|denied|expired]",
+    options: { state: { type: "string", default: "pending" } },
+    run: async (c) =>
+      c.print(await cmd.listApprovals(c.client(), c.workspace(), c.values.state as string)),
+  },
+  "approval resolve": {
+    usage: "<approval-id> (--allow | --deny) [--reason <text>]",
+    args: 1,
+    options: { allow: flag, deny: flag, reason: str },
+    run: async (c) => {
+      if (c.values.allow === c.values.deny)
+        throw invalid("exactly one of --allow, --deny is required");
+      c.print(
+        await cmd.approvalResolve(
+          c.client(),
+          c.envelope(),
+          c.args[0]!,
+          c.values.allow ? "allow" : "deny",
+          c.values.reason as string | undefined,
+        ),
+      );
+    },
+  },
+  "approval watch": {
+    usage: "[--timeout <s>]",
+    options: { timeout: str },
+    run: async (c) =>
+      cmd.watchApprovals(c.client(), c.workspace(), { ...c.wait(), onApproval: c.print }),
   },
   "agent send": {
     usage: "<bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]",

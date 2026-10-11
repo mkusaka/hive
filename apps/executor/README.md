@@ -23,17 +23,19 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK) and `fake
 - `src/adapters/fake.ts`: exits after `FAKE_DELAY_MS` (default 50) with code 0 and summary
   `fake: handled inbox item <id>`; `FAKE_FAIL=1` exits 1. It is idempotent, so reconcile may simply start it again.
 - `src/adapters/claude.ts`: one SDK `query()` per Run (see below).
+- `src/toolPolicy.ts`: the Bot tool policy as SDK options, the PreToolUse hook and the `canUseTool` approval gate
+  (see Tool policy and approvals).
+- `src/environments.ts`: `<state-dir>/environments.json`, environment name → local checkout root.
 - `src/main.ts`: `--api-url --token-file --state-dir [--once] --provider fake|claude` (`node:util` `parseArgs`).
 
 ## Claude provider
 
 - **Prompt.** `systemPrompt` = "You are <bot name>, a bot in a hive workspace." plus the Bot's `instructions`. The
   user message = the Task (if any), the Conversation's recent messages (oldest first) and the trigger item's body.
-- **Only the hive tools.** `tools: []` (no built-in tools), `permissionMode: "dontAsk"`, `settingSources: []`
-  (no user / project settings, hooks or CLAUDE.md), `strictMcpConfig`, `maxTurns: 4`, `cwd` =
-  `<state-dir>/runs/<runId>`. With a Run capability, `mcpServers: {hive}` is an in-process SDK MCP server
-  (`src/tools.ts`) and `allowedTools` lists exactly its tools; without one (a Run resumed after a restart: the token
-  is returned once and not journaled) there are no tools.
+- **Tools.** The Bot's tool policy (below) decides the native tools; `settingSources: []` (no user / project
+  settings, hooks or CLAUDE.md), `strictMcpConfig`, `maxTurns: 4`. With a Run capability, `mcpServers: {hive}` is an
+  in-process SDK MCP server (`src/tools.ts`) whose tools are in `allowedTools`; without one (a Run resumed after a
+  restart: the token is returned once and not journaled) there are no hive tools and no approvals.
 - **Hive tools.** `hive_send_request {botId | botName, text}`, `hive_notify {botId | botName, text}`,
   `hive_wait_for_reply {requestMessageId}`, `hive_reply {text}` (only when the trigger item is a request from another
   Bot), `hive_task_get {taskId}` and `hive_task_update {status?: "completed", assignee?}` (only for a Task Job). They
@@ -57,6 +59,32 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK) and `fake
   `CLAUDE_CONFIG_DIR=<profile dir> hive executor run --provider claude`. hive never switches to an API key; an
   `ANTHROPIC_API_KEY` in the environment would be used by the SDK, so keep it unset for subscription use. The
   SDK runs its bundled Claude Code (2.1.289 with SDK 0.3.289), not the installed `claude`.
+
+## Tool policy and approvals
+
+The run context's `bot.toolPolicy` (docs/architecture.md §19, §20.3; TOOLS-01):
+
+- **SDK options.** `tools` = the `allow` + `ask` tools (the others do not exist for the model), `allowedTools` = the
+  `allow` tools + the hive tools, `disallowedTools` = the `deny` tools, `permissionMode: "default"` (so a prompt
+  reaches `canUseTool`; `dontAsk` would deny without asking). The SDK warns that `canUseTool` is not invoked for
+  the pre-allowed tools; that is intended, the hook still gates them.
+- **PreToolUse hook (mandatory).** Runs before any permission rule: a `deny` or unknown tool is denied; a
+  Read / Edit / Write / Glob / Grep path (`file_path`, `path`, `pattern`, `glob`) outside the cwd (`..`, absolute,
+  `~`) is denied; an `ask` tool returns `ask`, which forces the prompt even where Claude Code would auto-allow.
+- **`canUseTool` (the broker).** Re-checks the policy first (a `deny` tool is denied even if asked), then for `ask`
+  sends `approval.request` with the SHA-256 of the canonical (sorted-key) input and a summary (the Bash command or
+  the path, ≤ 2 KiB, cwd replaced by `<cwd>`), and polls `GET /v1/run/approvals/:id` every 2 s. `approved` with the
+  same hash → allow with that input; `denied`, `expired`, a cloud error, no capability or an abort (stop / cancel)
+  → deny with a message the model sees. It never fails open and never returns null. The lease keeps renewing
+  while it waits; the cloud expires the approval after 10 min.
+- **cwd.** `run_scratch`: `<state-dir>/runs/<runId>`. `environment`: the checkout root mapped to the placement's
+  `environmentId` in `<state-dir>/environments.json` (`hive device env add`); when it is missing or not a
+  directory the adapter exits 1 with reason `environment_missing` without calling the SDK (the cloud already lists
+  the Job only to devices that registered the environment).
+- **Security.** The path check is not a sandbox (§18.3): **Bash is not path-restricted**. A Bot with Bash (`allow`
+  or `ask`) runs as the executor's OS user with its files, network and credentials; treat its environment as
+  `unsafe_host_access` (excluded from `safe_auto` recovery, which does not exist yet). `ask` puts a human in front
+  of each call; `allow` does not. Symlinks inside the cwd are not resolved by the path check.
 
 **Reconcile.** For each journaled claim without a result, or whose last result is an unconfirmed
 `stale_generation`, `GET /v1/executor/runs/:id` decides: a Run the cloud reports `unknown` (its lease expired) is
@@ -94,7 +122,8 @@ loop claim new Jobs.
 
 `bun run test` from the repo root. `test/runner.test.ts` runs in Node against an in-memory cloud;
 `test/claude.test.ts` drives the Claude adapter with a fake `queryFn` (SDK message shapes, no subprocess);
-`test/tools.test.ts` covers the hive tools and the `waiting` exit; the end-to-end
+`test/tools.test.ts` covers the hive tools and the `waiting` exit; `test/toolPolicy.test.ts` the SDK options, the
+path hook, the approval gate and the environment cwd; the end-to-end
 loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (workerd).
 
 ## Known gaps
@@ -103,8 +132,8 @@ loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (
   resume idempotent adapters.
 - No R2 upload of transcripts or artifacts (the JSONL transcript stays local); no SessionStore adapter (G-07), so
   no cross-device resume.
-- No permission broker beyond the hive tools; no Codex adapter. A Run resumed by reconcile has no capability, so no
-  hive tools.
+- No OS sandbox and no Bash path restriction; no effect broker for external writes (§19). No Codex adapter. A Run
+  resumed by reconcile has no capability, so no hive tools and every `ask` tool is denied.
 - Only `runtime.run.started` and `runtime.run.stopped` are observed; no usage / cost or other runtime events are
   sent to the cloud. The fake adapter sends no `runtime.run.started`, so its Runs stay `starting`.
 - Stop confirmation trusts the in-process adapter: with a real process supervisor it must check the process (PID +

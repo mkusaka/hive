@@ -2,10 +2,12 @@
 // `<state-dir>/transcripts/<runId>.jsonl` and fsynced before it is processed: the durable local journal outside
 // the SDK config dir. Auth is whatever the SDK subprocess finds (it inherits `process.env`, so
 // `CLAUDE_CONFIG_DIR` selects the login); never an automatic switch to an API key.
-// Tools: only the in-run hive tools (tools.ts), and only with a Run capability. `hive_wait_for_reply` ends the Run:
-// once its tool result appears in the stream, the adapter aborts the query (no further model turn) and exits with
-// `waitingFor`, which the runner submits as a `waiting` result (§8.2).
-import { mkdir, open, readFile } from "node:fs/promises";
+// Tools: the in-run hive tools (tools.ts, only with a Run capability) plus the native tools the Bot's tool policy
+// allows or asks for (toolPolicy.ts: PreToolUse hook + `canUseTool` approval broker). The cwd is a per-run scratch
+// directory, or the environment's checkout root from `<state-dir>/environments.json` (`cwdMode: environment`).
+// `hive_wait_for_reply` ends the Run: once its tool result appears in the stream, the adapter aborts the query (no
+// further model turn) and exits with `waitingFor`, which the runner submits as a `waiting` result (§8.2).
+import { mkdir, open, readFile, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
   type Options,
@@ -13,23 +15,14 @@ import {
   type SDKMessage,
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { readEnvironments } from "../environments.ts";
 import type { AgentAdapter, LaunchContext, RunningAgent } from "../runner.ts";
+import { approvalGate, preToolUse, toolOptions, truncate } from "../toolPolicy.ts";
 import { hiveMcpServer, hiveTools, toolName, waitForReplyTool } from "../tools.ts";
 
 export type QueryFn = (params: { prompt: string; options: Options }) => AsyncIterable<SDKMessage>;
 type Exit = Awaited<ReturnType<RunningAgent["waitForExit"]>>;
 
-/** UTF-8 prefix of at most `max` bytes, cut on a code point boundary. */
-const truncate = (text: string, max: number) => {
-  let bytes = 0;
-  let out = "";
-  for (const ch of text) {
-    bytes += Buffer.byteLength(ch);
-    if (bytes > max) break;
-    out += ch;
-  }
-  return out;
-};
 const kib8 = 8 * 1024;
 
 /** System prompt: who the Bot is plus its instructions. */
@@ -107,10 +100,12 @@ export const claudeAdapter = ({
   stateDir,
   queryFn = query,
   maxTurns = 4,
+  approvalPollMs,
 }: {
   stateDir: string;
   queryFn?: QueryFn;
   maxTurns?: number;
+  approvalPollMs?: number;
 }): AgentAdapter & { describe(): Promise<Record<string, boolean>> } => ({
   // Honest flags for what this adapter does today (§20.4).
   describe: async () => ({
@@ -119,22 +114,50 @@ export const claudeAdapter = ({
     externalSessionStore: false,
     steerActiveTurn: false,
     nativeChildIdentity: false,
-    enforceToolApproval: false,
+    enforceToolApproval: true,
   }),
   start: async (ctx) => {
     const transcript = join(stateDir, "transcripts", `${ctx.runId}.jsonl`);
-    const cwd = join(stateDir, "runs", ctx.runId);
     await mkdir(join(stateDir, "transcripts"), { recursive: true });
-    await mkdir(cwd, { recursive: true });
 
     const previous = await readTranscript(transcript);
     const done = previous.findLast((m): m is SDKResultMessage => m.type === "result");
     if (done) return { requestStop: async () => {}, waitForExit: async () => toExit(done) };
     const sessionId = previous.find((m) => m.type === "system" && m.subtype === "init")?.session_id;
 
+    // Preflight: an environment run needs the environment's checkout on this device.
+    const policy = ctx.context.bot.toolPolicy;
+    const environment = ctx.context.environment;
+    let cwd = join(stateDir, "runs", ctx.runId);
+    if (policy.cwdMode === "environment") {
+      const root = environment ? (await readEnvironments(stateDir))[environment] : undefined;
+      const isDir = root
+        ? await stat(root).then(
+            (s) => s.isDirectory(),
+            () => false,
+          )
+        : false;
+      if (!root || !isDir) {
+        const exit: Exit = {
+          code: 1,
+          reason: "environment_missing",
+          summary: truncate(
+            `claude: environment ${environment ?? "(none)"} is not on this device`,
+            kib8,
+          ),
+        };
+        return { requestStop: async () => {}, waitForExit: async () => exit };
+      }
+      cwd = root;
+    } else {
+      await mkdir(cwd, { recursive: true });
+    }
+    const roots = [...new Set([cwd, await realpath(cwd)])];
+
     const abort = new AbortController();
     let stopReason: string | undefined;
     const tools = ctx.run ? hiveTools(ctx.context, ctx.run) : [];
+    const hive = tools.map((t) => toolName(t.name));
     // tool_use id → requestMessageId of `hive_wait_for_reply` calls not yet answered.
     const waits = new Map<string, string>();
     let waitingFor: string | undefined;
@@ -156,10 +179,17 @@ export const claudeAdapter = ({
             cwd,
             abortController: abort,
             systemPrompt: systemPrompt(ctx.context),
-            // No built-in tools and no settings / MCP from the user's Claude config; only the hive tools.
-            tools: [],
-            allowedTools: tools.map((t) => toolName(t.name)),
-            permissionMode: "dontAsk",
+            // No settings / MCP / hooks from the user's Claude config: the tool policy and the hive tools only.
+            ...toolOptions(policy, hive),
+            hooks: { PreToolUse: [{ hooks: [preToolUse(policy, roots, new Set(hive))] }] },
+            canUseTool: approvalGate({
+              policy,
+              run: ctx.run,
+              cwdLabel: policy.cwdMode === "environment" ? environment! : "run_scratch",
+              roots,
+              hiveTools: new Set(hive),
+              pollMs: approvalPollMs,
+            }),
             settingSources: [],
             mcpServers: tools.length ? { hive: hiveMcpServer(tools) } : {},
             strictMcpConfig: true,

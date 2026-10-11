@@ -1,4 +1,4 @@
-import type { RunContext } from "@hive/contracts";
+import type { ApprovalStatus, RunContext } from "@hive/contracts";
 import { CloudError, type CloudClient, type RunApi } from "../src/cloudClient.ts";
 import type { JournalEntry } from "../src/runner.ts";
 
@@ -9,7 +9,13 @@ export const memoryJournal = (entries: JournalEntry[] = []) => ({
 });
 
 export const context: RunContext = {
-  bot: { id: "bot-1", name: "coder", instructions: "Reply in one short sentence." },
+  bot: {
+    id: "bot-1",
+    name: "coder",
+    instructions: "Reply in one short sentence.",
+    toolPolicy: { tools: {}, cwdMode: "run_scratch" },
+  },
+  environment: null,
   task: null,
   conversation: {
     id: "conv-1",
@@ -28,14 +34,34 @@ export const context: RunContext = {
   replies: [],
 };
 
-/** Records `/v1/run/*` calls; `fail` makes every call throw that error. */
-export const fakeRunApi = (fail?: Error) => {
+/**
+ * Records `/v1/run/*` calls; `fail` makes every call throw that error. Approval polls answer `approvalStates` in order
+ * (then `pending`), with the hash of the last `approval.request`.
+ */
+export const fakeRunApi = (fail?: Error, approvalStates: ApprovalStatus["state"][] = []) => {
   const calls: unknown[] = [];
+  let argsHash = "";
   const api: RunApi = {
     command: async (body) => {
       calls.push(body);
       if (fail) throw fail;
+      if (body.type === "approval.request") {
+        argsHash = body.argsHash;
+        return { status: "accepted", approvalId: "approval-1" };
+      }
       return { status: "accepted", messageId: "msg-sent" };
+    },
+    getApproval: async (id) => {
+      calls.push({ getApproval: id });
+      if (fail) throw fail;
+      const state = approvalStates.shift() ?? "pending";
+      return {
+        id,
+        state,
+        argsHash,
+        expiresAt: "",
+        decisionReason: state === "expired" ? "timeout" : null,
+      };
     },
     getTask: async (taskId) => {
       calls.push({ getTask: taskId });

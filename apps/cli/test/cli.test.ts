@@ -13,6 +13,7 @@ const harness = (
   const out: string[] = [];
   const err: string[] = [];
   const saved: Credentials[] = [];
+  const environments: [string, string][] = [];
   const deps: Deps = {
     fetch: async (url, init) => {
       const call = {
@@ -38,9 +39,21 @@ const harness = (
     stdout: (line) => void out.push(line),
     stderr: (line) => void err.push(line),
     runExecutor: async () => null,
+    saveEnvironment: async (name, path) => {
+      environments.push([name, path]);
+      return `/abs/${path}`;
+    },
     pollMs: 1,
   };
-  return { deps, calls, out, err, saved, hive: (...argv: string[]) => run(argv, deps) };
+  return {
+    deps,
+    calls,
+    out,
+    err,
+    saved,
+    environments,
+    hive: (...argv: string[]) => run(argv, deps),
+  };
 };
 
 const apiError = (status: number, code: string) =>
@@ -415,5 +428,121 @@ describe("output and credentials", () => {
     expect(await h.hive("executor", "run", "--once")).toBe(0);
     expect(await h.hive("executor", "run", "--provider", "codex")).toBe(2);
     expect(providers).toEqual(["claude", "fake"]);
+  });
+});
+
+const commandOf = (call: Call) => (call.body as { command: Record<string, unknown> }).command;
+
+describe("tools and approvals", () => {
+  it("bot create --tools / --environment and bot update at the current revision", async () => {
+    const h = harness((call) =>
+      call.method === "GET"
+        ? Response.json({
+            bots: [
+              {
+                id: "bot-1",
+                revision: 3,
+                toolPolicy: { tools: { Read: "allow" }, cwdMode: "environment" },
+              },
+            ],
+          })
+        : Response.json({ ok: true }),
+    );
+    expect(
+      await h.hive(
+        "bot",
+        "create",
+        "--name",
+        "b",
+        "--tools",
+        "Read=allow,Bash=ask",
+        "--cwd-mode",
+        "environment",
+        "--environment",
+        "backend",
+      ),
+    ).toBe(0);
+    expect(commandOf(h.calls[0]!)).toEqual({
+      type: "bot.create",
+      name: "b",
+      placementPolicy: { allowedDeviceIds: [], environmentId: "backend" },
+      toolPolicy: { tools: { Read: "allow", Bash: "ask" }, cwdMode: "environment" },
+    });
+    expect(await h.hive("bot", "update", "bot-1", "--tools", "Bash=ask")).toBe(0);
+    expect(h.calls[1]!.path).toBe("/v1/bots?workspaceId=ws-1");
+    expect(commandOf(h.calls.at(-1)!)).toEqual({
+      type: "bot.update",
+      botId: "bot-1",
+      expectedRevision: 3,
+      toolPolicy: { tools: { Bash: "ask" }, cwdMode: "environment" },
+    });
+    expect(await h.hive("bot", "update", "bot-1", "--instructions", "Be brief.")).toBe(0);
+    expect(commandOf(h.calls.at(-1)!)).toEqual({
+      type: "bot.update",
+      botId: "bot-1",
+      expectedRevision: 3,
+      instructions: "Be brief.",
+    });
+    expect(await h.hive("bot", "update", "bot-1")).toBe(2);
+    expect(await h.hive("bot", "create", "--name", "b", "--tools", "Bash")).toBe(2);
+  });
+
+  it("device env add maps the path locally and registers name + repository in the cloud", async () => {
+    const h = harness(undefined, { creds: { deviceToken: "dev-1.secret" } });
+    expect(
+      await h.hive(
+        "device",
+        "env",
+        "add",
+        "--name",
+        "backend",
+        "--repo",
+        "git@x:y.git",
+        "--path",
+        "repo",
+      ),
+    ).toBe(0);
+    expect(h.environments).toEqual([["backend", "repo"]]);
+    expect(commandOf(h.calls[0]!)).toEqual({
+      type: "device.environment.register",
+      deviceId: "dev-1",
+      name: "backend",
+      repository: "git@x:y.git",
+    });
+    expect(h.out).toContain("localPath: /abs/repo");
+    // The path never goes to the cloud.
+    expect(JSON.stringify(h.calls)).not.toContain("/abs/repo");
+  });
+
+  it("approval list / resolve / watch", async () => {
+    let polls = 0;
+    const h = harness((call) => {
+      if (call.method === "POST") return Response.json({ approvalId: "a-1", state: "approved" });
+      polls += 1;
+      const a1 = { id: "a-1", actionKind: "Bash", argsSummary: "ls" };
+      const a2 = { id: "a-2", actionKind: "Read", argsSummary: "README.md" };
+      // Newest first, like the API.
+      return Response.json({ approvals: polls === 1 ? [a1] : [a2, a1] });
+    });
+    expect(await h.hive("approval", "list")).toBe(0);
+    expect(h.calls[0]!.path).toBe("/v1/approvals?workspaceId=ws-1&state=pending");
+    expect(await h.hive("approval", "resolve", "a-1", "--allow", "--reason", "ok")).toBe(0);
+    expect(commandOf(h.calls[1]!)).toEqual({
+      type: "approval.resolve",
+      approvalId: "a-1",
+      decision: "allow",
+      reason: "ok",
+    });
+    expect(await h.hive("approval", "resolve", "a-1", "--deny")).toBe(0);
+    expect(commandOf(h.calls[2]!)).toMatchObject({ decision: "deny" });
+    expect(await h.hive("approval", "resolve", "a-1")).toBe(2);
+    expect(await h.hive("approval", "resolve", "a-1", "--allow", "--deny")).toBe(2);
+
+    polls = 0;
+    h.out.length = 0;
+    expect(await h.hive("approval", "watch", "--timeout", "0.02", "--format", "json")).toBe(0);
+    expect(polls).toBeGreaterThanOrEqual(2);
+    // Each pending approval is printed once, oldest first.
+    expect(h.out.map((line) => (JSON.parse(line) as { id: string }).id)).toEqual(["a-1", "a-2"]);
   });
 });

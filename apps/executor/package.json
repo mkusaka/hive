@@ -8,7 +8,8 @@
     "./runner": "./src/runner.ts",
     "./adapters/fake": "./src/adapters/fake.ts",
     "./adapters/claude": "./src/adapters/claude.ts",
-    "./journal": "./src/journal.ts"
+    "./journal": "./src/journal.ts",
+    "./environments": "./src/environments.ts"
   },
   "scripts": {
     "start": "bun run src/main.ts"

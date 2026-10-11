@@ -198,7 +198,7 @@ describe("claudeAdapter with hive tools", () => {
       "mcp__hive__hive_notify",
       "mcp__hive__hive_wait_for_reply",
     ]);
-    expect(options).toMatchObject({ tools: [], permissionMode: "dontAsk", strictMcpConfig: true });
+    expect(options).toMatchObject({ tools: [], permissionMode: "default", strictMcpConfig: true });
     expect(Object.keys(options.mcpServers ?? {})).toEqual(["hive"]);
     expect(`${prompt}\n${String(options.systemPrompt)}`).not.toContain("TOPSECRET");
   });

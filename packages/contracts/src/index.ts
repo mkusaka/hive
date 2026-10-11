@@ -111,12 +111,50 @@ export type PlacementPolicy = v.InferOutput<typeof PlacementPolicy>;
 
 const MessageText = v.pipe(v.string(), v.minLength(1), v.maxLength(64 * 1024));
 
+/** Claude's native tools a Bot may be given (TOOLS-01). */
+export const toolNames = ["Read", "Grep", "Glob", "Edit", "Write", "Bash"] as const;
+export const ToolName = v.picklist(toolNames);
+export type ToolName = v.InferOutput<typeof ToolName>;
+
+/**
+ * Which native tools a Bot's runs may use (docs/architecture.md §19, §20.3). A tool not listed is `deny`; `ask` needs a
+ * human approval per call. `cwdMode: environment` runs in the checkout root of the placement's `environmentId` on the
+ * device; `run_scratch` in an empty per-run directory.
+ */
+export const ToolPolicy = v.strictObject({
+  tools: v.optional(v.record(ToolName, v.picklist(["allow", "ask", "deny"])), {}),
+  cwdMode: v.optional(v.picklist(["run_scratch", "environment"]), "run_scratch"),
+});
+export type ToolPolicy = v.InferOutput<typeof ToolPolicy>;
+
+const Instructions = v.pipe(v.string(), v.maxLength(64 * 1024));
+const Revision = v.pipe(v.number(), v.integer(), v.minValue(1));
+
 export const BotCreate = v.strictObject({
   type: v.literal("bot.create"),
   name: Name,
   placementPolicy: v.optional(PlacementPolicy, {}),
   /** The Bot's system prompt for its runs. */
-  instructions: v.optional(v.pipe(v.string(), v.maxLength(64 * 1024)), ""),
+  instructions: v.optional(Instructions, ""),
+  toolPolicy: v.optional(ToolPolicy, {}),
+});
+
+/** Replaces the given fields; `expectedRevision` is the Bot's `config_revision`. Running Runs keep what they read. */
+export const BotUpdate = v.strictObject({
+  type: v.literal("bot.update"),
+  botId: BotId,
+  expectedRevision: Revision,
+  instructions: v.optional(Instructions),
+  toolPolicy: v.optional(ToolPolicy),
+});
+
+/** Registers (or updates the repository of) an environment on one of the caller's devices (§10.1). */
+export const DeviceEnvironmentRegister = v.strictObject({
+  type: v.literal("device.environment.register"),
+  deviceId: DeviceId,
+  name: Name,
+  /** Repository identity, e.g. the git remote URL. Never a local path. */
+  repository: Name,
 });
 
 // docs/architecture.md §5.3, §7.2. Direct delivery to a Bot's Inbox; lane = channel.
@@ -193,7 +231,6 @@ export type RunPrincipal = {
 // ---------------------------------------------------- Work (docs/architecture.md §4)
 // Task edits carry the Task's `expectedRevision`; a stale one is 409 REVISION_CONFLICT.
 
-const Revision = v.pipe(v.number(), v.integer(), v.minValue(1));
 /** Display-key prefix: Task keys are `<projectKey>-<n>`. */
 export const ProjectKey = v.pipe(v.string(), v.regex(/^[A-Z][A-Z0-9]{1,9}$/));
 
@@ -511,10 +548,46 @@ export const RunResultSubmit = v.strictObject({
 
 export const ExecutorCommand = v.variant("type", [JobClaim, RunLeaseRenew, RunResultSubmit]);
 
+// ------------------------------------------------- Approvals (docs/architecture.md §19)
+
+/**
+ * A Run asks a human before an `ask` tool runs. `argsHash` is SHA-256 (hex) of the canonical JSON of the tool input,
+ * computed on the device; only `argsSummary` (the Bash command or the file path, at most 2 KiB) leaves it.
+ */
+export const ApprovalRequest = v.strictObject({
+  type: v.literal("approval.request"),
+  actionKind: ToolName,
+  argsHash: v.pipe(v.string(), v.regex(/^[0-9a-f]{64}$/)),
+  argsSummary: v.pipe(
+    v.string(),
+    v.check((s) => utf8Bytes(s) <= 2 * 1024, "argsSummary must be at most 2 KiB"),
+  ),
+  /** The environment name, or `run_scratch`. */
+  cwdLabel: Name,
+});
+
+/** Resolves a pending approval once; any later resolve is 409 (AT-35). */
+export const ApprovalResolve = v.strictObject({
+  type: v.literal("approval.resolve"),
+  approvalId: v.pipe(v.string(), v.minLength(1)),
+  decision: v.picklist(["allow", "deny"]),
+  reason: v.optional(v.pipe(v.string(), v.maxLength(1024))),
+});
+
+/** `GET /v1/run/approvals/:id`: what the waiting executor polls. `expired` and `denied` both mean deny. */
+export type ApprovalStatus = {
+  id: string;
+  state: "pending" | "approved" | "denied" | "expired";
+  argsHash: string;
+  expiresAt: string;
+  decisionReason: string | null;
+};
+
 /** Task writes need the `task.write` scope and a target in the Run's Task's Project. */
 export const RunCommand = v.variant("type", [
   RunAgentSend,
   AgentReply,
+  ApprovalRequest,
   TaskCreate,
   TaskAssign,
   TaskPlan,
@@ -554,7 +627,9 @@ export type QueuedJob = {
 /** `GET /v1/executor/runs/:id`: the device's own Run, for reconcile after a restart. */
 /** `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=`: what the adapter builds its prompt from. */
 export type RunContext = {
-  bot: { id: string; name: string; instructions: string };
+  bot: { id: string; name: string; instructions: string; toolPolicy: ToolPolicy };
+  /** The Job's placement `environmentId` (an environment name), or null. */
+  environment: string | null;
   task: { id: string; key: string; title: string; description: string } | null;
   conversation: {
     id: string;

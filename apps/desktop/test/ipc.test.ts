@@ -83,6 +83,27 @@ describe("IPC handlers", () => {
     expect(requests[0]).toMatchObject({ path: "/v1/commands", body: cancel });
   });
 
+  it("posts an approval.resolve envelope and rejects a bad decision", async () => {
+    const { h, requests } = setup();
+    const resolve = {
+      ...envelope,
+      command: { type: "approval.resolve", approvalId: "a-1", decision: "deny", reason: "no" },
+    };
+    expect((await h.command(resolve)).ok).toBe(true);
+    expect(requests[0]).toMatchObject({ path: "/v1/commands", body: resolve });
+    const rejected = await Promise.all(
+      [
+        { type: "approval.resolve", approvalId: "a-1", decision: "approve" },
+        { type: "approval.resolve", approvalId: "", decision: "allow" },
+        { type: "approval.resolve", approvalId: "a-1", decision: "allow", argsHash: "x" },
+      ].map((command) => h.command({ ...envelope, command })),
+    );
+    for (const result of rejected) {
+      expect(result).toMatchObject({ ok: false, error: { code: "INVALID_ARGS" } });
+    }
+    expect(requests).toHaveLength(1);
+  });
+
   it("posts a valid agent.send envelope", async () => {
     const { h, requests } = setup();
     expect((await h.command(envelope)).ok).toBe(true);

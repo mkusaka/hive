@@ -2,12 +2,23 @@
 /* oxlint-disable no-await-in-loop */
 import type { ApiResult } from "../../shared/api.ts";
 
-export type ListKey = "channels" | "messages" | "inbox" | "jobs" | "bots" | "devices";
-export const allLists: ListKey[] = ["channels", "messages", "inbox", "jobs", "bots", "devices"];
+export type ListKey = "channels" | "messages" | "inbox" | "jobs" | "bots" | "devices" | "approvals";
+export const allLists: ListKey[] = [
+  "channels",
+  "messages",
+  "inbox",
+  "jobs",
+  "bots",
+  "devices",
+  "approvals",
+];
 
 type Change = { scope: string; entityKind: string };
 
-/** `channel:*` → messages / inbox (and the channel list for a new channel); `workspace:*` → jobs / bots / devices. */
+/**
+ * `channel:*` → messages / inbox (and the channel list for a new channel); `workspace:*` → jobs / bots / devices /
+ * approvals.
+ */
 export const refetchFor = (changes: Change[]) => {
   const keys = new Set<ListKey>();
   for (const { scope, entityKind } of changes) {
@@ -15,7 +26,7 @@ export const refetchFor = (changes: Change[]) => {
       keys.add("messages").add("inbox");
       if (entityKind === "channel") keys.add("channels");
     } else if (scope.startsWith("workspace:")) {
-      keys.add("jobs").add("bots").add("devices");
+      keys.add("jobs").add("bots").add("devices").add("approvals");
     }
   }
   return keys;

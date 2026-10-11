@@ -505,6 +505,66 @@ export const confirmRunStopped = async (
   }
 };
 
+// --------------------------------------------------- Approvals (§19)
+
+/** A `waiting_approval` Run with no pending approval left goes back to `running`. Batchable. */
+export const resumeRunAfterApproval = (db: D1Database, runId: string) =>
+  db
+    .prepare(
+      `UPDATE runs SET state = 'running', updated_at = ?
+        WHERE id = ? AND state = 'waiting_approval'
+          AND NOT EXISTS (SELECT 1 FROM approvals WHERE run_id = runs.id AND state = 'pending')`,
+    )
+    .bind(iso(), runId);
+
+/**
+ * Pending approvals past `expires_at`, or whose Run is no longer active at their generation, go `expired` (= deny,
+ * never fail-open), with the Run resumed and change rows in one batch. A row resolved meanwhile is left alone.
+ * Returns the touched Workspaces.
+ */
+export const expireApprovals = async (db: D1Database, limit = 50) => {
+  const now = iso();
+  const { results } = await db
+    .prepare(
+      `SELECT a.id, a.workspace_id, a.run_id, a.expires_at < ? AS timed_out FROM approvals a
+         JOIN runs r ON r.workspace_id = a.workspace_id AND r.id = a.run_id
+        WHERE a.state = 'pending'
+          AND (a.expires_at < ? OR r.state NOT IN ${activeRunStates}
+               OR r.execution_generation <> a.execution_generation)
+        LIMIT ?`,
+    )
+    .bind(now, now, limit)
+    .all<{ id: string; workspace_id: string; run_id: string; timed_out: number }>();
+  if (results.length === 0) return [];
+  await db.batch(
+    results.flatMap((a) => {
+      const scope = `workspace:${a.workspace_id}`;
+      return [
+        db
+          .prepare(
+            `UPDATE approvals SET state = 'expired', resolved_at = ?, decision_reason = ?
+              WHERE id = ? AND state = 'pending'`,
+          )
+          .bind(now, a.timed_out ? "timeout" : "run_not_current", a.id),
+        resumeRunAfterApproval(db, a.run_id),
+        appendChange(db, {
+          workspaceId: a.workspace_id,
+          entityKind: "approval",
+          entityId: a.id,
+          scope,
+        }),
+        appendChange(db, {
+          workspaceId: a.workspace_id,
+          entityKind: "run",
+          entityId: a.run_id,
+          scope,
+        }),
+      ];
+    }),
+  );
+  return [...new Set(results.map((a) => a.workspace_id))];
+};
+
 // A device is online when it heartbeated within this window: 3 × the 15 s heartbeat (docs/roadmap.md §1).
 const onlineSeconds = 45;
 // `placement` names devices; an empty `allowedDeviceIds` (any device) never waits here.

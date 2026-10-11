@@ -1,10 +1,11 @@
 #!/usr/bin/env bun
 // `hive` entrypoint: real credentials file, stdin and the Local Executor journal for `run` (src/cli.ts).
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { text } from "node:stream/consumers";
 import { claudeAdapter } from "@hive/executor/adapters/claude";
+import { saveEnvironment } from "@hive/executor/environments";
 import { fakeAdapter } from "@hive/executor/adapters/fake";
 import { fileJournal } from "@hive/executor/journal";
 import { runLoop } from "@hive/executor/runner";
@@ -13,6 +14,7 @@ import { type Credentials, run } from "./cli.ts";
 const dir = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "hive");
 const credentialsFile = join(dir, "credentials.json");
 const tokenFile = join(dir, "device-token");
+const executorDir = join(dir, "executor");
 
 const readCredentials = async (): Promise<Credentials> =>
   readFile(credentialsFile, "utf8").then(
@@ -48,16 +50,22 @@ process.exitCode = await run(process.argv.slice(2), {
     return { tokenFile };
   },
   readInput: (path) => (path === "-" ? text(process.stdin) : readFile(path, "utf8")),
+  saveEnvironment: async (name, path) => {
+    const root = await realpath(path);
+    if (!(await stat(root)).isDirectory()) throw new Error(`not a directory: ${root}`);
+    await saveEnvironment(executorDir, name, root);
+    return root;
+  },
   stdout: (line) => console.log(line),
   stderr: (line) => console.error(line),
   runExecutor: async (cloud, once, provider) =>
     runLoop(
       {
         cloud,
-        journal: await fileJournal(join(dir, "executor")),
+        journal: await fileJournal(executorDir),
         adapter:
           provider === "claude"
-            ? claudeAdapter({ stateDir: join(dir, "executor") })
+            ? claudeAdapter({ stateDir: executorDir })
             : fakeAdapter({
                 delayMs: Number(process.env.FAKE_DELAY_MS ?? 50),
                 fail: process.env.FAKE_FAIL === "1",

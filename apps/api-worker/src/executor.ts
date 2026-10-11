@@ -13,6 +13,7 @@ import {
   type RunContext,
   type RunObservation,
   type RunResultSubmit,
+  type ToolPolicy,
 } from "@hive/contracts";
 import {
   appendChange,
@@ -46,11 +47,21 @@ const activeRunStatesSql = `(${[...activeRunStates].map((s) => `'${s}'`).join(",
 
 /**
  * Placement (§10.2) as a safety constraint: a non-empty `allowedDeviceIds` is always intersected, whatever
- * the mode; an empty list means any device in the Workspace.
+ * the mode; an empty list means any device in the Workspace. An `environmentId` needs that environment registered
+ * on the device (§10.1, `environments` = the device's environment names).
  */
-const eligible = (placement: PlacementPolicy, deviceId: string) =>
-  placement.allowedDeviceIds.length === 0 ||
-  (placement.allowedDeviceIds as string[]).includes(deviceId);
+const eligible = (placement: PlacementPolicy, deviceId: string, environments: Set<string>) =>
+  (placement.allowedDeviceIds.length === 0 ||
+    (placement.allowedDeviceIds as string[]).includes(deviceId)) &&
+  (placement.environmentId === undefined || environments.has(placement.environmentId));
+
+const deviceEnvironments = async (db: D1Database, deviceId: string) => {
+  const { results } = await db
+    .prepare("SELECT name FROM device_environments WHERE device_id = ?")
+    .bind(deviceId)
+    .all<{ name: string }>();
+  return new Set(results.map((r) => r.name));
+};
 
 type JobRow = {
   id: string;
@@ -83,7 +94,9 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
     .first<JobRow>();
   if (!row) throw new HttpError("NOT_FOUND", "job not found");
   const job = toQueuedJob(row);
-  if (!eligible(job.placement, device.deviceId)) throw notEligible();
+  if (!eligible(job.placement, device.deviceId, await deviceEnvironments(db, device.deviceId))) {
+    throw notEligible();
+  }
   // The Run capability (§18.2) is committed with the claim. Task writes need a Task Job.
   const secret = newDeviceSecret();
   const tokenHash = await hashSecret(secret);
@@ -402,8 +415,11 @@ export const listQueuedJobs = async (db: D1Database, device: Device, limit: numb
     )
     .bind(device.workspaceIds[0], limit)
     .all<JobRow>();
+  const environments = await deviceEnvironments(db, device.deviceId);
   return {
-    jobs: results.map(toQueuedJob).filter((job) => eligible(job.placement, device.deviceId)),
+    jobs: results
+      .map(toQueuedJob)
+      .filter((job) => eligible(job.placement, device.deviceId, environments)),
   };
 };
 
@@ -461,7 +477,7 @@ export const getRunContext = async (
   const workspaceId = device.workspaceIds[0];
   const row = await db
     .prepare(
-      `SELECT b.id AS bot_id, b.name, b.instructions, t.id AS task_id, t.key, t.title, t.description,
+      `SELECT b.id AS bot_id, b.name, b.instructions, b.tool_policy, j.placement, t.id AS task_id, t.key, t.title, t.description,
               j.inbox_batch_id, i.id AS item_id, i.conversation_id, c.channel_id, c.kind AS conversation_kind,
               m.id AS message_id, m.kind AS message_kind, fb.id AS from_bot_id, fb.name AS from_bot_name,
               COALESCE(m.body, CASE e.source_kind WHEN 'routine' THEN json_extract(e.data, '$.inputText') END,
@@ -482,6 +498,8 @@ export const getRunContext = async (
       bot_id: string;
       name: string;
       instructions: string;
+      tool_policy: string;
+      placement: string;
       task_id: string | null;
       key: string | null;
       title: string | null;
@@ -561,7 +579,13 @@ export const getRunContext = async (
       created_at: string;
     }>();
   return {
-    bot: { id: row.bot_id, name: row.name, instructions: row.instructions },
+    bot: {
+      id: row.bot_id,
+      name: row.name,
+      instructions: row.instructions,
+      toolPolicy: JSON.parse(row.tool_policy) as ToolPolicy,
+    },
+    environment: (JSON.parse(row.placement) as PlacementPolicy).environmentId ?? null,
     task:
       row.task_id === null
         ? null

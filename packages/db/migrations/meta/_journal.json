@@ -71,6 +71,13 @@
       "when": 1791689068044,
       "tag": "0009_bot_messaging",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1791690524225,
+      "tag": "0010_tool_policy_approvals",
+      "breakpoints": true
     }
   ]
 }

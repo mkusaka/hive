@@ -1,4 +1,5 @@
 // Read routes for a user principal, scoped to the user's Workspaces (docs/architecture.md §22.2).
+import type { ApprovalStatus } from "@hive/contracts";
 import { displayState } from "@hive/db";
 import { HttpError } from "./errors.ts";
 
@@ -99,13 +100,16 @@ export const listChannels = async (db: D1Database, workspaceId: string, userId: 
 export const listBots = async (db: D1Database, workspaceId: string) => {
   const { results } = await db
     .prepare(
-      `SELECT id, name, placement_policy AS placementPolicy, config_revision AS revision,
-              created_at AS createdAt, updated_at AS updatedAt
+      `SELECT id, name, placement_policy AS placementPolicy, tool_policy AS toolPolicy,
+              config_revision AS revision, created_at AS createdAt, updated_at AS updatedAt
          FROM bots WHERE workspace_id = ? ORDER BY name LIMIT 500`,
     )
     .bind(workspaceId)
-    .all<{ placementPolicy: unknown }>();
-  for (const bot of results) bot.placementPolicy = JSON.parse(bot.placementPolicy as string);
+    .all<{ placementPolicy: unknown; toolPolicy: unknown }>();
+  for (const bot of results) {
+    bot.placementPolicy = JSON.parse(bot.placementPolicy as string);
+    bot.toolPolicy = JSON.parse(bot.toolPolicy as string);
+  }
   return { bots: results };
 };
 
@@ -392,4 +396,44 @@ export const listRoutines = async (db: D1Database, workspaceId: string) => {
     r.enabled = r.enabled === 1;
   }
   return { routines: results };
+};
+
+const approvalStates = ["pending", "approved", "denied", "expired"];
+
+/** Newest first (max 100), optionally one `state`; `argsSummary` is redacted on the device (§19). */
+export const listApprovals = async (db: D1Database, workspaceId: string, state?: string) => {
+  if (state !== undefined && !approvalStates.includes(state)) {
+    throw new HttpError("INVALID_INPUT", `state must be one of ${approvalStates.join(", ")}`);
+  }
+  const { results } = await db
+    .prepare(
+      `SELECT a.id, a.run_id AS runId, a.execution_generation AS executionGeneration, a.job_id AS jobId,
+              a.bot_id AS botId, b.name AS botName, a.action_kind AS actionKind, a.args_summary AS argsSummary,
+              a.args_hash AS argsHash, a.cwd_label AS cwdLabel, a.state, a.requested_at AS requestedAt,
+              a.expires_at AS expiresAt, a.resolved_at AS resolvedAt, a.resolved_by AS resolvedBy,
+              a.decision_reason AS decisionReason
+         FROM approvals a JOIN bots b ON b.workspace_id = a.workspace_id AND b.id = a.bot_id
+        WHERE a.workspace_id = ? AND (? IS NULL OR a.state = ?)
+        ORDER BY a.requested_at DESC, a.id DESC LIMIT 100`,
+    )
+    .bind(workspaceId, state ?? null, state ?? null)
+    .all();
+  return { approvals: results };
+};
+
+/** The Run's own approval at its generation (what its executor polls), else 404. */
+export const getRunApproval = async (
+  db: D1Database,
+  run: { runId: string; executionGeneration: number },
+  id: string,
+): Promise<ApprovalStatus> => {
+  const row = await db
+    .prepare(
+      `SELECT id, state, args_hash AS argsHash, expires_at AS expiresAt, decision_reason AS decisionReason
+         FROM approvals WHERE id = ? AND run_id = ? AND execution_generation = ?`,
+    )
+    .bind(id, run.runId, run.executionGeneration)
+    .first<ApprovalStatus>();
+  if (!row) throw notFound("approval");
+  return row;
 };

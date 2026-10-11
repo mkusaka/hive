@@ -4,9 +4,13 @@ import {
   type AgentReplyAccepted,
   AgentSend,
   type AgentSendAccepted,
+  ApprovalRequest,
+  ApprovalResolve,
   BotCreate,
+  BotUpdate,
   ChannelCreate,
   commandEnvelope,
+  DeviceEnvironmentRegister,
   DeviceRegister,
   DeviceRevoke,
   EventEmit,
@@ -51,6 +55,7 @@ import {
   insertInboxItem,
   insertMessage,
   readiness,
+  resumeRunAfterApproval,
   withOperationReceipt,
   wouldCreateCycle,
 } from "@hive/db";
@@ -66,8 +71,10 @@ export const CommandEnvelope = commandEnvelope(
     WorkspaceCreate,
     DeviceRegister,
     DeviceRevoke,
+    DeviceEnvironmentRegister,
     ChannelCreate,
     BotCreate,
+    BotUpdate,
     AgentSend,
     EventEmit,
     ProjectCreate,
@@ -90,6 +97,7 @@ export const CommandEnvelope = commandEnvelope(
     RoutinePause,
     RoutineResume,
     RoutineRun,
+    ApprovalResolve,
   ]),
 );
 type Envelope = v.InferOutput<typeof CommandEnvelope>;
@@ -330,7 +338,8 @@ const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env
         .bind(actorId, workspaceId, command.name),
       db
         .prepare(
-          "INSERT INTO bots (id, workspace_id, actor_id, name, placement_policy, instructions) VALUES (?, ?, ?, ?, ?, ?)",
+          `INSERT INTO bots (id, workspace_id, actor_id, name, placement_policy, instructions, tool_policy)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
         .bind(
           botId,
@@ -339,12 +348,119 @@ const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env
           command.name,
           JSON.stringify(command.placementPolicy),
           command.instructions,
+          JSON.stringify(command.toolPolicy),
         ),
     ],
     { operationId: env.operationId, status: "accepted", botId },
     [{ entityKind: "bot", entityId: botId, revision: 1, scope: `workspace:${workspaceId}` }],
   );
   return uniqueName(db, "bots", workspaceId, command.name, run);
+};
+
+/** Revision CAS on `config_revision`. A Run reads the policy once at start, so an update never widens a running one. */
+const botUpdate: Handler<v.InferOutput<typeof BotUpdate>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const revision = async () => {
+    const row = await db
+      .prepare("SELECT config_revision AS revision FROM bots WHERE workspace_id = ? AND id = ?")
+      .bind(workspaceId, command.botId)
+      .first<{ revision: number }>();
+    if (!row) throw new HttpError("NOT_FOUND", "bot not found");
+    return row.revision;
+  };
+  await revision();
+  const [setGuard, clearGuard] = guard(db);
+  const next = command.expectedRevision + 1;
+  const run = receipt(
+    db,
+    user.userId,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE bots SET instructions = COALESCE(?, instructions), tool_policy = COALESCE(?, tool_policy),
+             config_revision = config_revision + 1, updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND config_revision = ?`,
+        )
+        .bind(
+          command.instructions ?? null,
+          command.toolPolicy ? JSON.stringify(command.toolPolicy) : null,
+          new Date().toISOString(),
+          workspaceId,
+          command.botId,
+          command.expectedRevision,
+        ),
+      setGuard,
+      clearGuard,
+    ],
+    { operationId: env.operationId, status: "accepted", botId: command.botId, revision: next },
+    [
+      {
+        entityKind: "bot",
+        entityId: command.botId,
+        revision: next,
+        scope: `workspace:${workspaceId}`,
+      },
+    ],
+  );
+  return explainFailure(run, async () => {
+    const current = await revision();
+    return current === command.expectedRevision
+      ? null
+      : new HttpError(
+          "REVISION_CONFLICT",
+          `bot revision is ${current}; refetch and retry`,
+          false,
+          "stale_revision",
+        );
+  });
+};
+
+/** On the caller's own, unrevoked device. Re-registering a name replaces its repository identity. */
+const deviceEnvironmentRegister: Handler<v.InferOutput<typeof DeviceEnvironmentRegister>> = async (
+  db,
+  user,
+  env,
+) => {
+  const { workspaceId, command } = env;
+  const owned = await db
+    .prepare(
+      `SELECT e.id FROM devices d
+         LEFT JOIN device_environments e ON e.device_id = d.id AND e.name = ?
+        WHERE d.workspace_id = ? AND d.id = ? AND d.owner_user_id = ? AND d.revoked_at IS NULL`,
+    )
+    .bind(command.name, workspaceId, command.deviceId, user.userId)
+    .first<{ id: string | null }>();
+  if (!owned) throw new HttpError("NOT_FOUND", "device not found");
+  const environmentId = owned.id ?? crypto.randomUUID();
+  const now = new Date().toISOString();
+  return receipt(
+    db,
+    user.userId,
+    env,
+    [
+      db
+        .prepare(
+          `INSERT INTO device_environments (id, workspace_id, device_id, name, repository) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT (device_id, name) DO UPDATE SET repository = excluded.repository, updated_at = ?`,
+        )
+        .bind(environmentId, workspaceId, command.deviceId, command.name, command.repository, now),
+    ],
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      environmentId,
+      deviceId: command.deviceId,
+      name: command.name,
+    },
+    [
+      {
+        entityKind: "device_environment",
+        entityId: environmentId,
+        scope: `workspace:${workspaceId}`,
+      },
+    ],
+  );
 };
 
 /** §11.1: Message, Inbox item, Event, Change Log, Outbox and Receipt in one batch. Routing creates the Job later. */
@@ -1579,12 +1695,103 @@ const routineRun: Handler<v.InferOutput<typeof RoutineRun>> = async (db, user, e
   );
 };
 
+// ------------------------------------------------ Approvals (docs/architecture.md §19)
+
+const activeRunStates = "('starting', 'running', 'waiting_approval', 'stopping')";
+
+/** Why an approval cannot be resolved now, or null when it can (AT-35). */
+const explainApproval = async (db: D1Database, workspaceId: string, approvalId: string) => {
+  const row = await db
+    .prepare(
+      `SELECT a.state, a.expires_at,
+              (r.state IN ${activeRunStates} AND r.execution_generation = a.execution_generation) AS current
+         FROM approvals a JOIN runs r ON r.workspace_id = a.workspace_id AND r.id = a.run_id
+        WHERE a.workspace_id = ? AND a.id = ?`,
+    )
+    .bind(workspaceId, approvalId)
+    .first<{ state: string; expires_at: string; current: number }>();
+  if (!row) return new HttpError("NOT_FOUND", "approval not found");
+  if (row.state !== "pending") {
+    return new HttpError(
+      "REVISION_CONFLICT",
+      `approval is ${row.state}`,
+      false,
+      `approval_${row.state}`,
+    );
+  }
+  if (!row.current) {
+    return new HttpError(
+      "STALE_GENERATION",
+      "the requesting run is no longer current",
+      false,
+      "stale_generation",
+    );
+  }
+  if (row.expires_at <= new Date().toISOString()) {
+    return new HttpError("REVISION_CONFLICT", "approval is expired", false, "approval_expired");
+  }
+  return null;
+};
+
+/**
+ * One-use CAS pending → approved / denied, only while the requesting Run is still active at the approval's generation
+ * and before `expires_at`. The Run goes back to `running` once it has no pending approval left.
+ */
+const approvalResolve: Handler<v.InferOutput<typeof ApprovalResolve>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const problem = await explainApproval(db, workspaceId, command.approvalId);
+  if (problem) throw problem;
+  const { run_id: runId } = (await db
+    .prepare("SELECT run_id FROM approvals WHERE id = ?")
+    .bind(command.approvalId)
+    .first<{ run_id: string }>())!;
+  const now = new Date().toISOString();
+  const state = command.decision === "allow" ? "approved" : "denied";
+  const [setGuard, clearGuard] = guard(db);
+  const scope = `workspace:${workspaceId}`;
+  const run = receipt(
+    db,
+    user.userId,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE approvals SET state = ?, resolved_at = ?, resolved_by = ?, decision_reason = ?
+            WHERE workspace_id = ? AND id = ? AND state = 'pending' AND expires_at > ?
+              AND EXISTS (SELECT 1 FROM runs r WHERE r.workspace_id = approvals.workspace_id AND r.id = approvals.run_id
+                            AND r.execution_generation = approvals.execution_generation
+                            AND r.state IN ${activeRunStates})`,
+        )
+        .bind(
+          state,
+          now,
+          user.userId,
+          command.reason ?? null,
+          workspaceId,
+          command.approvalId,
+          now,
+        ),
+      setGuard,
+      clearGuard,
+      resumeRunAfterApproval(db, runId),
+    ],
+    { operationId: env.operationId, status: "accepted", approvalId: command.approvalId, state },
+    [
+      { entityKind: "approval", entityId: command.approvalId, scope },
+      { entityKind: "run", entityId: runId, scope },
+    ],
+  );
+  return explainFailure(run, () => explainApproval(db, workspaceId, command.approvalId));
+};
+
 const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>> } = {
   "workspace.create": workspaceCreate,
   "device.register": deviceRegister,
   "device.revoke": deviceRevoke,
   "channel.create": channelCreate,
   "bot.create": botCreate,
+  "bot.update": botUpdate,
+  "device.environment.register": deviceEnvironmentRegister,
   "agent.send": agentSend,
   "event.emit": eventEmit,
   "project.create": projectCreate,
@@ -1607,6 +1814,7 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "routine.pause": routinePause,
   "routine.resume": routineResume,
   "routine.run": routineRun,
+  "approval.resolve": approvalResolve,
 };
 
 export const runCommand = (db: D1Database, principal: Principal, envelope: Envelope) => {
@@ -1848,6 +2056,77 @@ const runAgentReply: RunHandler<v.InferOutput<typeof AgentReply>> = async (db, r
   );
 };
 
+/** docs/roadmap.md §1: approval timeout 10 min; a timeout means deny. */
+export const approvalTimeoutSeconds = 10 * 60;
+
+/**
+ * A pending approval for this Run's generation; the Run goes `waiting_approval` (fenced, lease kept). Each call is a
+ * new approval: one is never reused for another tool call (§9.3).
+ */
+const runApprovalRequest: RunHandler<v.InferOutput<typeof ApprovalRequest>> = async (
+  db,
+  run,
+  env,
+) => {
+  const { workspaceId, command } = env;
+  const approvalId = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + approvalTimeoutSeconds * 1000).toISOString();
+  const scope = `workspace:${workspaceId}`;
+  const [setGuard, clearGuard] = guard(db);
+  const pending = receipt(
+    db,
+    run.runId,
+    env as unknown as Envelope,
+    [
+      db
+        .prepare(
+          `INSERT INTO approvals (id, workspace_id, run_id, execution_generation, job_id, bot_id, action_kind, args_hash,
+             args_summary, cwd_label, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          approvalId,
+          workspaceId,
+          run.runId,
+          run.executionGeneration,
+          run.jobId,
+          run.botId,
+          command.actionKind,
+          command.argsHash,
+          command.argsSummary,
+          command.cwdLabel,
+          expiresAt,
+        ),
+      db
+        .prepare(
+          `UPDATE runs SET state = 'waiting_approval', updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND execution_generation = ?
+              AND state IN ('starting', 'running', 'waiting_approval')`,
+        )
+        .bind(new Date().toISOString(), workspaceId, run.runId, run.executionGeneration),
+      setGuard,
+      clearGuard,
+    ],
+    { operationId: env.operationId, status: "accepted", approvalId, expiresAt },
+    [
+      { entityKind: "approval", entityId: approvalId, scope },
+      { entityKind: "run", entityId: run.runId, scope },
+    ],
+  );
+  // Only a Run that left `starting / running / waiting_approval` explains a failed batch; anything else rethrows.
+  return explainFailure(pending, async () =>
+    (await db
+      .prepare(
+        `SELECT 1 FROM runs WHERE workspace_id = ? AND id = ? AND execution_generation = ?
+          AND state IN ('starting', 'running', 'waiting_approval')`,
+      )
+      .bind(workspaceId, run.runId, run.executionGeneration)
+      .first())
+      ? null
+      : new HttpError("STALE_GENERATION", "run is not running", false, "stale_generation"),
+  );
+};
+
 const taskHandlers = {
   "task.create": taskCreate,
   "task.assign": taskAssign,
@@ -1899,6 +2178,9 @@ export const runRunCommand = (db: D1Database, run: Run, envelope: RunEnvelopeVal
   }
   if (command.type === "agent.reply") {
     return runAgentReply(db, run, envelope as RunEnvelopeValue & { command: typeof command });
+  }
+  if (command.type === "approval.request") {
+    return runApprovalRequest(db, run, envelope as RunEnvelopeValue & { command: typeof command });
   }
   return runTaskCommand(db, run, envelope as RunEnvelopeValue & { command: typeof command });
 };

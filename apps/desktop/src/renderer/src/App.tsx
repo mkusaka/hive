@@ -1,11 +1,11 @@
-// Phase 2 UI slice: Channel / Inbox / Activity / Devices views and a status bar (docs/architecture.md §21).
+// Phase 2 UI slice: Channel / Inbox / Activity / Approvals / Devices views and a status bar (docs/architecture.md §21).
 /* oxlint-disable no-await-in-loop */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HiveConfig } from "../../shared/api.ts";
 import { createSync, type ListKey, type SyncStatus } from "./sync.ts";
 
 type Row = Record<string, unknown> & { id: string };
-type View = "channel" | "inbox" | "activity" | "devices";
+type View = "channel" | "inbox" | "activity" | "approvals" | "devices";
 
 const get = async (path: string) => {
   const result = await window.hive.api.get(path);
@@ -33,6 +33,7 @@ export const App = () => {
   const [inbox, setInbox] = useState<Row[]>([]);
   const [jobs, setJobs] = useState<Row[]>([]);
   const [devices, setDevices] = useState<Row[]>([]);
+  const [approvals, setApprovals] = useState<Row[]>([]);
   const [channelId, setChannelId] = useState("");
   const [botId, setBotId] = useState("");
   const [jobDetail, setJobDetail] = useState<Record<string, unknown> | null>(null);
@@ -46,6 +47,22 @@ export const App = () => {
       command: { type: "job.cancel", jobId },
     });
     if (!result.ok) setError(`${result.error.code}: ${result.error.message}`);
+  };
+
+  /** approval.resolve (§19): resolved once; a stale or already-resolved one is a 409 shown as an error. */
+  const resolveApproval = async (
+    workspaceId: string,
+    approvalId: string,
+    decision: "allow" | "deny",
+  ) => {
+    const result = await window.hive.api.command({
+      operationId: crypto.randomUUID(),
+      idempotencyKey: crypto.randomUUID(),
+      workspaceId,
+      command: { type: "approval.resolve", approvalId, decision },
+    });
+    if (!result.ok) setError(`${result.error.code}: ${result.error.message}`);
+    void refetch(new Set(["approvals"]), workspaceId);
   };
 
   // Refetches run from sync callbacks, so they read the current selection through refs.
@@ -62,6 +79,12 @@ export const App = () => {
     load("bots", inWorkspace("bots", ws), "bots", setBots);
     load("devices", inWorkspace("devices", ws), "devices", setDevices);
     load("jobs", inWorkspace("jobs", ws, { limit: "50" }), "jobs", setJobs);
+    load(
+      "approvals",
+      inWorkspace("approvals", ws, { state: "pending" }),
+      "approvals",
+      setApprovals,
+    );
     // Newest first from the API, shown oldest first.
     load(
       "messages",
@@ -149,9 +172,14 @@ export const App = () => {
   return (
     <div className="app">
       <nav>
-        {(["channel", "inbox", "activity", "devices"] as const).map((v) => (
+        {(["channel", "inbox", "activity", "approvals", "devices"] as const).map((v) => (
           <button key={v} className={v === view ? "active" : ""} onClick={() => setView(v)}>
             {v[0]!.toUpperCase() + v.slice(1)}
+            {v === "approvals" && approvals.length > 0 && (
+              <span className="count" aria-label={`${approvals.length} pending`}>
+                {approvals.length}
+              </span>
+            )}
           </button>
         ))}
       </nav>
@@ -225,6 +253,12 @@ export const App = () => {
             <pre>{jobDetail ? JSON.stringify(jobDetail, null, 2) : "Select a Job"}</pre>
           </section>
         )}
+        {view === "approvals" && (
+          <ApprovalsView
+            approvals={approvals}
+            resolve={(id, d) => void resolveApproval(ws, id, d)}
+          />
+        )}
         {view === "devices" && (
           <section>
             <h2>Devices</h2>
@@ -261,6 +295,57 @@ export const App = () => {
         {sync.error && <span className="error">{sync.error}</span>}
       </footer>
     </div>
+  );
+};
+
+/** Pending approvals, newest first. The command is a device-side redacted summary; the full input never leaves it. */
+const ApprovalsView = (props: {
+  approvals: Row[];
+  resolve: (approvalId: string, decision: "allow" | "deny") => void;
+}) => {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const expiresIn = (at: unknown) => {
+    const s = Math.max(0, Math.round((Date.parse(String(at)) - now) / 1000));
+    return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+  };
+  return (
+    <section>
+      <h2>Approvals</h2>
+      {props.approvals.length === 0 && <p>No pending approvals.</p>}
+      <table>
+        <thead>
+          <tr>
+            <th>Action</th>
+            <th>Arguments</th>
+            <th>Where</th>
+            <th>Bot</th>
+            <th>Expires in</th>
+            <th />
+          </tr>
+        </thead>
+        <tbody>
+          {props.approvals.map((a) => (
+            <tr key={a.id}>
+              <td>{text(a.actionKind)}</td>
+              <td>
+                <pre className="mono">{text(a.argsSummary)}</pre>
+              </td>
+              <td className="mono">{text(a.cwdLabel)}</td>
+              <td>{text(a.botName)}</td>
+              <td>{expiresIn(a.expiresAt)}</td>
+              <td>
+                <button onClick={() => props.resolve(a.id, "allow")}>Allow</button>{" "}
+                <button onClick={() => props.resolve(a.id, "deny")}>Deny</button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
   );
 };
 

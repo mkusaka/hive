@@ -15,6 +15,12 @@ hive device register --name <n> --os <os> --agent-version <v>
                                                        # prints the token once, stores it for `executor run`
 hive channel create --name <name>
 hive bot create --name <name> [--allowed-device <device-id>]... [--instructions <text> | --instructions-file <path|->]
+                [--tools <Tool=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] [--environment <name>]
+hive bot update <bot-id> [--instructions <text> | --instructions-file <path|->] [--tools ...] [--cwd-mode ...]
+hive device env add --name <name> --repo <url> --path <local checkout root>
+hive approval list [--state pending|approved|denied|expired]   # default pending
+hive approval resolve <approval-id> (--allow | --deny) [--reason <text>]
+hive approval watch [--timeout <s>]                # prints each new pending approval once, polls every 2 s
 hive agent send <bot-id> --channel <channel-id> --message <text> [--notify] [--wait [--timeout <s>]]
 hive event emit <type> [--data-file <path|->] [--subject <kind:id>]
 hive op get <operation-id>
@@ -63,6 +69,16 @@ a fresh UUID per invocation).
 - **`routine create`** defaults `--tz` to this machine's IANA zone. `--channel` is resolved to the Channel's main
   Conversation (the Routine's lane and reply target) through `channel list`. `job resolve --retry` is 409 (exit 4)
   until the old Run's stop is confirmed by its executor.
+- **`--tools`** is `Read=allow,Bash=ask` (Read, Grep, Glob, Edit, Write, Bash; a missing tool is `deny`).
+  `bot update --tools` replaces the tool list and keeps the current `cwdMode` unless `--cwd-mode` is given; it reads
+  the Bot's revision from `bot list`, so a concurrent edit is 409 (exit 4). **Security:** Bash is not
+  path-restricted (see `apps/executor/README.md`, Tool policy and approvals); prefer `Bash=ask`.
+- **`device env add`** resolves `--path` to an existing directory and writes it to
+  `<config dir>/hive/executor/environments.json` first (the local path never leaves the device), then registers
+  `{deviceId (from the stored device token), name, repository}` in the cloud. A Bot created with
+  `--environment <name> --cwd-mode environment` then runs in that checkout on devices that registered the name.
+- **`approval resolve`** is one-use: a second resolve, an expired approval or one whose Run is no longer current is
+  409 (exit 4).
 - **`subscription create`** sends the file's JSON object as the `subscription.create` command, for example
   `{"botId": "<bot-id>", "eventTypes": ["github.pull_request.*"], "filter": {"op": "eq", "field":
 "data.repositoryId", "value": 42}, "destination": {"conversationId": "<conversation-id>"}, "delivery": {"mode":
