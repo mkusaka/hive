@@ -20,6 +20,7 @@ import {
   RoutineRun,
   RoutineRotateSecret,
   RoutineUpdate,
+  RunLinkTask,
   SidebarUpdate,
   WorkspaceCreate,
 } from "@hive/contracts";
@@ -56,6 +57,7 @@ export const UiCommandSchema = commandEnvelope(
     RoutineResume,
     RoutineRun,
     RoutineRotateSecret,
+    RunLinkTask,
     SidebarUpdate,
     WorkspaceCreate,
   ]),

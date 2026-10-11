@@ -36,9 +36,24 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK), `codex` 
   `claude` (Claude provider configured; no probe), `codex` (Codex provider and a `codex` binary on `PATH`) and
   `env:<name>` per environment in `environments.json`; `capacity.background` = `--concurrency`. Bots match their
   `requiredCapabilities` against these.
+- `src/collector.ts`: read-only import of externally started Claude and Codex session JSONL. It uses durable
+  byte offsets plus immutable part sequences in `collector.json`, so a failed ACK retries identical bytes and a
+  growing session appends new parts rather than uploading a replacement snapshot.
 - `src/main.ts`: `--api-url --token-file --state-dir [--once] [--concurrency N] --provider fake|claude|codex`
   (`node:util` `parseArgs`). `--concurrency N` (1..64, default 1) runs N worker loops in `runLoop`, each sequential,
   and reports N as the device's background capacity; the cloud refuses claims past it (409 `at_capacity`).
+
+## External session collection
+
+Collection is opt-in through `hive collect enable`; it is disabled by default. The CLI executor performs an enabled
+pass on startup and then every ten minutes. `hive collect run` works independently of that setting and supports
+`--since <duration>` and `--dry-run`.
+
+The collector reads, but never modifies, Claude JSONL in `$CLAUDE_CONFIG_DIR/projects` (or
+`~/.claude/projects`) and Codex JSONL in `~/.codex/sessions`. It skips hive-managed session mirrors and hive run
+directories. It uploads only normalized user/assistant text and required tool details. Environment/configuration and
+reasoning records are omitted; credential-shaped assignments and token prefixes are redacted before upload and
+redacted again by the Worker. `--dry-run` makes no network calls or local writes.
 
 ## Claude provider
 

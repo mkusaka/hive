@@ -48,6 +48,12 @@ export type Deps = {
    * that is not an existing directory; returns the absolute path stored.
    */
   saveEnvironment(name: string, path: string): Promise<string>;
+  loadCollectConfig(): Promise<{ enabled: boolean }>;
+  saveCollectConfig(enabled: boolean): Promise<void>;
+  runCollector(
+    cloud: CloudClient,
+    options: { sinceMs?: number; dryRun?: boolean },
+  ): Promise<{ files: number; uploaded: number; dryRun: boolean }>;
   /** Watch interval; 2 s by default. */
   pollMs?: number;
 };
@@ -90,6 +96,14 @@ const need = (values: Values, name: string) => {
   return value;
 };
 
+const duration = (value: string) => {
+  const match = /^(\d+(?:\.\d+)?)(ms|s|m|h|d|w)$/.exec(value);
+  if (!match) throw invalid("--since must be a duration such as 30m or 1h");
+  const unit = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 }[
+    match[2]!
+  ]!;
+  return Number(match[1]) * unit;
+};
 const exitForJob = (job: cmd.Json) => (job.state === "succeeded" ? 0 : 5);
 
 /** `--tools Read=allow,Bash=ask` (+ `--cwd-mode`) → a ToolPolicy; the server validates names and modes. */
@@ -406,7 +420,7 @@ const specs: Record<string, Spec> = {
     run: async (c) => c.print(await cmd.getStatus(c.client(), c.workspace())),
   },
   search: {
-    usage: "<query> [--kinds message,task,memory]",
+    usage: "<query> [--kinds message,task,memory,run]",
     args: 1,
     options: { kinds: str },
     run: async (c) =>
@@ -560,6 +574,63 @@ const specs: Record<string, Spec> = {
     usage: "<operation-id>",
     args: 1,
     run: async (c) => c.print(await cmd.getOperation(c.client(), c.args[0]!)),
+  },
+  "collect enable": {
+    usage: "",
+    run: async (c) => {
+      await c.deps.saveCollectConfig(true);
+      c.print({ enabled: true });
+    },
+  },
+  "collect disable": {
+    usage: "",
+    run: async (c) => {
+      await c.deps.saveCollectConfig(false);
+      c.print({ enabled: false });
+    },
+  },
+  "collect status": {
+    usage: "",
+    run: async (c) => c.print(await c.deps.loadCollectConfig()),
+  },
+  "collect run": {
+    usage: "[--since <duration>] [--dry-run]",
+    options: { since: str, "dry-run": flag },
+    run: async (c) => {
+      if (!c.creds.deviceToken)
+        throw new CliError("UNAUTHENTICATED", 3, "no deviceToken: run `hive device register`");
+      const { accessClientId: clientId, accessClientSecret: clientSecret } = c.creds;
+      c.print(
+        await c.deps.runCollector(
+          createCloudClient({
+            apiUrl: c.apiUrl(),
+            token: c.creds.deviceToken,
+            accessService: clientId && clientSecret ? { clientId, clientSecret } : undefined,
+            fetch: c.deps.fetch,
+          }),
+          {
+            ...(typeof c.values.since === "string" ? { sinceMs: duration(c.values.since) } : {}),
+            ...(c.values["dry-run"] === true ? { dryRun: true } : {}),
+          },
+        ),
+      );
+    },
+  },
+  "run list": {
+    usage: "[--kind job|external]",
+    options: { kind: str },
+    run: async (c) => {
+      const kind = c.values.kind;
+      if (kind !== undefined && kind !== "job" && kind !== "external")
+        throw invalid("--kind must be job or external");
+      c.print(await cmd.listRuns(c.client(), c.workspace(), kind));
+    },
+  },
+  "run link-task": {
+    usage: "<run-id> <task-id>",
+    args: 2,
+    run: async (c) =>
+      c.print(await cmd.runLinkTask(c.client(), c.envelope(), c.args[0]!, c.args[1]!)),
   },
   "job get": {
     usage: "<job-id>",

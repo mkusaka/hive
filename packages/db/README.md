@@ -95,8 +95,13 @@ bun run db:check   # migrations are consistent and `db:generate` has nothing lef
 
 1. Change `src/schema.ts`.
 2. `bun run db:generate` (from the repo root) and commit the new file under `migrations/`.
-3. `bun run db:check` must pass; CI runs it. On drift it has already generated the missing migration: review and
-   commit it, or delete it.
+3. `bun run db:check` must pass; CI runs it. On drift it reports the proposed schema change without writing a
+   migration into the repository.
+
+`db:check` validates the complete snapshot chain, then checks schema drift against the journal's final snapshot
+in a temporary directory. drizzle-kit otherwise picks the lexically last filename: after this merge, migration
+order is `0022_threads` → `0024_routine_triggers` → `0030_run_outcome` → `0027_external_runs`, not ticket-number order.
+The collector snapshot includes the routine-trigger schema and `runs.outcome`, and its `prevId` is the 0030 id.
 
 ## Foreign keys added to existing tables
 

@@ -93,7 +93,7 @@ const waitingReason = async (
     : null;
 };
 
-/** The Job with its root Runs (oldest first): recovery needs every attempt's state and device (§22.2). */
+/** The Job with its Job Runs (oldest first): recovery needs every attempt's state and device (§22.2). */
 export const getJob = async (db: D1Database, wsIds: string[], id: string) => {
   if (wsIds.length === 0) throw notFound("job");
   const job = await db
@@ -111,7 +111,7 @@ export const getJob = async (db: D1Database, wsIds: string[], id: string) => {
     .prepare(
       `SELECT id, state, execution_generation AS generation, lease_expires_at AS leaseExpiresAt,
               device_id AS deviceId, started_at AS startedAt, result_error AS error, outcome
-         FROM runs WHERE workspace_id = ? AND job_id = ? AND kind = 'root' ORDER BY execution_generation`,
+         FROM runs WHERE workspace_id = ? AND job_id = ? AND kind = 'job' ORDER BY execution_generation`,
     )
     .bind(job.workspaceId, id)
     .all();
@@ -360,6 +360,32 @@ export const listJobs = async (
   return { jobs: results };
 };
 
+/** Newest first Run metadata. External sessions are visible only to their device owner or a Workspace owner. */
+export const listRuns = async (
+  db: D1Database,
+  user: { userId: string },
+  workspaceId: string,
+  kind?: "job" | "native_child" | "external",
+) => {
+  const { results } = await db
+    .prepare(
+      `SELECT r.id, r.kind, r.job_id AS jobId, r.task_id AS taskId, t.key AS taskKey, r.state, r.provider,
+              r.cwd, r.repository, r.title, r.started_at AS startedAt, r.last_activity_at AS lastActivityAt,
+              r.finished_at AS finishedAt, r.device_id AS deviceId, r.created_at AS createdAt
+         FROM runs r
+         JOIN devices d ON d.workspace_id = r.workspace_id AND d.id = r.device_id
+         LEFT JOIN tasks t ON t.workspace_id = r.workspace_id AND t.id = r.task_id
+        WHERE r.workspace_id = ? AND (? IS NULL OR r.kind = ?)
+          AND (r.kind != 'external' OR d.owner_user_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members m
+             WHERE m.workspace_id = r.workspace_id AND m.user_id = ? AND m.role = 'owner'))
+        ORDER BY r.created_at DESC, r.id DESC LIMIT 200`,
+    )
+    .bind(workspaceId, kind ?? null, kind ?? null, user.userId, user.userId)
+    .all();
+  return { runs: results };
+};
+
 /** SQL: user `?uid` may read conversation `c`: a member of its Channel, or the user of its DM (a thread: its parent's). */
 const mayRead = (uid: string) => `EXISTS (
   SELECT 1 FROM conversations p WHERE p.workspace_id = c.workspace_id AND p.id = COALESCE(c.parent_conversation_id, c.id)
@@ -565,7 +591,7 @@ export const listTasks = async (
 };
 
 /** One Task with its prerequisites, dependents, Results, Jobs and Delegations. */
-export const getTask = async (db: D1Database, wsIds: string[], id: string) => {
+export const getTask = async (db: D1Database, wsIds: string[], id: string, userId?: string) => {
   if (wsIds.length === 0) throw notFound("task");
   const task = await db
     .prepare(
@@ -577,50 +603,66 @@ export const getTask = async (db: D1Database, wsIds: string[], id: string) => {
     .first<TaskRow & { workspaceId: string }>();
   if (!task) throw notFound("task");
   const { workspaceId } = task;
-  const [prerequisites, dependents, results, jobs, git, delegations] = await Promise.all([
-    prerequisitesOf(db, workspaceId, id),
-    db
-      .prepare(
-        `SELECT t.id, t.key, t.status FROM task_dependencies d
+  const [prerequisites, dependents, results, jobs, git, delegations, externalSessions] =
+    await Promise.all([
+      prerequisitesOf(db, workspaceId, id),
+      db
+        .prepare(
+          `SELECT t.id, t.key, t.status FROM task_dependencies d
            JOIN tasks t ON t.workspace_id = d.workspace_id AND t.id = d.dependent_task_id
           WHERE d.workspace_id = ? AND d.prerequisite_task_id = ? ORDER BY t.key`,
-      )
-      .bind(workspaceId, id)
-      .all(),
-    db
-      .prepare(
-        `SELECT id, execution_id AS executionId, run_id AS runId, scope_revision AS scopeRevision, state,
+        )
+        .bind(workspaceId, id)
+        .all(),
+      db
+        .prepare(
+          `SELECT id, execution_id AS executionId, run_id AS runId, scope_revision AS scopeRevision, state,
                 summary, created_at AS createdAt
            FROM task_results WHERE workspace_id = ? AND task_id = ? ORDER BY created_at, id`,
-      )
-      .bind(workspaceId, id)
-      .all(),
-    db
-      .prepare(
-        `SELECT id, bot_id AS botId, state, revision, trigger_key AS triggerKey, created_at AS createdAt,
+        )
+        .bind(workspaceId, id)
+        .all(),
+      db
+        .prepare(
+          `SELECT id, bot_id AS botId, state, revision, trigger_key AS triggerKey, created_at AS createdAt,
                 updated_at AS updatedAt
            FROM jobs WHERE workspace_id = ? AND task_id = ? ORDER BY created_at, id`,
-      )
-      .bind(workspaceId, id)
-      .all(),
-    db
-      .prepare(
-        `SELECT repository, commits, prs FROM run_git
+        )
+        .bind(workspaceId, id)
+        .all(),
+      db
+        .prepare(
+          `SELECT repository, commits, prs FROM run_git
           WHERE workspace_id = ? AND run_id IN (SELECT run_id FROM executions WHERE workspace_id = ? AND task_id = ?)
           ORDER BY created_at, run_id`,
-      )
-      .bind(workspaceId, workspaceId, id)
-      .all<{ repository: string; commits: string; prs: string }>(),
-    db
-      .prepare(
-        `SELECT id, from_kind AS fromKind, from_id AS fromId, to_bot_id AS toBotId, mode, state, deadline,
+        )
+        .bind(workspaceId, workspaceId, id)
+        .all<{ repository: string; commits: string; prs: string }>(),
+      db
+        .prepare(
+          `SELECT id, from_kind AS fromKind, from_id AS fromId, to_bot_id AS toBotId, mode, state, deadline,
                 scope_revision AS scopeRevision, job_id AS jobId, outcome_summary AS outcomeSummary,
                 created_at AS createdAt, closed_at AS closedAt
            FROM delegations WHERE workspace_id = ? AND task_id = ? ORDER BY created_at, id`,
-      )
-      .bind(workspaceId, id)
-      .all(),
-  ]);
+        )
+        .bind(workspaceId, id)
+        .all(),
+      userId
+        ? db
+            .prepare(
+              `SELECT r.id, r.provider, r.cwd, r.repository, r.title, r.state, r.started_at AS startedAt,
+                    r.last_activity_at AS lastActivityAt
+               FROM runs r JOIN devices d ON d.workspace_id = r.workspace_id AND d.id = r.device_id
+              WHERE r.workspace_id = ? AND r.task_id = ? AND r.kind = 'external'
+                AND (d.owner_user_id = ? OR EXISTS (
+                  SELECT 1 FROM workspace_members m
+                   WHERE m.workspace_id = r.workspace_id AND m.user_id = ? AND m.role = 'owner'))
+              ORDER BY r.created_at DESC, r.id DESC`,
+            )
+            .bind(workspaceId, id, userId, userId)
+            .all()
+        : Promise.resolve({ results: [] }),
+    ]);
   // GIT-01 rollup over the Task's Runs: distinct commits, PRs unique by URL, repositories.
   const shas = new Set<string>();
   const prs = new Map<string, unknown>();
@@ -636,6 +678,7 @@ export const getTask = async (db: D1Database, wsIds: string[], id: string) => {
     results: results.results,
     jobs: jobs.results,
     delegations: delegations.results,
+    externalSessions: externalSessions.results,
     git: { commits: shas.size, prs: [...prs.values()], repositories: [...repositories] },
   };
 };

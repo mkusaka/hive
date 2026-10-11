@@ -848,7 +848,7 @@ export const jobs = sqliteTable(
   ],
 );
 
-const runKinds = ["root", "native_child"] as const;
+const runKinds = ["job", "native_child", "external"] as const;
 const runStates = [
   "starting",
   "running",
@@ -859,22 +859,32 @@ const runStates = [
   "failed",
   "interrupted",
   "cancelled",
+  "active",
+  "finished",
 ] as const;
 
-/** current state. A Job has many root Runs but at most one non-terminal root Run. */
+/** A managed Job attempt, a native child, or an externally observed CLI session. */
 export const runs = sqliteTable(
   "runs",
   {
     id: text("id").primaryKey(),
     workspaceId: workspaceId(),
-    jobId: text("job_id").notNull(),
-    kind: text("kind", { enum: runKinds }).notNull(),
+    jobId: text("job_id"),
+    kind: text("kind", { enum: runKinds }).notNull().default("job"),
     parentRunId: text("parent_run_id"),
     deviceId: text("device_id").notNull(),
-    executionGeneration: integer("execution_generation").notNull(),
+    executionGeneration: integer("execution_generation"),
     state: text("state", { enum: runStates }).notNull().default("starting"),
     leaseExpiresAt: text("lease_expires_at"),
     continuedFromRunId: text("continued_from_run_id"),
+    provider: text("provider", { enum: ["claude", "codex"] }),
+    externalSessionId: text("external_session_id"),
+    cwd: text("cwd"),
+    repository: text("repository"),
+    title: text("title"),
+    firstUserMessage: text("first_user_message"),
+    lastActivityAt: text("last_activity_at"),
+    taskId: text("task_id"),
     // Submitted by the executor with the terminal state (run.result.submit).
     resultSummary: text("result_summary"),
     resultError: text("result_error"),
@@ -899,14 +909,25 @@ export const runs = sqliteTable(
   (t) => [
     scoped(t),
     unique().on(t.jobId, t.executionGeneration),
-    // `unknown` is not terminal: the root attempt stays occupied until observation settles it.
-    uniqueIndex("runs_one_active_root")
+    unique().on(t.workspaceId, t.deviceId, t.provider, t.externalSessionId),
+    // `unknown` is not terminal: the Job attempt stays occupied until observation settles it.
+    uniqueIndex("runs_one_active_job")
       .on(t.jobId)
       .where(
-        sql`${t.kind} = 'root' AND ${t.state} NOT IN ('succeeded', 'failed', 'interrupted', 'cancelled')`,
+        sql`${t.kind} = 'job' AND ${t.state} NOT IN ('succeeded', 'failed', 'interrupted', 'cancelled')`,
       ),
     oneOf("runs_kind", t.kind, runKinds),
     oneOf("runs_state", t.state, runStates),
+    check(
+      "runs_external",
+      sql`(${t.kind} = 'external' AND ${t.jobId} IS NULL AND ${t.executionGeneration} IS NULL
+          AND ${t.parentRunId} IS NULL AND ${t.continuedFromRunId} IS NULL AND ${t.leaseExpiresAt} IS NULL
+          AND ${t.provider} IS NOT NULL AND ${t.externalSessionId} IS NOT NULL AND ${t.cwd} IS NOT NULL
+          AND ${t.repository} IS NOT NULL AND ${t.title} IS NOT NULL AND ${t.lastActivityAt} IS NOT NULL
+          AND ${t.state} IN ('active', 'finished'))
+        OR (${t.kind} != 'external' AND ${t.jobId} IS NOT NULL AND ${t.executionGeneration} IS NOT NULL
+            AND ${t.provider} IS NULL AND ${t.externalSessionId} IS NULL AND ${t.taskId} IS NULL)`,
+    ),
     foreignKey({ columns: [t.workspaceId, t.jobId], foreignColumns: [jobs.workspaceId, jobs.id] }),
     foreignKey({
       columns: [t.workspaceId, t.deviceId],
@@ -916,6 +937,10 @@ export const runs = sqliteTable(
     foreignKey({
       columns: [t.workspaceId, t.continuedFromRunId],
       foreignColumns: [t.workspaceId, t.id],
+    }),
+    foreignKey({
+      columns: [t.workspaceId, t.taskId],
+      foreignColumns: [tasks.workspaceId, tasks.id],
     }),
   ],
 );
@@ -1306,7 +1331,7 @@ export const memoryRevisions = sqliteTable(
   (t) => [primaryKey({ columns: [t.memoryId, t.revision] })],
 );
 
-const searchSourceKinds = ["message", "task", "memory"] as const;
+const searchSourceKinds = ["message", "task", "memory", "run"] as const;
 
 /**
  * rebuildable projection (docs/architecture.md §14). One row per indexed source chunk; the FTS5 table `search_fts`

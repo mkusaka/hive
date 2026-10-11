@@ -43,20 +43,25 @@ const uploadableRun = async (db: D1Database, principal: Uploader, runId: string)
   return row.workspace_id;
 };
 
-type Stream = { id: string; confirmed_through_seq: number | null };
+type Stream = {
+  id: string;
+  kind: "run" | "session";
+  confirmed_through_seq: number | null;
+  last_part_seq: number | null;
+};
 
 /** The Run's transcript stream, or with `session` its snapshot of that native session stream. */
 const streamOf = (db: D1Database, runId: string, session?: SessionStreamKey) =>
   (session
     ? db
         .prepare(
-          `SELECT id, confirmed_through_seq FROM transcript_streams
+          `SELECT id, kind, confirmed_through_seq, last_part_seq FROM transcript_streams
             WHERE run_id = ? AND kind = 'session' AND session_id = ? AND subpath = ?`,
         )
         .bind(runId, session.sessionId, session.subpath ?? "")
     : db
         .prepare(
-          "SELECT id, confirmed_through_seq FROM transcript_streams WHERE run_id = ? AND kind = 'run'",
+          "SELECT id, kind, confirmed_through_seq, last_part_seq FROM transcript_streams WHERE run_id = ? AND kind = 'run'",
         )
         .bind(runId)
   ).first<Stream>();
@@ -129,6 +134,13 @@ export const initUpload = async (
     throw new HttpError("INVALID_INPUT", "a session stream needs its provider");
   }
   const workspaceId = await uploadableRun(db, principal, input.runId);
+  const external = await db
+    .prepare("SELECT kind, provider FROM runs WHERE id = ? AND workspace_id = ?")
+    .bind(input.runId, workspaceId)
+    .first<{ kind: string; provider: string | null }>();
+  if (external?.kind === "external" && input.provider !== external.provider) {
+    throw new HttpError("INVALID_INPUT", "external transcript provider must match its run");
+  }
   await (
     session
       ? db
@@ -184,7 +196,7 @@ export const putPart = async (
   const streamById = () =>
     db
       .prepare(
-        "SELECT id, confirmed_through_seq FROM transcript_streams WHERE id = ? AND run_id = ?",
+        "SELECT id, kind, confirmed_through_seq, last_part_seq FROM transcript_streams WHERE id = ? AND run_id = ?",
       )
       .bind(t.streamId, t.runId)
       .first<Stream>();
@@ -235,6 +247,21 @@ export const putPart = async (
             WHERE id = ?1`,
         )
         .bind(stream.id, new Date().toISOString()),
+      ...(stream.kind === "run" && stream.last_part_seq !== null && t.partSeq > stream.last_part_seq
+        ? [
+            db
+              .prepare(
+                "UPDATE runs SET persistence = 'pending', updated_at = ? WHERE id = ? AND persistence = 'complete'",
+              )
+              .bind(new Date().toISOString(), t.runId),
+            appendChange(db, {
+              workspaceId,
+              entityKind: "run",
+              entityId: t.runId,
+              scope: `workspace:${workspaceId}`,
+            }),
+          ]
+        : []),
     ]);
     // Lost a race to an identical or a different body.
     if ((await partOf(db, stream.id, t.partSeq))!.sha256 !== t.sha256) throw shaConflict();
@@ -297,8 +324,14 @@ export const completeUpload = async (
     .prepare("SELECT persistence FROM runs WHERE id = ?")
     .bind(input.runId)
     .first<{ persistence: string }>();
+  const streamComplete = stream
+    ? db
+        .prepare("UPDATE transcript_streams SET last_part_seq = ?, updated_at = ? WHERE id = ?")
+        .bind(input.lastPartSeq, new Date().toISOString(), stream.id)
+    : null;
   if (run?.persistence !== "complete") {
     await db.batch([
+      ...(streamComplete ? [streamComplete] : []),
       db
         .prepare(
           "UPDATE runs SET persistence = 'complete', updated_at = ? WHERE id = ? AND persistence = 'pending'",
@@ -311,41 +344,66 @@ export const completeUpload = async (
         scope: `workspace:${workspaceId}`,
       }),
     ]);
+  } else if (streamComplete) {
+    await streamComplete.run();
   }
   return { workspaceId, body: { runId: input.runId, persistence: "complete" as const } };
 };
 
 // ------------------------------------------------------------------- Reads
 
-const terminalRunStates = new Set(["succeeded", "failed", "interrupted", "cancelled"]);
+const terminalRunStates: Record<string, true> = {
+  succeeded: true,
+  failed: true,
+  interrupted: true,
+  cancelled: true,
+  finished: true,
+};
 
 /** The Run for a member of its Workspace (like `GET /v1/jobs/:id`); provider ids are only reported as present. */
 export const getRun = async (db: D1Database, user: User, id: string) => {
   if (user.workspaceIds.length === 0) throw notFound();
   const row = await db
     .prepare(
-      `SELECT r.id, r.job_id, r.workspace_id, r.state, r.execution_generation, r.device_id, r.persistence,
-              r.started_at, r.finished_at, r.created_at, r.result_summary, r.result_error,
-              r.provider_session_id IS NOT NULL AS has_session, s.confirmed_through_seq,
-              (SELECT COUNT(*) FROM transcript_parts p WHERE p.stream_id = s.id) AS parts,
+      `SELECT r.id, r.kind, r.job_id, r.workspace_id, r.state, r.execution_generation, r.device_id, r.persistence,
+              r.provider, r.external_session_id, r.cwd, r.repository, r.title, r.first_user_message,
+              r.last_activity_at, r.task_id, t.key AS task_key, r.started_at, r.finished_at, r.created_at,
+              r.result_summary, r.result_error, r.provider_session_id IS NOT NULL AS has_session,
+              s.confirmed_through_seq, (SELECT COUNT(*) FROM transcript_parts p WHERE p.stream_id = s.id) AS parts,
               g.run_id AS git_run_id, g.repository AS git_repository, g.branch AS git_branch,
               g.before AS git_before, g.after AS git_after, g.commits AS git_commits, g.partial AS git_partial,
               g.prs AS git_prs, g.pr_error AS git_pr_error
-         FROM runs r LEFT JOIN transcript_streams s ON s.run_id = r.id AND s.kind = 'run'
+         FROM runs r
+         JOIN devices d ON d.workspace_id = r.workspace_id AND d.id = r.device_id
+         LEFT JOIN tasks t ON t.workspace_id = r.workspace_id AND t.id = r.task_id
+         LEFT JOIN transcript_streams s ON s.run_id = r.id AND s.kind = 'run'
          LEFT JOIN run_git g ON g.workspace_id = r.workspace_id AND g.run_id = r.id
-        WHERE r.id = ? AND r.workspace_id IN (${placeholders(user.workspaceIds)})`,
+        WHERE r.id = ? AND r.workspace_id IN (${placeholders(user.workspaceIds)})
+          AND (r.kind != 'external' OR d.owner_user_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members m
+             WHERE m.workspace_id = r.workspace_id AND m.user_id = ? AND m.role = 'owner'))`,
     )
-    .bind(id, ...user.workspaceIds)
+    .bind(id, ...user.workspaceIds, user.userId, user.userId)
     .first<Record<string, string | number | null>>();
   if (!row) throw notFound();
   return {
     id: row.id,
+    kind: row.kind,
     jobId: row.job_id,
     workspaceId: row.workspace_id,
     state: row.state,
     generation: row.execution_generation,
     deviceId: row.device_id,
-    terminal: terminalRunStates.has(row.state as string),
+    provider: row.provider,
+    externalSessionId: row.external_session_id,
+    cwd: row.cwd,
+    repository: row.repository,
+    title: row.title,
+    firstUserMessage: row.first_user_message,
+    lastActivityAt: row.last_activity_at,
+    taskId: row.task_id,
+    taskKey: row.task_key,
+    terminal: terminalRunStates[row.state as string] === true,
     persistence: row.persistence,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
@@ -383,7 +441,8 @@ const transcriptAccess = async (
   if (user.workspaceIds.length === 0) throw notFound();
   const row = await db
     .prepare(
-      `SELECT r.workspace_id, s.id AS stream_id, s.confirmed_through_seq, s.provider,
+      `SELECT r.workspace_id, r.kind, s.id AS stream_id, s.confirmed_through_seq, s.provider,
+              d.owner_user_id = ?1 AS device_owner,
               EXISTS (SELECT 1 FROM workspace_members w
                        WHERE w.workspace_id = r.workspace_id AND w.user_id = ?1 AND w.role = 'owner') AS owner,
               EXISTS (SELECT 1 FROM jobs j
@@ -393,19 +452,29 @@ const transcriptAccess = async (
                         JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
                        WHERE j.workspace_id = r.workspace_id AND j.id = r.job_id AND cv.kind IN ('channel', 'thread')
                          AND a.user_id = ?1) AS member
-         FROM runs r LEFT JOIN transcript_streams s ON s.run_id = r.id AND s.kind = 'run'
+         FROM runs r
+         JOIN devices d ON d.workspace_id = r.workspace_id AND d.id = r.device_id
+         LEFT JOIN transcript_streams s ON s.run_id = r.id AND s.kind = 'run'
         WHERE r.id = ?2 AND r.workspace_id IN (SELECT value FROM json_each(?3))`,
     )
     .bind(user.userId, runId, JSON.stringify(user.workspaceIds))
     .first<{
       workspace_id: string;
+      kind: string;
       stream_id: string | null;
       confirmed_through_seq: number | null;
       provider: string | null;
+      device_owner: number;
       owner: number;
       member: number;
     }>();
-  if (!row || !(row.owner === 1 || (need === "member" && row.member === 1))) throw notFound();
+  if (
+    !row ||
+    (row.kind === "external"
+      ? !(row.owner === 1 || row.device_owner === 1)
+      : !(row.owner === 1 || (need === "member" && row.member === 1)))
+  )
+    throw notFound();
   return row;
 };
 
@@ -427,7 +496,7 @@ const confirmedParts = async (
   ).results;
 
 const secret =
-  /-----BEGIN[\s\S]*?(?:-----END[^\n]*|$)|(?:sk-|ghp_|xox[a-z]-|AKIA|-----BEGIN)[^\s]*/g;
+  /-----BEGIN[\s\S]*?(?:-----END[^\n]*|$)|(?:sk-|ghp_|xox[a-z]-|AKIA|-----BEGIN)[^\s]*|\b[A-Z0-9_]*(?:TOKEN|SECRET|KEY)=[^\s]+/g;
 const maxEntryBytes = 4 * 1024;
 const encoder = new TextEncoder();
 
@@ -638,6 +707,51 @@ export const normalizeCodex = (line: string, seq: number): TranscriptEntry[] => 
   }
 };
 
+const externalEntryKinds: Record<TranscriptEntry["kind"], true> = {
+  system: true,
+  assistant: true,
+  tool_use: true,
+  tool_result: true,
+  result: true,
+  user: true,
+  other: true,
+};
+
+/** A collector uploads already normalized entries; retain only the display-safe shape and redact again. */
+export const normalizeExternal = (line: string, seq: number): TranscriptEntry[] => {
+  try {
+    const value = JSON.parse(line) as { kind?: unknown; text?: unknown; toolName?: unknown };
+    if (
+      typeof value.kind === "string" &&
+      externalEntryKinds[value.kind as TranscriptEntry["kind"]]
+    ) {
+      return [
+        {
+          seq,
+          kind: value.kind as TranscriptEntry["kind"],
+          text: clean(
+            typeof value.text === "string"
+              ? value.kind === "other"
+                ? value.text.slice(0, 80)
+                : value.text
+              : value.kind,
+          ),
+          ...(typeof value.toolName === "string" ? { toolName: clean(value.toolName) } : {}),
+        },
+      ];
+    }
+    return [
+      {
+        seq,
+        kind: "other",
+        text: clean(typeof value.kind === "string" ? value.kind.slice(0, 80) : "unknown"),
+      },
+    ];
+  } catch {
+    return [{ seq, kind: "other", text: "invalid" }];
+  }
+};
+
 /**
  * One confirmed part per page (≤ 1 MiB from the executor): `cursor` is the part seq, `nextCursor` the next one or
  * null. Only parts up to the watermark are read.
@@ -672,7 +786,11 @@ export const getTranscript = async (
   if (lines.at(-1) === "") lines.pop();
   return {
     entries: lines.flatMap((line, i) =>
-      (access.provider === "codex" ? normalizeCodex : normalize)(line, offset!.n + i),
+      (access.kind === "external"
+        ? normalizeExternal
+        : access.provider === "codex"
+          ? normalizeCodex
+          : normalize)(line, offset!.n + i),
     ),
     nextCursor: partSeq < confirmed ? String(partSeq + 1) : null,
     confirmedThroughSeq: confirmed,

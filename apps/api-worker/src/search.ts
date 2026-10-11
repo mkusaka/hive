@@ -91,6 +91,31 @@ const loadSource = async (db: D1Database, kind: SearchKind, id: string): Promise
         }
       : null;
   }
+  if (kind === "run") {
+    const row = await db
+      .prepare(
+        `SELECT workspace_id, device_id, title, first_user_message, updated_at
+           FROM runs WHERE id = ? AND kind = 'external'`,
+      )
+      .bind(id)
+      .first<{
+        workspace_id: string;
+        device_id: string;
+        title: string;
+        first_user_message: string | null;
+        updated_at: string;
+      }>();
+    return row
+      ? {
+          workspaceId: row.workspace_id,
+          revision: Date.parse(row.updated_at),
+          title: row.title,
+          body: row.first_user_message ?? "",
+          scope: `device:${row.device_id}`,
+          deleted: false,
+        }
+      : null;
+  }
   const row = await db
     .prepare(
       "SELECT workspace_id, scope_kind, scope_id, content, revision, deleted_at FROM memories WHERE id = ?",
@@ -272,10 +297,10 @@ export const searchDocuments = async (
 };
 
 const parseKinds = (value: string | undefined): SearchKind[] => {
-  if (!value) return ["message", "task", "memory"];
+  if (!value) return ["message", "task", "memory", "run"];
   const kinds = value.split(",");
   for (const kind of kinds) {
-    if (kind !== "message" && kind !== "task" && kind !== "memory") {
+    if (kind !== "message" && kind !== "task" && kind !== "memory" && kind !== "run") {
       throw new HttpError("INVALID_INPUT", `unknown kind: ${kind}`);
     }
   }
@@ -331,13 +356,13 @@ export const relatedQuery = (body: string) => {
  * single D1 batch.
  */
 export const rebuildSearch = async (db: D1Database, workspaceId: string) => {
-  const enqueue = (kind: SearchKind, table: string) =>
+  const enqueue = (kind: SearchKind, table: string, where = "") =>
     db
       .prepare(
         `INSERT INTO outbox (id, workspace_id, topic, payload)
          SELECT lower(hex(randomblob(16))), workspace_id, 'search.index',
                 json_object('sourceKind', '${kind}', 'sourceId', id)
-           FROM ${table} WHERE workspace_id = ?`,
+           FROM ${table} WHERE workspace_id = ?${where}`,
       )
       .bind(workspaceId);
   await db.batch([
@@ -345,6 +370,7 @@ export const rebuildSearch = async (db: D1Database, workspaceId: string) => {
     enqueue("message", "messages"),
     enqueue("task", "tasks"),
     enqueue("memory", "memories"),
+    enqueue("run", "runs", " AND kind = 'external'"),
   ]);
   // No counts: D1 `meta.changes` would include the FTS writes of the triggers.
   return { status: "accepted" as const };

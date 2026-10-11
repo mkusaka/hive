@@ -11,8 +11,9 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/me`                                                     | Access assertion (user)           | Returns the user principal (CLI login check)                                                                                                                                                   |
 | `POST /v1/commands`                                              | Access assertion (user)           | Command intake (see below)                                                                                                                                                                     |
 | `GET /v1/operations/:id`                                         | Access assertion (user)           | Receipt of the user's command; for `agent.send` also the inbox item, routing status and Job id; for `message.post` `jobIds` (one per mention, null until routed)                               |
-| `GET /v1/jobs/:id`                                               | Access assertion (user)           | A Job in one of the user's Workspaces, with `cancelRequestedAt` and its root `runs`                                                                                                            |
+| `GET /v1/jobs/:id`                                               | Access assertion (user)           | A Job in one of the user's Workspaces, with `cancelRequestedAt` and its Job `runs`                                                                                                             |
 | `GET /v1/runs/:id`                                               | Access assertion (user)           | A Run of the user's Workspaces: state, generation, device, `persistence`, started / finished, result, `hasProviderSession`, transcript parts and watermark, `git` (or null)                    |
+| `GET /v1/runs?workspaceId=&kind=job\|native_child\|external`     | Access assertion (user)           | Newest-first Run metadata; external sessions are visible only to their device owner or a Workspace owner                                                                                       |
 | `GET /v1/runs/:id/transcript?cursor=`                            | Access assertion (user)           | Normalized, redacted transcript, one confirmed part per page; channel member or owner (404 otherwise); see Transcripts                                                                         |
 | `GET /v1/transcripts/:runId/raw`                                 | Access assertion (user, owner)    | The confirmed raw JSONL parts concatenated (`application/x-ndjson`); never indexed                                                                                                             |
 | `GET /v1/inbox?botId=`                                           | Access assertion (user)           | The Bot's inbox items (first 100, no cursor yet)                                                                                                                                               |
@@ -57,6 +58,7 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/executor/runs/:id`                                      | `X-Hive-Token: <device-token>`    | The device's own Run: state, generation, `active` (startup reconcile)                                                                                                                          |
 | `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=`  | `X-Hive-Token: <device-token>`    | Run context for the adapter's prompt (see Executor commands)                                                                                                                                   |
 | `POST /v1/executor/observations`                                 | `X-Hive-Token: <device-token>`    | Runtime observations: `runtime.run.started`, `runtime.run.stopped`, `git.collected`                                                                                                            |
+| `POST /v1/executor/external-runs`                                | `X-Hive-Token: <device-token>`    | Upserts this device's external Claude / Codex session metadata and returns `{runId, state}`                                                                                                    |
 | `POST /v1/executor/uploads/init`                                 | device token or `cap.`            | Authorizes one transcript part `{runId, partSeq, byteSize, sha256, provider?, session?}` (`session: {sessionId, subpath?}` = a native session stream, needs `provider`); see Transcripts       |
 | `PUT /v1/executor/uploads/:uploadId`                             | device token or `cap.`            | Raw part body (≤ 8 MiB): verify, store in R2, commit the manifest                                                                                                                              |
 | `POST /v1/executor/uploads/complete`                             | device token or `cap.`            | `{runId, lastPartSeq, session?}` → `persistence: complete` (with `session`: the snapshot is complete), or 409 `gap`                                                                            |
@@ -67,6 +69,15 @@ with Managed OAuth `Authorization: Bearer` belongs to Access (it would try to re
 token). The Worker falls back to `Authorization: Bearer <token>` for local dev and older clients (`hiveToken` in
 `src/auth/device.ts`). Behind Access, executors also send their Access Service Token (`CF-Access-Client-Id` /
 `CF-Access-Client-Secret`, `infra/README.md`).
+
+**External sessions.** `POST /v1/executor/external-runs` accepts `{provider, externalSessionId, cwd,
+startedAt, lastActivityAt, repository, title, firstUserMessage?}` from a device token. Identity is
+Workspace + device + provider + external session id. The Worker classifies a session as `finished` after
+30 minutes without activity; external Runs never create Jobs, Executions, capabilities, leases, or recovery work.
+`run.link_task {runId, taskId}` links a visible external Run to a same-Workspace Task. External metadata, normalized
+transcripts, raw transcripts, Task external-session lists, and search results are private to the device owner or a
+Workspace owner. The external uploader sends only normalized JSONL `{kind, text, toolName?}`; the Worker redacts it
+again and indexes only the title and first user message.
 
 - **User auth.** `Cf-Access-Jwt-Assertion` is verified with `jose` against
   `https://<ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs` (issuer `https://<ACCESS_TEAM_DOMAIN>`, audience
@@ -80,8 +91,9 @@ token). The Worker falls back to `Authorization: Bearer <token>` for local dev a
 - **Command types:** `workspace.create`, `device.register`, `device.revoke`, `channel.create`, `channel.update`,
   `channel.join`, `channel.leave`, `dm.open`, `bot.create`,
   `agent.send`, `event.emit`, the Work commands, the Subscription / integration commands, the Routine commands,
-  `job.cancel` / `job.resolve` below, `bot.update`, `device.environment.register`, `approval.resolve` (Tools and
-  approvals), `memory.write` / `memory.delete` (Search and memory), `effect.resolve` (External effects) and `sidebar.update`.
+  `job.cancel` / `job.resolve` / `run.link_task` below, `bot.update`, `device.environment.register`,
+  `approval.resolve` (Tools and approvals), `memory.write` / `memory.delete` (Search and memory),
+  `effect.resolve` (External effects) and `sidebar.update`.
 - **Actors.** A user's `actors` row is created by `workspace.create` together with the membership (the only path
   that creates a membership today), unique per `(workspace_id, user_id)`. Messages and channel membership use it.
 - **`channel.create`** creates the channel, its main conversation and an `owner` channel membership for the caller.
@@ -586,7 +598,7 @@ D1 FTS5 search projection and explicit Memory (docs/architecture.md §13.5, §13
 - **`GET /v1/search`.** `q` of 3+ code points is matched with FTS5 `MATCH` as one quoted phrase (`"` doubled), never
   as FTS syntax, ranked by `bm25`, with `snippet()` (matches in `[` `]`, ≤ 200 characters). A shorter `q` (trigram
   needs 3) takes the short path: a `LIKE` substring match on title / body over the 200 newest permitted documents
-  only, never an unbounded scan; that covers Task key prefixes. `kinds` defaults to `message,task,memory`. The
+  only, never an unbounded scan; that covers Task key prefixes. `kinds` defaults to `message,task,memory,run`. The
   response is `{hits: [{sourceKind, sourceId, title, snippet, scope, sourceRevision}], indexedThrough, cursor}`;
   `indexedThrough` is the Workspace's newest `indexed_at` (AT-32) and `cursor` an offset, set when the page is full.
   A hit's source must be re-fetched through its normal route; Task / Job state never comes from search.
@@ -629,7 +641,9 @@ Raw provider transcripts in R2 with a D1 manifest (docs/architecture.md §3.3, �
   `confirmed_through_seq`, the highest seq with every part from 0 present. A replay of a stored part is a no-op.
 - **complete** `{runId, lastPartSeq}` (-1: empty transcript) sets `runs.persistence = complete` and writes a `run`
   change row when the watermark reached `lastPartSeq`; a gap is 409 `REVISION_CONFLICT` with reason `gap` and the
-  missing seqs in the message (the Run stays `pending`); parts beyond `lastPartSeq` are 422. Idempotent.
+  missing seqs in the message (the Run stays `pending`); parts beyond `lastPartSeq` are 422. A new immutable part
+  after a completed stream returns it to `pending`; the next complete ACK advances its stored `lastPartSeq`.
+  Idempotent.
 - **Reads.** `GET /v1/runs/:id` needs Workspace membership (like `GET /v1/jobs/:id`). The transcript needs a
   Workspace owner or a member of the Channel of the Run's trigger Conversation; a `bot_pair` Conversation, or a
   Job without one (Task, Routine, batch), is owner-only; anything else is 404. Each page is one confirmed part

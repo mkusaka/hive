@@ -46,6 +46,13 @@ const harness = (
       environments.push([name, path]);
       return `/abs/${path}`;
     },
+    loadCollectConfig: async () => ({ enabled: false }),
+    saveCollectConfig: async () => {},
+    runCollector: async (_cloud, options) => ({
+      files: 0,
+      uploaded: 0,
+      dryRun: options.dryRun === true,
+    }),
     pollMs: 1,
   };
   return {
@@ -800,6 +807,37 @@ describe("tools and approvals", () => {
       botId: "bot-1",
       expectedRevision: 2,
       placementPolicy: { ...current, overflowToFallback: true, requiredCapabilities: ["codex"] },
+    });
+  });
+
+  it("collect commands keep collection opt-in and run manually with since and dry-run", async () => {
+    const h = harness(undefined, { creds: { deviceToken: "d-1.secret" } });
+    const enabled: boolean[] = [];
+    let options: { sinceMs?: number; dryRun?: boolean } | undefined;
+    h.deps.loadCollectConfig = async () => ({ enabled: true });
+    h.deps.saveCollectConfig = async (value) => void enabled.push(value);
+    h.deps.runCollector = async (_cloud, value) => {
+      options = value;
+      return { files: 1, uploaded: 0, dryRun: value.dryRun === true };
+    };
+    expect(await h.hive("collect", "enable")).toBe(0);
+    expect(await h.hive("collect", "disable")).toBe(0);
+    expect(await h.hive("collect", "status")).toBe(0);
+    expect(await h.hive("collect", "run", "--since", "1h", "--dry-run")).toBe(0);
+    expect(await h.hive("collect", "run", "--since", "later")).toBe(2);
+    expect(enabled).toEqual([true, false]);
+    expect(options).toEqual({ sinceMs: 3_600_000, dryRun: true });
+  });
+
+  it("lists external runs and links one to a task", async () => {
+    const h = harness();
+    expect(await h.hive("run", "list", "--kind", "external")).toBe(0);
+    expect(await h.hive("run", "link-task", "run-1", "task-1")).toBe(0);
+    expect(h.calls[0]!.path).toBe("/v1/runs?workspaceId=ws-1&kind=external");
+    expect(commandOf(h.calls[1]!)).toEqual({
+      type: "run.link_task",
+      runId: "run-1",
+      taskId: "task-1",
     });
   });
 

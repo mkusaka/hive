@@ -47,9 +47,8 @@ export const headCursor = async (db: D1Database, workspaceId: string) => {
 };
 
 /**
- * A user: `workspace:<id>` plus `channel:<id>` for every channel their actor is a member of and every DM's backing
- * Channel. A Run: `workspace:<id>`,
- * its Conversation's Channel and its own `bot:<id>` / `task:<id>` (search only: change rows never carry those).
+ * A user: `workspace:<id>`, their Channel / DM scopes, and private device scopes for devices they own (or all
+ * devices when they own the Workspace). A Run: its Workspace, Conversation Channel and own Bot / Task scopes.
  */
 export const permittedScopes = async (
   db: D1Database,
@@ -66,15 +65,21 @@ export const permittedScopes = async (
   }
   const { results } = await db
     .prepare(
-      `SELECT m.channel_id FROM channel_members m
+      `SELECT 'channel:' || m.channel_id AS scope FROM channel_members m
          JOIN actors a ON a.workspace_id = m.workspace_id AND a.id = m.actor_id
         WHERE m.workspace_id = ?1 AND a.user_id = ?2
        UNION ALL
-       SELECT channel_id FROM conversations WHERE workspace_id = ?1 AND kind = 'dm' AND dm_user_id = ?2`,
+       SELECT 'channel:' || channel_id AS scope FROM conversations
+        WHERE workspace_id = ?1 AND kind = 'dm' AND dm_user_id = ?2
+       UNION ALL
+       SELECT 'device:' || d.id AS scope FROM devices d
+        WHERE d.workspace_id = ?1 AND (d.owner_user_id = ?2 OR EXISTS (
+          SELECT 1 FROM workspace_members m
+           WHERE m.workspace_id = d.workspace_id AND m.user_id = ?2 AND m.role = 'owner'))`,
     )
     .bind(workspaceId, principal.userId)
-    .all<{ channel_id: string }>();
-  return [`workspace:${workspaceId}`, ...results.map((r) => `channel:${r.channel_id}`)];
+    .all<{ scope: string }>();
+  return [`workspace:${workspaceId}`, ...results.map((r) => r.scope)];
 };
 
 const expired = () =>

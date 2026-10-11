@@ -607,6 +607,13 @@ export const JobResolve = v.strictObject({
   action: v.picklist(["retry", "cancel", "mark_failed"]),
 });
 
+/** Attach an externally collected Run to a Task in the same Workspace. */
+export const RunLinkTask = v.strictObject({
+  type: v.literal("run.link_task"),
+  runId: RunId,
+  taskId: TaskId,
+});
+
 // UTF-8 size. No TextEncoder: contracts stay runtime-neutral (`types: []`). A lone surrogate counts 3,
 // as TextEncoder would encode it (U+FFFD).
 const utf8Bytes = (text: string) => {
@@ -669,7 +676,7 @@ export type EventEmitAccepted = {
 // ------------------------------------------------- Executor (§9.2, §10.3)
 // Device principal only, same envelope as user commands (`commandEnvelope`).
 
-/** Defaults to `["bot:<botId>"]` on the server: one root Run per Bot at a time. */
+/** Defaults to `["bot:<botId>"]` on the server: one Job Run per Bot at a time. */
 export const JobClaim = v.strictObject({
   type: v.literal("job.claim"),
   jobId: JobId,
@@ -710,6 +717,19 @@ export const RunResultSubmit = v.strictObject({
    */
   pass: v.optional(v.boolean()),
 });
+
+/** Metadata for a CLI session observed on a registered device, never a managed Job or Execution. */
+export const ExternalRunInput = v.strictObject({
+  provider: v.picklist(["claude", "codex"]),
+  externalSessionId: v.pipe(v.string(), v.minLength(1), v.maxLength(512)),
+  cwd: v.pipe(v.string(), v.minLength(1), v.maxLength(4096)),
+  startedAt: Timestamp,
+  lastActivityAt: Timestamp,
+  repository: v.pipe(v.string(), v.maxLength(300)),
+  title: v.pipe(v.string(), v.minLength(1), v.maxLength(120)),
+  firstUserMessage: v.optional(v.pipe(v.string(), v.maxLength(4096))),
+});
+export type ExternalRunInput = v.InferOutput<typeof ExternalRunInput>;
 
 export const ExecutorCommand = v.variant("type", [JobClaim, RunLeaseRenew, RunResultSubmit]);
 
@@ -908,7 +928,7 @@ export type Memory = {
   createdAt: string;
 };
 
-export const searchKinds = ["message", "task", "memory"] as const;
+export const searchKinds = ["message", "task", "memory", "run"] as const;
 export type SearchKind = (typeof searchKinds)[number];
 export type SearchHit = {
   sourceKind: SearchKind;
@@ -1139,7 +1159,7 @@ export type UploadComplete = v.InferInput<typeof UploadComplete>;
 export type TranscriptEntry = {
   /** Line number in the raw stream; the blocks of one message share it. */
   seq: number;
-  kind: "system" | "assistant" | "tool_use" | "tool_result" | "result" | "user";
+  kind: "system" | "assistant" | "tool_use" | "tool_result" | "result" | "user" | "other";
   text: string;
   toolName?: string;
 };

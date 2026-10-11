@@ -3,6 +3,7 @@ import {
   commandEnvelope,
   ExecutorCommand,
   type ExecutorHeartbeat,
+  ExternalRunInput,
   GitCollected,
   type ExecutorRun,
   type JobClaimed,
@@ -26,6 +27,7 @@ import {
   busyInConversation,
   claimJob,
   confirmRunStopped,
+  digest,
   finishRun,
   insertEvent,
   insertMessage,
@@ -72,7 +74,7 @@ export const placementDevices = async (db: D1Database, workspaceId: string) => {
               (SELECT json_group_array(e.name) FROM device_environments e
                 WHERE e.workspace_id = d.workspace_id AND e.device_id = d.id) AS environments,
               (SELECT COUNT(*) FROM runs r
-                WHERE r.workspace_id = d.workspace_id AND r.device_id = d.id AND r.kind = 'root'
+                WHERE r.workspace_id = d.workspace_id AND r.device_id = d.id AND r.kind = 'job'
                   AND r.state IN ${activeRunStatesSql}) AS active
          FROM devices d WHERE d.workspace_id = ? AND d.revoked_at IS NULL`,
     )
@@ -93,6 +95,66 @@ export const placementDevices = async (db: D1Database, workspaceId: string) => {
     capacity: r.capacity_background,
     active: r.active,
   }));
+};
+
+/** Creates or refreshes one external CLI session, identified by its device and provider session id. */
+export const upsertExternalRun = async (
+  db: D1Database,
+  device: Device,
+  input: v.InferOutput<typeof ExternalRunInput>,
+) => {
+  const workspaceId = device.workspaceIds[0]!;
+  const now = new Date().toISOString();
+  const state =
+    Date.parse(input.lastActivityAt) <= Date.now() - 30 * 60 * 1000 ? "finished" : "active";
+  const id = `external-${(
+    await digest([workspaceId, device.deviceId, input.provider, input.externalSessionId])
+  ).slice(0, 32)}`;
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO runs (id, workspace_id, kind, device_id, state, provider, external_session_id, cwd, repository,
+           title, first_user_message, started_at, last_activity_at, finished_at)
+         VALUES (?, ?, 'external', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'finished' THEN ? END)
+         ON CONFLICT (workspace_id, device_id, provider, external_session_id) DO UPDATE SET
+           state = excluded.state, cwd = excluded.cwd, repository = excluded.repository, title = excluded.title,
+           first_user_message = excluded.first_user_message,
+           started_at = CASE WHEN excluded.started_at < runs.started_at THEN excluded.started_at ELSE runs.started_at END,
+           last_activity_at = excluded.last_activity_at,
+           finished_at = CASE WHEN excluded.state = 'finished' THEN excluded.last_activity_at ELSE NULL END,
+           updated_at = ?
+         WHERE julianday(excluded.last_activity_at) >= julianday(runs.last_activity_at)`,
+      )
+      .bind(
+        id,
+        workspaceId,
+        device.deviceId,
+        state,
+        input.provider,
+        input.externalSessionId,
+        input.cwd,
+        input.repository,
+        input.title,
+        input.firstUserMessage ?? null,
+        input.startedAt,
+        input.lastActivityAt,
+        state,
+        input.lastActivityAt,
+        now,
+      ),
+    appendChange(db, {
+      workspaceId,
+      entityKind: "run",
+      entityId: id,
+      scope: `workspace:${workspaceId}`,
+    }),
+    indexLater(db, workspaceId, "run", id),
+  ]);
+  const run = (await db
+    .prepare("SELECT id, state FROM runs WHERE id = ? AND workspace_id = ?")
+    .bind(id, workspaceId)
+    .first<{ id: string; state: "active" | "finished" }>())!;
+  return { runId: run.id, state: run.state };
 };
 
 /** The offer rule (placement.ts) for the calling device; null when it may take the Job. */
@@ -620,7 +682,7 @@ export const getExecutorRun = async (db: D1Database, device: Device, id: string)
   const row = await db
     .prepare(
       `SELECT id, job_id, state, execution_generation FROM runs
-        WHERE id = ? AND workspace_id = ? AND device_id = ?`,
+        WHERE id = ? AND workspace_id = ? AND device_id = ? AND kind = 'job'`,
     )
     .bind(id, device.workspaceIds[0], device.deviceId)
     .first<{ id: string; job_id: string; state: string; execution_generation: number }>();
@@ -643,7 +705,7 @@ const fencedRun = async (
 ) => {
   const run = await db
     .prepare(
-      "SELECT job_id, state, execution_generation FROM runs WHERE id = ? AND workspace_id = ? AND device_id = ?",
+      "SELECT job_id, state, execution_generation FROM runs WHERE id = ? AND workspace_id = ? AND device_id = ? AND kind = 'job'",
     )
     .bind(fence.runId, device.workspaceIds[0], device.deviceId)
     .first<{ job_id: string; state: string; execution_generation: number }>();
@@ -862,7 +924,7 @@ export const getRunContext = async (
                       JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
                       JOIN inbox_items i ON i.workspace_id = j.workspace_id AND i.id = substr(j.trigger_key, 7)
                      WHERE r.workspace_id = ?1 AND j.bot_id = ?3 AND j.trigger_key LIKE 'inbox:%'
-                       AND i.conversation_id = ?2 AND r.kind = 'root'
+                       AND i.conversation_id = ?2 AND r.kind = 'job'
                        AND r.created_at < (SELECT created_at FROM runs WHERE id = ?4)), '')
             ORDER BY m.seq DESC LIMIT 50
          ) ORDER BY seq`,
@@ -937,11 +999,11 @@ export const getRunContext = async (
         snippet,
       }))
     : [];
-  // The native session to resume (§13.3): the latest earlier root Run of this Job that reported one.
+  // The native session to resume (§13.3): the latest earlier Job Run of this Job that reported one.
   const previous = await db
     .prepare(
       `SELECT provider_session_id FROM runs
-        WHERE workspace_id = ? AND job_id = ? AND kind = 'root' AND execution_generation < ?
+        WHERE workspace_id = ? AND job_id = ? AND kind = 'job' AND execution_generation < ?
           AND provider_session_id IS NOT NULL
         ORDER BY execution_generation DESC LIMIT 1`,
     )
@@ -1089,7 +1151,7 @@ export const recordObservation = async (db: D1Database, device: Device, input: R
     .prepare(
       `UPDATE runs SET provider_session_id = ?, updated_at = ?, started_at = COALESCE(started_at, ?),
               state = CASE state WHEN 'starting' THEN 'running' ELSE state END
-        WHERE id = ? AND workspace_id = ? AND device_id = ? AND execution_generation = ?
+        WHERE id = ? AND workspace_id = ? AND device_id = ? AND execution_generation = ? AND kind = 'job'
           AND state IN ${activeRunStatesSql}`,
     )
     .bind(

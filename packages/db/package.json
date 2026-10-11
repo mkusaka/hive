@@ -8,7 +8,7 @@
   },
   "scripts": {
     "db:generate": "drizzle-kit generate",
-    "db:check": "drizzle-kit check && drizzle-kit generate 2>&1 | grep -q 'No schema changes'"
+    "db:check": "drizzle-kit check && bun checkMigrations.ts"
   },
   "dependencies": {
     "drizzle-orm": "^0.45.2"

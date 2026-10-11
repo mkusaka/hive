@@ -157,6 +157,7 @@ export const fakeCloud = (overrides: Partial<CloudClient> = {}) => {
       calls.push("observe");
       observed.push(input);
     },
+    externalRun: async () => ({ runId: "run-external-1", state: "active" }),
     forRun: () => fakeRunApi().api,
     uploadInit: async (input) => {
       calls.push(`init:${input.partSeq}`);

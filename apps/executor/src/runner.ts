@@ -71,6 +71,8 @@ export type RunnerDeps = {
   adapter: AgentAdapter;
   uploader?: Uploader;
   heartbeat?: ExecutorHeartbeat;
+  /** Optional opt-in external session pass, run at startup and every ten minutes. */
+  collect?: () => Promise<void>;
 };
 
 /** Agents this process is running, so a SIGTERM (service stop, process-tree stop) can stop them first. */
@@ -272,6 +274,12 @@ export const runLoop = async (
   options: { once: boolean; pollMs: number; concurrency?: number },
 ) => {
   await reconcile(deps);
+  const collect = async () => {
+    await deps
+      .collect?.()
+      .catch((error: unknown) => console.error("external collection failed", error));
+  };
+  await collect();
   if (options.once) return runOnce(deps);
   let stopping = false;
   let wake!: () => void;
@@ -289,6 +297,8 @@ export const runLoop = async (
     }
   };
   const workers = Promise.all(Array.from({ length: options.concurrency ?? 1 }, worker));
+  const timer = setInterval(() => void collect(), 10 * 60 * 1000);
+  timer.unref();
   const onTerm = () => {
     stopping = true;
     wake();
@@ -300,5 +310,8 @@ export const runLoop = async (
     });
   };
   process.once("SIGTERM", onTerm);
-  await workers.finally(() => process.off("SIGTERM", onTerm));
+  await workers.finally(() => {
+    clearInterval(timer);
+    process.off("SIGTERM", onTerm);
+  });
 };

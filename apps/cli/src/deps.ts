@@ -7,6 +7,7 @@ import { text } from "node:stream/consumers";
 import { claudeAdapter } from "@hive/executor/adapters/claude";
 import { codexAdapter } from "@hive/executor/adapters/codex";
 import { executorHeartbeat } from "@hive/executor/capabilities";
+import { collectExternalRuns } from "@hive/executor/collector";
 import { saveEnvironment } from "@hive/executor/environments";
 import { fakeAdapter } from "@hive/executor/adapters/fake";
 import { withGitCollector } from "@hive/executor/gitCollector";
@@ -23,6 +24,23 @@ const dir = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "hiv
 const credentialsFile = join(dir, "credentials.json");
 const tokenFile = join(dir, "device-token");
 const executorDir = join(dir, "executor");
+const configFile = join(dir, "config.json");
+
+const readCollectConfig = async () =>
+  readFile(configFile, "utf8").then(
+    (data) => {
+      const parsed = JSON.parse(data) as { collect?: { enabled?: unknown } };
+      return { enabled: parsed.collect?.enabled === true };
+    },
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return { enabled: false };
+      throw error;
+    },
+  );
+
+const writeCollectConfig = async (enabled: boolean) => {
+  await writePrivate(configFile, `${JSON.stringify({ collect: { enabled } }, null, 2)}\n`);
+};
 
 const readCredentials = async (): Promise<Credentials> =>
   readFile(credentialsFile, "utf8").then(
@@ -73,6 +91,10 @@ export const deps: Deps = {
   },
   stdout: (line) => console.log(line),
   stderr: (line) => console.error(line),
+  loadCollectConfig: readCollectConfig,
+  saveCollectConfig: writeCollectConfig,
+  runCollector: (cloud, options) =>
+    collectExternalRuns(cloud, { stateDir: executorDir, ...options }),
   runExecutor: async (cloud, once, provider, concurrency) => {
     // Retention (docs/roadmap.md LOG-01): Run data once before the journal opens, the service logs now and hourly.
     await pruneRunData(executorDir).catch((error) =>
@@ -94,6 +116,10 @@ export const deps: Deps = {
           sessions: sessionJournals(executorDir),
           provider,
         }),
+        collect: async () => {
+          if ((await readCollectConfig()).enabled)
+            await collectExternalRuns(cloud, { stateDir: executorDir });
+        },
         adapter: withGitCollector(
           provider === "claude"
             ? claudeAdapter({
