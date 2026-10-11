@@ -19,19 +19,19 @@ export type Routes = Record<
   Record<string, unknown> | ((query: URLSearchParams) => Record<string, unknown>)
 >;
 
-type Options = {
+export type FakeHiveOptions = {
   get?: Routes;
   command?: (envelope: UiCommand) => ApiResult | undefined;
   config?: Partial<HiveConfig>;
   executor?: Record<string, unknown>;
   /** `login()`'s answer (default ok); `never` keeps it pending. */
-  login?: Awaited<ReturnType<HiveApi["login"]>> | "never";
+  login?: { ok: true } | { ok: false; message: string } | "never";
 };
 
 const ok = (value: Record<string, unknown>): ApiResult => ({ ok: true, value });
 
 /** Installs `window.hive`; `routes` stays mutable, every call is recorded, `emit` pushes a Realtime event. */
-export const fakeHive = (options: Options = {}) => {
+export const fakeHive = (options: FakeHiveOptions = {}) => {
   const routes: Routes = { ...options.get };
   const calls = {
     get: [] as string[],
@@ -122,7 +122,7 @@ export const fakeHive = (options: Options = {}) => {
 };
 
 /** `<App />` over the default fixtures; `overrides.get` replaces single routes. */
-export const renderApp = (overrides: Options = {}) => {
+export const renderApp = (overrides: FakeHiveOptions = {}) => {
   const hive = fakeHive({
     executor: executorStatus,
     ...overrides,

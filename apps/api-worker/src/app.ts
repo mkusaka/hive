@@ -59,6 +59,7 @@ import {
   principalHeader,
   type Realtime,
 } from "./realtime.ts";
+import { maxRoutineWebhookBytes, receiveRoutineWebhook } from "./routineWebhook.ts";
 import { listMemories, rebuildSearch, search, searchAccess } from "./search.ts";
 import { listChanges, permittedScopes } from "./sync.ts";
 import {
@@ -154,6 +155,22 @@ export const createApp = ({
   app.notFound((c) => toErrorResponse(new HttpError("NOT_FOUND", "route not found"), c));
 
   app.get("/healthz", (c) => c.json({ ok: true }));
+
+  // Per-Routine HMAC authenticates this hook; it is intentionally outside the `/v1/*` Access middleware.
+  app.post("/v1/hooks/routines/:routineId", async (c) => {
+    const body = new Uint8Array(await c.req.arrayBuffer());
+    if (body.byteLength > maxRoutineWebhookBytes) {
+      return c.json({ error: `payload exceeds ${maxRoutineWebhookBytes} bytes` }, 413);
+    }
+    return c.json(
+      await receiveRoutineWebhook(c.env.DB, {
+        routineId: c.req.param("routineId"),
+        signature: c.req.header("X-Hive-Signature") ?? "",
+        deliveryId: c.req.header("X-Hive-Delivery") ?? null,
+        body,
+      }),
+    );
+  });
 
   // Executor routes take device tokens (uploads also a Run capability) and `/v1/run/` routes a Run capability; every other /v1 route takes a user's
   // Access assertion, except `/v1/realtime`, which takes a device token when one is presented (hiveToken). A Bearer

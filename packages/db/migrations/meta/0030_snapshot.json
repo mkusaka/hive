@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "ef34330e-522b-4a66-b430-9e3ea8aa1a53",
-  "prevId": "2f520412-551b-4276-8b0e-96b38c0b2888",
+  "id": "8b777a10-cd30-4aad-8e96-5a7ec7d0f79b",
+  "prevId": "7a829814-5e7e-445e-b472-56a1672d5562",
   "tables": {
     "actors": {
       "name": "actors",
@@ -3444,6 +3444,20 @@
           "notNull": true,
           "autoincrement": false
         },
+        "occurrence_key": {
+          "name": "occurrence_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "payload": {
+          "name": "payload",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "state": {
           "name": "state",
           "type": "text",
@@ -3468,9 +3482,9 @@
         }
       },
       "indexes": {
-        "routine_occurrences_routine_id_schedule_revision_scheduled_at_unique": {
-          "name": "routine_occurrences_routine_id_schedule_revision_scheduled_at_unique",
-          "columns": ["routine_id", "schedule_revision", "scheduled_at"],
+        "routine_occurrences_routine_id_schedule_revision_occurrence_key_unique": {
+          "name": "routine_occurrences_routine_id_schedule_revision_occurrence_key_unique",
+          "columns": ["routine_id", "schedule_revision", "occurrence_key"],
           "isUnique": true
         }
       },
@@ -3515,6 +3529,105 @@
           "value": "(\"routine_occurrences\".\"state\" = 'created') = (\"routine_occurrences\".\"job_id\" IS NOT NULL)"
         }
       }
+    },
+    "routine_webhook_deliveries": {
+      "name": "routine_webhook_deliveries",
+      "columns": {
+        "routine_id": {
+          "name": "routine_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "delivery_id": {
+          "name": "delivery_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "received_at": {
+          "name": "received_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "routine_webhook_deliveries_expiry": {
+          "name": "routine_webhook_deliveries_expiry",
+          "columns": ["routine_id", "received_at"],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {
+        "routine_webhook_deliveries_routine_id_routines_id_fk": {
+          "name": "routine_webhook_deliveries_routine_id_routines_id_fk",
+          "tableFrom": "routine_webhook_deliveries",
+          "tableTo": "routines",
+          "columnsFrom": ["routine_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "routine_webhook_deliveries_routine_id_delivery_id_pk": {
+          "columns": ["routine_id", "delivery_id"],
+          "name": "routine_webhook_deliveries_routine_id_delivery_id_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "routine_webhook_rate_limits": {
+      "name": "routine_webhook_rate_limits",
+      "columns": {
+        "routine_id": {
+          "name": "routine_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "window_started_at": {
+          "name": "window_started_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "request_count": {
+          "name": "request_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "routine_webhook_rate_limits_routine_id_routines_id_fk": {
+          "name": "routine_webhook_rate_limits_routine_id_routines_id_fk",
+          "tableFrom": "routine_webhook_rate_limits",
+          "tableTo": "routines",
+          "columnsFrom": ["routine_id"],
+          "columnsTo": ["id"],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {
+        "routine_webhook_rate_limits_routine_id_window_started_at_pk": {
+          "columns": ["routine_id", "window_started_at"],
+          "name": "routine_webhook_rate_limits_routine_id_window_started_at_pk"
+        }
+      },
+      "uniqueConstraints": {},
+      "checkConstraints": {}
     },
     "routines": {
       "name": "routines",
@@ -3573,6 +3686,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "webhook_secret_hash": {
+          "name": "webhook_secret_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         },
         "schedule_revision": {

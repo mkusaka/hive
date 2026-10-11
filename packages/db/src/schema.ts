@@ -699,9 +699,9 @@ export const subscriptionRevisions = sqliteTable(
 const misfirePolicies = ["skip", "coalesce"] as const;
 
 /**
- * current state (docs/architecture.md §17.2). `schedule` is `{kind: "cron", expr, timezone}` or `{kind: "once", at}`;
+ * current state (docs/architecture.md §17.2). `schedule` is a timed cron / once trigger, a webhook, or an event filter.
  * `schedule_revision` bumps when it changes and is part of the occurrence identity. `next_fire_at` is the next UTC
- * occurrence, null when none is left (a fired `once`). `revision` bumps on every edit.
+ * occurrence, null for non-timed triggers and after a fired `once`. `revision` bumps on every edit.
  */
 export const routines = sqliteTable(
   "routines",
@@ -714,6 +714,8 @@ export const routines = sqliteTable(
     taskId: text("task_id"),
     inputText: text("input_text").notNull(),
     schedule: text("schedule", { mode: "json" }).notNull(),
+    /** SHA-256 of the displayed webhook secret; decoded bytes are the HMAC key. */
+    webhookSecretHash: text("webhook_secret_hash"),
     scheduleRevision: integer("schedule_revision").notNull().default(1),
     misfire: text("misfire", { enum: misfirePolicies }).notNull().default("coalesce"),
     nextFireAt: text("next_fire_at"),
@@ -738,9 +740,38 @@ export const routines = sqliteTable(
   ],
 );
 
+/** One accepted delivery id per webhook Routine; stale rows are removed when that hook receives its next request. */
+export const routineWebhookDeliveries = sqliteTable(
+  "routine_webhook_deliveries",
+  {
+    routineId: text("routine_id").notNull(),
+    deliveryId: text("delivery_id").notNull(),
+    receivedAt: text("received_at").notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.routineId, t.deliveryId] }),
+    index("routine_webhook_deliveries_expiry").on(t.routineId, t.receivedAt),
+    foreignKey({ columns: [t.routineId], foreignColumns: [routines.id] }),
+  ],
+);
+
+/** One durable counter per Routine and minute. */
+export const routineWebhookRateLimits = sqliteTable(
+  "routine_webhook_rate_limits",
+  {
+    routineId: text("routine_id").notNull(),
+    windowStartedAt: integer("window_started_at").notNull(),
+    requestCount: integer("request_count").notNull().default(0),
+  },
+  (t) => [
+    primaryKey({ columns: [t.routineId, t.windowStartedAt] }),
+    foreignKey({ columns: [t.routineId], foreignColumns: [routines.id] }),
+  ],
+);
+
 const occurrenceStates = ["created", "skipped"] as const;
 
-/** immutable history. One row per UTC occurrence (AT-31); `created` ones carry their Job. */
+/** immutable history. `occurrenceKey` preserves timer AT-31 dedupe and distinguishes immediate trigger bursts. */
 export const routineOccurrences = sqliteTable(
   "routine_occurrences",
   {
@@ -749,12 +780,15 @@ export const routineOccurrences = sqliteTable(
     routineId: text("routine_id").notNull(),
     scheduleRevision: integer("schedule_revision").notNull(),
     scheduledAt: text("scheduled_at").notNull(),
+    occurrenceKey: text("occurrence_key").notNull(),
+    /** JSON received from a webhook or routed internal event, null for timer and manual occurrences. */
+    payload: text("payload", { mode: "json" }),
     state: text("state", { enum: occurrenceStates }).notNull(),
     jobId: text("job_id"),
     createdAt: createdAt(),
   },
   (t) => [
-    unique().on(t.routineId, t.scheduleRevision, t.scheduledAt),
+    unique().on(t.routineId, t.scheduleRevision, t.occurrenceKey),
     oneOf("routine_occurrences_state", t.state, occurrenceStates),
     check("routine_occurrences_job", sql`(${t.state} = 'created') = (${t.jobId} IS NOT NULL)`),
     foreignKey({

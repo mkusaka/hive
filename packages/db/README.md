@@ -51,9 +51,13 @@ D1 schema, migrations and the atomic repository for the Phase 1 slice
   `devices.capacity_background`; `devices.capabilities` (JSON array) holds what the heartbeat reported.
   Migration 0014 is hand-written (`drizzle-kit generate --custom`) because it renames the unused `capacity` column.
   `finishRun` accepts `cancelled` (Execution `interrupted`). `jobs.cancel_requested_at` records `job.cancel`.
-- Routines (§17.2): `routines` (schedule JSON, `schedule_revision`, `misfire` `skip / coalesce`, `next_fire_at`,
-  `enabled`, `revision`) and immutable `routine_occurrences` (UNIQUE (routine_id, schedule_revision, scheduled_at),
-  state `created` with its `job_id` or `skipped`).
+- Routines (§17.2): `routines` (cron / once / webhook / event schedule JSON, `schedule_revision`, `misfire`
+  `skip / coalesce`, timed `next_fire_at`, `enabled`, `revision`, hashed-only `webhook_secret_hash`) and immutable
+  `routine_occurrences` (UNIQUE (routine_id, schedule_revision, occurrence_key), `scheduled_at`, optional JSON
+  `payload`, state `created` with its `job_id` or `skipped`). Migration 0024 preserves timestamp keys for timed
+  occurrences; event keys use `event:<eventId>`, manual keys the command's operation id, and webhook keys fresh ids.
+  `routine_webhook_deliveries` dedupes (routine_id, delivery_id) for seven days; `routine_webhook_rate_limits`
+  atomically caps each routine's fixed UTC-minute window at 60 accepted requests.
 - `guard` is exported for command batches outside this package (`apps/api-worker` Task commands).
 - Memory and search (§13.6, §14): `memories` (scope `workspace / channel / project / bot / task` + `scope_id`,
   content ≤ 16 KiB by CHECK on its UTF-8 bytes, source, creating actor, `revision`, `supersedes_id`, tombstone

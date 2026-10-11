@@ -1,6 +1,7 @@
 // The Bot panel (Details / Library / Computer), the Channel panel (About / Members / Routines), the routine list with its menu
 // and editor shared by both, and the executor service section of the Computer tab.
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { FilterExpression, parse, type FilterExpression as Filter } from "@hive/contracts";
 import type { ExecutorProvider, UiCommand } from "../../shared/api.ts";
 import { type Schedule, scheduleLine } from "./format.ts";
 import { Avatar, failure, Icon, inWorkspace, MemoryList, Menu, type Row, text } from "./ui.tsx";
@@ -526,6 +527,18 @@ const localInput = (iso: string) => {
   return new Date(d.getTime() - d.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
 };
 
+const eventTypePrefix = (filter: Filter): string => {
+  if (filter.op === "prefix" && filter.field === "type" && typeof filter.value === "string")
+    return filter.value;
+  if (filter.op === "and") {
+    for (const node of filter.nodes) {
+      const prefix = eventTypePrefix(node);
+      if (prefix) return prefix;
+    }
+  }
+  return "";
+};
+
 /**
  * Create (`routine.create` into the Channel's conversation) or edit (`routine.update` with `expectedRevision`, only
  * the changed fields, so a rename keeps the schedule revision). The Bot of an existing routine cannot change.
@@ -549,15 +562,94 @@ const RoutineEditor = (props: {
     old?.kind === "cron" ? old.timezone : Intl.DateTimeFormat().resolvedOptions().timeZone,
   );
   const [at, setAt] = useState(old?.kind === "once" ? localInput(old.at) : "");
+  const oldEventFilter = old?.kind === "event" ? old.filter : undefined;
+  const oldType = oldEventFilter ? eventTypePrefix(oldEventFilter) : "";
+  const remainingFilter =
+    oldEventFilter?.op === "and"
+      ? oldEventFilter.nodes.filter(
+          (node) =>
+            !(node.op === "prefix" && node.field === "type" && typeof node.value === "string"),
+        )
+      : oldType
+        ? []
+        : oldEventFilter
+          ? [oldEventFilter]
+          : [];
+  const initialFilterJson =
+    remainingFilter.length === 0
+      ? ""
+      : JSON.stringify(
+          remainingFilter.length === 1 ? remainingFilter[0] : { op: "and", nodes: remainingFilter },
+          null,
+          2,
+        );
+  const [eventType, setEventType] = useState(oldType);
+  const [filterJson, setFilterJson] = useState(initialFilterJson);
   const [inputText, setInputText] = useState(r ? String(r.inputText) : "");
   const [misfire, setMisfire] = useState(r ? String(r.misfire) : "coalesce");
+  const [apiUrl, setApiUrl] = useState("");
+  const [secret, setSecret] = useState<{ value: string; hookPath: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const hookPath = r && typeof r.hookPath === "string" ? r.hookPath : null;
+
+  useEffect(() => {
+    void window.hive.getConfig().then((config) => setApiUrl(config.apiUrl));
+  }, []);
+
+  const setDisclosure = (value: Record<string, unknown>) => {
+    if (
+      "secret" in value &&
+      typeof value.secret === "string" &&
+      "hookPath" in value &&
+      typeof value.hookPath === "string"
+    ) {
+      setSecret({ value: value.secret, hookPath: value.hookPath });
+      return true;
+    }
+    return false;
+  };
+
+  const schedule = (): Schedule | null => {
+    if (kind === "cron") return { kind, expr: expr.trim(), timezone };
+    if (kind === "once") return { kind, at: new Date(at).toISOString() };
+    if (kind === "webhook") return { kind };
+    if (old?.kind === "event" && eventType === oldType && filterJson === initialFilterJson)
+      return old;
+    let extra: Filter | null = null;
+    if (filterJson.trim()) {
+      try {
+        const result = parse(FilterExpression, JSON.parse(filterJson));
+        if (!result.ok) {
+          setError(result.issues.join("; "));
+          return null;
+        }
+        extra = result.value;
+      } catch {
+        setError("Filter must be valid JSON.");
+        return null;
+      }
+    }
+    if (!eventType.trim() && !extra) {
+      setError("Enter an event type prefix or filter JSON.");
+      return null;
+    }
+    const filter: Filter = eventType.trim()
+      ? extra
+        ? { op: "and", nodes: [{ op: "prefix", field: "type", value: eventType.trim() }, extra] }
+        : { op: "prefix", field: "type", value: eventType.trim() }
+      : extra!;
+    const result = parse(FilterExpression, filter);
+    if (!result.ok) {
+      setError(result.issues.join("; "));
+      return null;
+    }
+    return { kind, filter: result.value };
+  };
 
   const save = async () => {
-    const schedule: Schedule =
-      kind === "cron"
-        ? { kind, expr: expr.trim(), timezone }
-        : { kind, at: new Date(at).toISOString() };
+    if (secret) return;
+    const next = schedule();
+    if (!next) return;
     const misfirePolicy = misfire as "skip" | "coalesce";
     const res = r
       ? await command(props.ws, {
@@ -565,7 +657,7 @@ const RoutineEditor = (props: {
           routineId: r.id,
           expectedRevision: Number(r.revision),
           ...(name !== r.name ? { name } : {}),
-          ...(JSON.stringify(schedule) !== JSON.stringify(old) ? { schedule } : {}),
+          ...(JSON.stringify(next) !== JSON.stringify(old) ? { schedule: next } : {}),
           ...(inputText !== r.inputText ? { inputText } : {}),
           ...(misfire !== r.misfire ? { misfire: misfirePolicy } : {}),
         })
@@ -573,17 +665,28 @@ const RoutineEditor = (props: {
           type: "routine.create",
           botId,
           name,
-          schedule,
+          schedule: next,
           inputText,
           misfire: misfirePolicy,
           conversationId: props.create?.conversationId,
         });
-    if (res.ok) return props.done(null);
+    if (res.ok) {
+      if (setDisclosure(res.value)) return;
+      return props.done(null);
+    }
     if (res.error.code === "REVISION_CONFLICT")
       return props.done("The routine changed elsewhere; reloaded. Edit it again.");
     setError(failure(res));
   };
 
+  const rotate = async () => {
+    if (!r || secret) return;
+    const res = await command(props.ws, { type: "routine.rotate_secret", routineId: r.id });
+    if (res.ok && setDisclosure(res.value)) return;
+    setError(res.ok ? "The server did not return a new secret." : failure(res));
+  };
+
+  const shownHookPath = secret?.hookPath ?? hookPath;
   return (
     <form
       className="card editor"
@@ -608,13 +711,22 @@ const RoutineEditor = (props: {
         </select>
       </label>
       <label>
-        Schedule
-        <select value={kind} onChange={(e) => setKind(e.target.value as Schedule["kind"])}>
-          <option value="cron">Repeat (cron)</option>
+        Trigger
+        <select
+          value={kind}
+          onChange={(e) => {
+            const next = e.target.value as Schedule["kind"];
+            if (next !== "webhook") setSecret(null);
+            setKind(next);
+          }}
+        >
+          <option value="cron">Repeat</option>
           <option value="once">Once</option>
+          <option value="webhook">Webhook</option>
+          <option value="event">When an event matches</option>
         </select>
       </label>
-      {kind === "cron" ? (
+      {kind === "cron" && (
         <>
           <label>
             Cron
@@ -632,7 +744,8 @@ const RoutineEditor = (props: {
             <input value={timezone} onChange={(e) => setTimezone(e.target.value)} required />
           </label>
         </>
-      ) : (
+      )}
+      {kind === "once" && (
         <label>
           At
           <input
@@ -642,6 +755,43 @@ const RoutineEditor = (props: {
             required
           />
         </label>
+      )}
+      {kind === "event" && (
+        <>
+          <label>
+            Event type prefix
+            <input
+              value={eventType}
+              onChange={(e) => setEventType(e.target.value)}
+              placeholder="github.pull_request"
+            />
+          </label>
+          <label>
+            Filter JSON (optional)
+            <textarea rows={4} value={filterJson} onChange={(e) => setFilterJson(e.target.value)} />
+          </label>
+        </>
+      )}
+      {kind === "webhook" && (
+        <>
+          {shownHookPath && (
+            <label>
+              Webhook URL
+              <input readOnly value={`${apiUrl.replace(/\/$/, "")}${shownHookPath}`} />
+            </label>
+          )}
+          {r && (
+            <button type="button" disabled={Boolean(secret)} onClick={() => void rotate()}>
+              Rotate secret
+            </button>
+          )}
+          {secret && (
+            <label>
+              Secret (shown once)
+              <input readOnly value={secret.value} />
+            </label>
+          )}
+        </>
       )}
       <label>
         Input
@@ -661,11 +811,13 @@ const RoutineEditor = (props: {
       </label>
       {error && <p className="error">{error}</p>}
       <div className="row">
-        <button type="submit" disabled={!botId}>
-          {r ? "Save" : "Create"}
-        </button>
+        {!secret && (
+          <button type="submit" disabled={!botId}>
+            {r ? "Save" : "Create"}
+          </button>
+        )}
         <button type="button" onClick={() => props.done(null)}>
-          Cancel
+          {secret ? "Done" : "Cancel"}
         </button>
       </div>
     </form>

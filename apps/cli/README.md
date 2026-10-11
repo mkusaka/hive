@@ -72,6 +72,9 @@ hive job cancel <job-id>                           # queued: cancelled now; acti
 hive job resolve <job-id> (--retry | --cancel | --mark-failed)   # a recovery_required Job
 hive routine create --bot <bot-id> --name <name> --cron "0 9 * * 1-5" --input <text> [--tz <zone>]
                     [--channel <channel-id>] [--misfire skip|coalesce]
+hive routine create --bot <bot-id> --name <name> --webhook --input <text> [--channel <channel-id>]
+hive routine create --bot <bot-id> --name <name> --event-filter <json> --input <text> [--channel <channel-id>]
+hive routine rotate-secret <routine-id>           # prints the new webhook secret once; invalidates the old one
 hive routine list
 hive routine run <routine-id>                      # manual run: one Job now
 hive routine pause <routine-id> | hive routine resume <routine-id>
@@ -91,9 +94,15 @@ a fresh UUID per invocation).
 - **`--wait`** polls `GET /v1/operations/:id` until routing created the Job, then watches it. `--notify` creates no
   Job, so `--notify --wait` is invalid. A timeout never cancels the Job. The default timeout is 300 s.
 - **`event emit`** reads JSON from `--data-file` (`-` is stdin); without it `data` is `{}`.
-- **`routine create`** defaults `--tz` to this machine's IANA zone. `--channel` is resolved to the Channel's main
-  Conversation (the Routine's lane and reply target) through `channel list`. `job resolve --retry` is 409 (exit 4)
-  until the old Run's stop is confirmed by its executor.
+- **`routine create`** requires exactly one trigger: `--cron`, `--webhook` or `--event-filter`. Cron defaults
+  `--tz` to this machine's IANA zone. `--event-filter` is the existing Subscription AST, for example
+  `'{"op":"eq","field":"type","value":"custom.demo.ping"}'`; users may emit only `custom.*`.
+  `--channel` resolves to the Channel's main Conversation (the Routine's lane and reply target).
+  Webhook creation and `routine rotate-secret` print the secret once and the hook path; copy it into your
+  caller's secret store, not logs. A command replay cannot recover it. Callers POST raw JSON (≤ 64 KiB) to that
+  path on the API host, signed as `X-Hive-Signature: sha256=<hex HMAC-SHA256(secret, body)>`.
+  Optional `X-Hive-Delivery` dedupes for seven days; the budget is 60/minute/routine. See the API README.
+  `job resolve --retry` is 409 (exit 4) until the old Run's stop is confirmed by its executor.
 - **`--tools`** is `Read=allow,Bash=ask` (Read, Grep, Glob, Edit, Write, Bash; a missing tool is `deny`).
   `bot update --tools` replaces the tool list and keeps the current `cwdMode` unless `--cwd-mode` is given; it reads
   the Bot's revision from `bot list`, so a concurrent edit is 409 (exit 4). **Security:** Bash is not

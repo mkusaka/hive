@@ -669,6 +669,8 @@ export const listRoutines = async (
     .prepare(
       `SELECT id, bot_id AS botId, name, conversation_id AS conversationId, task_id AS taskId, input_text AS inputText,
               schedule, schedule_revision AS scheduleRevision, misfire, next_fire_at AS nextFireAt, enabled, revision,
+              CASE WHEN json_extract(schedule, '$.kind') = 'webhook'
+                   THEN '/v1/hooks/routines/' || id ELSE NULL END AS hookPath,
               created_at AS createdAt, updated_at AS updatedAt
          FROM routines WHERE workspace_id = ? AND (? IS NULL OR bot_id = ?) AND (? IS NULL OR conversation_id = ?)
         ORDER BY created_at, id LIMIT 500`,

@@ -315,6 +315,74 @@ describe("argv → request", () => {
     expect(await h.hive("job", "get", "j", "--bogus")).toBe(2);
     expect(h.calls).toEqual([]);
   });
+  it("creates webhook and event routines and rotates a webhook secret", async () => {
+    const h = harness(() => Response.json({ hookPath: "/v1/hooks/routines/r-1" }));
+    const filter = { op: "eq", field: "type", value: "demo.ping" };
+    expect(
+      await h.hive(
+        "routine",
+        "create",
+        "--bot",
+        "bot-1",
+        "--name",
+        "webhook",
+        "--webhook",
+        "--input",
+        "Handle hook",
+      ),
+    ).toBe(0);
+    expect(
+      await h.hive(
+        "routine",
+        "create",
+        "--bot",
+        "bot-1",
+        "--name",
+        "event",
+        "--event-filter",
+        JSON.stringify(filter),
+        "--input",
+        "Handle event",
+      ),
+    ).toBe(0);
+    expect(await h.hive("routine", "rotate-secret", "r-1")).toBe(0);
+    expect(h.calls.map(commandOf)).toEqual([
+      {
+        type: "routine.create",
+        botId: "bot-1",
+        name: "webhook",
+        schedule: { kind: "webhook" },
+        inputText: "Handle hook",
+      },
+      {
+        type: "routine.create",
+        botId: "bot-1",
+        name: "event",
+        schedule: { kind: "event", filter },
+        inputText: "Handle event",
+      },
+      { type: "routine.rotate_secret", routineId: "r-1" },
+    ]);
+  });
+
+  it("rejects conflicting or invalid routine triggers before sending a command", async () => {
+    const h = harness();
+    const required = ["--bot", "bot-1", "--name", "routine", "--input", "Run"];
+    expect(await h.hive("routine", "create", ...required, "--cron", "* * * * *", "--webhook")).toBe(
+      2,
+    );
+    expect(await h.hive("routine", "create", ...required, "--event-filter", "{")).toBe(2);
+    expect(
+      await h.hive(
+        "routine",
+        "create",
+        ...required,
+        "--event-filter",
+        JSON.stringify({ op: "eq", field: "unknown", value: "x" }),
+      ),
+    ).toBe(2);
+    expect(h.calls).toEqual([]);
+  });
 });
 
 describe("exit codes", () => {

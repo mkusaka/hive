@@ -5,11 +5,13 @@ import {
   type SearchKind,
   type FilterExpression,
   type FilterTarget,
+  type RoutineSchedule,
   matchesEventType,
   matchesFilter,
 } from "@hive/contracts";
 import {
   acquireOutboxBatch,
+  appendChange,
   createDeliveryAndInbox,
   expireApprovals,
   expireLeases,
@@ -24,7 +26,14 @@ import {
 import { performEffect, type Performers, reconcileEffect } from "./effects.ts";
 import { parkWaitingJobs } from "./executor.ts";
 import type { Notification } from "./realtime.ts";
-import { fireDueRoutines } from "./routines.ts";
+import {
+  fireDueRoutines,
+  occurrenceStatements,
+  routineColumns,
+  routineFrom,
+  routineSkipGraceMs,
+  type RoutineRow,
+} from "./routines.ts";
 import { indexSource } from "./search.ts";
 
 const maxAttempts = 5;
@@ -67,18 +76,17 @@ export type SubscriptionRow = {
 };
 type Delivery = { mode: "notify" | "wake" | "batch"; debounceMs: number; maxBatchItems: number };
 
-const toTarget = (e: EventRow): FilterTarget => ({
-  type: e.type,
-  source: { kind: e.source_kind },
-  subject: e.subject_kind === null ? null : { kind: e.subject_kind, id: e.subject_id ?? "" },
-  data: JSON.parse(e.data) as unknown,
-});
-
 /** Event type pattern, integration and filter AST (docs/architecture.md §6.4). */
 export const subscriptionMatches = (sub: SubscriptionRow, event: EventRow) =>
   matchesEventType(JSON.parse(sub.event_types) as string[], event.type) &&
   (sub.integration_id === null || sub.integration_id === event.integration_id) &&
-  matchesFilter(JSON.parse(sub.filter) as FilterExpression, toTarget(event));
+  matchesFilter(JSON.parse(sub.filter) as FilterExpression, {
+    type: event.type,
+    source: { kind: event.source_kind },
+    subject:
+      event.subject_kind === null ? null : { kind: event.subject_kind, id: event.subject_id ?? "" },
+    data: JSON.parse(event.data) as unknown,
+  });
 
 // When Subscriptions of one (bot, lane) disagree, the strongest mode wins.
 const modeRank = { notify: 0, batch: 1, wake: 2 } as const;
@@ -137,6 +145,51 @@ const subscriptionRecipients = async (db: D1Database, event: EventRow) => {
   return recipients;
 };
 
+/** Event-triggered occurrences use the same durable occurrence and Job path as timed Routines. */
+const eventRoutineOccurrences = async (db: D1Database, event: EventRow) => {
+  const { results } = await db
+    .prepare(
+      `SELECT ${routineColumns} FROM ${routineFrom}
+        WHERE r.workspace_id = ? AND r.enabled = 1 AND json_extract(r.schedule, '$.kind') = 'event'
+        ORDER BY r.id`,
+    )
+    .bind(event.workspace_id)
+    .all<RoutineRow>();
+  const target: FilterTarget = {
+    type: event.type,
+    source: { kind: event.source_kind },
+    subject:
+      event.subject_kind === null ? null : { kind: event.subject_kind, id: event.subject_id ?? "" },
+    data: JSON.parse(event.data) as unknown,
+  };
+  const payload = {
+    eventId: event.id,
+    type: event.type,
+    source: {
+      kind: event.source_kind,
+      ...(event.integration_id === null ? {} : { integrationId: event.integration_id }),
+    },
+    subject:
+      event.subject_kind === null ? null : { kind: event.subject_kind, id: event.subject_id ?? "" },
+    data: target.data,
+  };
+  const late = Date.now() - Date.parse(event.received_at) > routineSkipGraceMs;
+  return results.flatMap((routine) => {
+    const schedule = JSON.parse(routine.schedule) as RoutineSchedule;
+    if (schedule.kind !== "event" || !matchesFilter(schedule.filter, target)) return [];
+    return [
+      {
+        routine,
+        occurrence: occurrenceStatements(db, routine, event.received_at, {
+          occurrenceKey: `event:${event.id}`,
+          payload,
+          skipped: routine.misfire === "skip" && late,
+        }),
+      },
+    ];
+  });
+};
+
 /**
  * Idempotent: the consumer receipt makes a second route of the same event a no-op. Returns the realtime
  * hint for what this call changed, or null.
@@ -149,8 +202,11 @@ export const routeEvent = async (db: D1Database, eventId: string): Promise<Notif
   if (!event) throw new Error(`event not found: ${eventId}`);
   const workspaceId = event.workspace_id;
   if (event.type !== "agent.message.sent") {
-    const recipients = await subscriptionRecipients(db, event);
-    if (recipients.length === 0) {
+    const [recipients, occurrences] = await Promise.all([
+      subscriptionRecipients(db, event),
+      eventRoutineOccurrences(db, event),
+    ]);
+    if (recipients.length === 0 && occurrences.length === 0) {
       // matched=0 (AT-06): only the consumer receipt is written.
       await recordEventRouted(db, { workspaceId, eventId });
       return null;
@@ -160,10 +216,38 @@ export const routeEvent = async (db: D1Database, eventId: string): Promise<Notif
       eventId,
       correlationId: event.correlation_id,
       recipients,
+      additionalStatements: occurrences.flatMap(({ routine, occurrence }) => {
+        const operationId = `routine-event:${event.id}:${routine.id}`;
+        return [
+          db
+            .prepare(
+              `INSERT INTO atomic_guards (operation_id, ok)
+               SELECT ?, EXISTS(
+                 SELECT 1 FROM routines
+                  WHERE id = ? AND enabled = 1 AND schedule_revision = ?
+                    AND json_extract(schedule, '$.kind') = 'event'
+               )`,
+            )
+            .bind(operationId, routine.id, routine.schedule_revision),
+          ...occurrence.statements,
+          db.prepare("DELETE FROM atomic_guards WHERE operation_id = ?").bind(operationId),
+          ...occurrence.changes.map((change) => appendChange(db, { workspaceId, ...change })),
+        ];
+      }),
     });
     if (!routed.routed) return null;
-    const jobAvailable = routed.deliveries.some((d) => d.jobId !== null);
-    const scopes = [...new Set(recipients.map((r) => r.scope))];
+    const jobAvailable =
+      routed.deliveries.some((delivery) => delivery.jobId !== null) ||
+      occurrences.some(({ occurrence }) => occurrence.jobId !== null);
+    const scopes = [
+      ...new Set([
+        ...recipients.map((recipient) => recipient.scope),
+        ...occurrences.flatMap(({ occurrence }) =>
+          occurrence.changes.map((change) => change.scope),
+        ),
+      ]),
+    ];
+    if (scopes.length === 0) return null;
     return jobAvailable
       ? { workspaceId, scopes: [...scopes, `workspace:${workspaceId}`], jobAvailable }
       : { workspaceId, scopes };
