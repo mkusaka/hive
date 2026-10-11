@@ -1,11 +1,12 @@
-import { parse, RunObservation } from "@hive/contracts";
+import { parse, RunObservation, type RunPrincipal } from "@hive/contracts";
 import { type Context, Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { JWTVerifyGetKey } from "jose";
 import { authenticateUser, remoteJwks } from "./auth/access.ts";
 import { authenticateDevice } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
-import { CommandEnvelope, runCommand } from "./commands.ts";
+import { authenticateRun } from "./auth/run.ts";
+import { CommandEnvelope, RunEnvelope, runCommand, runRunCommand } from "./commands.ts";
 import { HttpError, toErrorResponse } from "./errors.ts";
 import {
   type Device,
@@ -22,6 +23,7 @@ import {
   getJob,
   getOperation,
   getTask,
+  listBotConversations,
   listBots,
   listChannels,
   listDevices,
@@ -65,6 +67,11 @@ const device = (c: { get: (key: "principal") => Principal }): Device => {
   if (principal.kind !== "device") throw new HttpError("FORBIDDEN", "device principal required");
   return principal;
 };
+const runPrincipal = (c: { get: (key: "principal") => Principal }) => {
+  const principal = c.get("principal");
+  if (principal.kind !== "run") throw new HttpError("FORBIDDEN", "run capability required");
+  return principal;
+};
 
 /** `?workspaceId=`, which the principal must belong to (403 otherwise). */
 const workspaceParam = (c: Context<AppEnv>) => {
@@ -103,17 +110,19 @@ export const createApp = ({
 
   app.get("/healthz", (c) => c.json({ ok: true }));
 
-  // Executor routes take device tokens; every other /v1 route takes a user's Access assertion, except
-  // `/v1/realtime`, which takes a device token when a Bearer token is presented.
+  // Executor routes take device tokens and `/v1/run/` routes a Run capability; every other /v1 route takes a user's
+  // Access assertion, except `/v1/realtime`, which takes a device token when a Bearer token is presented.
   app.use("/v1/*", async (c, next) => {
     const deviceAuth =
       c.req.path.startsWith("/v1/executor/") ||
       (c.req.path === "/v1/realtime" && c.req.header("Authorization")?.startsWith("Bearer "));
     c.set(
       "principal",
-      deviceAuth
-        ? await authenticateDevice(c.req.raw, c.env)
-        : await authenticateUser(c.req.raw, c.env, jwks(c.env)),
+      c.req.path.startsWith("/v1/run/")
+        ? await authenticateRun(c.req.raw, c.env)
+        : deviceAuth
+          ? await authenticateDevice(c.req.raw, c.env)
+          : await authenticateUser(c.req.raw, c.env, jwks(c.env)),
     );
     await next();
   });
@@ -186,6 +195,44 @@ export const createApp = ({
     return c.json(body, status);
   });
 
+  // In-run hive tools (§18.2): the capability's Run acts as its Bot.
+  app.post("/v1/run/commands", async (c) => {
+    const run = runPrincipal(c);
+    const parsed = parse(RunEnvelope, await c.req.json().catch(() => null));
+    if (!parsed.ok) throw new HttpError("INVALID_INPUT", parsed.issues.join("; "));
+    c.set("operationId", parsed.value.operationId);
+    const { status, response, scopes } = await runRunCommand(c.env.DB, run, parsed.value);
+    hint(c, { workspaceId: run.workspaceId, scopes: scopes ?? [] });
+    return c.json(response, status as ContentfulStatusCode);
+  });
+  app.get("/v1/run/me", (c) => {
+    const run = runPrincipal(c);
+    const me: RunPrincipal = {
+      kind: "run",
+      runId: run.runId,
+      jobId: run.jobId,
+      botId: run.botId,
+      workspaceId: run.workspaceId,
+      executionGeneration: run.executionGeneration,
+      conversationId: run.conversationId,
+      taskId: run.taskId,
+      hop: run.hop,
+      correlationId: run.correlationId,
+      scopes: run.scopes,
+    };
+    return c.json(me);
+  });
+  app.get("/v1/run/tasks/:id", async (c) => {
+    const run = runPrincipal(c);
+    if (!run.scopes.includes("task.read"))
+      throw new HttpError("FORBIDDEN", "capability lacks task.read");
+    const task = await getTask(c.env.DB, [run.workspaceId], c.req.param("id"));
+    if (!run.taskProjectId || task.projectId !== run.taskProjectId) {
+      throw new HttpError("FORBIDDEN", "a run may only read tasks of its own task's project");
+    }
+    return c.json(task);
+  });
+
   app.get("/v1/operations/:id", async (c) => {
     const { userId, workspaceIds } = user(c);
     return c.json(await getOperation(c.env.DB, userId, workspaceIds, c.req.param("id")));
@@ -213,6 +260,9 @@ export const createApp = ({
     ),
   );
   app.get("/v1/bots", async (c) => c.json(await listBots(c.env.DB, workspaceParam(c))));
+  app.get("/v1/bot-conversations", async (c) =>
+    c.json(await listBotConversations(c.env.DB, workspaceParam(c))),
+  );
   app.get("/v1/devices", async (c) => c.json(await listDevices(c.env.DB, workspaceParam(c))));
   app.get("/v1/jobs", async (c) =>
     c.json(
@@ -265,7 +315,7 @@ export const createApp = ({
           }
         : {
             principalKind: "device",
-            principalId: principal.deviceId,
+            principalId: device(c).deviceId,
             scopes: [`workspace:${workspaceId}`],
           };
     const stub = c.env.REALTIME.get(c.env.REALTIME.idFromName(workspaceId));

@@ -1,5 +1,5 @@
 import type { RunContext } from "@hive/contracts";
-import { CloudError, type CloudClient } from "../src/cloudClient.ts";
+import { CloudError, type CloudClient, type RunApi } from "../src/cloudClient.ts";
 import type { JournalEntry } from "../src/runner.ts";
 
 export const memoryJournal = (entries: JournalEntry[] = []) => ({
@@ -14,10 +14,36 @@ export const context: RunContext = {
   conversation: {
     id: "conv-1",
     channelId: "chan-1",
+    kind: "channel",
     recent: [{ actorKind: "user", actorId: "actor-1", body: "Say hello.", createdAt: "" }],
   },
-  inboxItem: { id: "inbox-1", body: "Say hello." },
+  inboxItem: {
+    id: "inbox-1",
+    body: "Say hello.",
+    messageId: "msg-1",
+    kind: "request",
+    fromBot: null,
+  },
   batch: null,
+  replies: [],
+};
+
+/** Records `/v1/run/*` calls; `fail` makes every call throw that error. */
+export const fakeRunApi = (fail?: Error) => {
+  const calls: unknown[] = [];
+  const api: RunApi = {
+    command: async (body) => {
+      calls.push(body);
+      if (fail) throw fail;
+      return { status: "accepted", messageId: "msg-sent" };
+    },
+    getTask: async (taskId) => {
+      calls.push({ getTask: taskId });
+      if (fail) throw fail;
+      return { id: taskId, revision: 3 };
+    },
+  };
+  return { api, calls };
 };
 
 const lease = () => new Date(Date.now() + 40).toISOString();
@@ -47,6 +73,7 @@ export const fakeCloud = (overrides: Partial<CloudClient> = {}) => {
         executionId: "exec-1",
         executionGeneration: 1,
         leaseExpiresAt: lease(),
+        capability: null,
         job: { id: "job-1", botId: "bot-1", inboxItemId: "inbox-1", placement: {} as never },
       };
     },
@@ -73,6 +100,7 @@ export const fakeCloud = (overrides: Partial<CloudClient> = {}) => {
       calls.push("observe");
       observed.push(input);
     },
+    forRun: () => fakeRunApi().api,
     ...overrides,
   };
   return { cloud, calls, submitted, observed };

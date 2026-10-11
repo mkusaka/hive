@@ -160,7 +160,7 @@ describe("claimJob", () => {
     const input = claimInput(s);
     const first = await claimJob(db, input);
     const replay = await claimJob(db, input);
-    expect(replay).toEqual(first);
+    expect(replay).toEqual({ ...first, replayed: true });
     expect(await count("runs WHERE job_id = ?", s.job)).toBe(1);
     await expect(claimJob(db, { ...input, leaseSeconds: 30 })).rejects.toBeInstanceOf(
       IdempotencyConflict,

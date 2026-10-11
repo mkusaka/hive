@@ -2,6 +2,9 @@
 // `<state-dir>/transcripts/<runId>.jsonl` and fsynced before it is processed: the durable local journal outside
 // the SDK config dir. Auth is whatever the SDK subprocess finds (it inherits `process.env`, so
 // `CLAUDE_CONFIG_DIR` selects the login); never an automatic switch to an API key.
+// Tools: only the in-run hive tools (tools.ts), and only with a Run capability. `hive_wait_for_reply` ends the Run:
+// once its tool result appears in the stream, the adapter aborts the query (no further model turn) and exits with
+// `waitingFor`, which the runner submits as a `waiting` result (§8.2).
 import { mkdir, open, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -11,6 +14,7 @@ import {
   type SDKResultMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AgentAdapter, LaunchContext, RunningAgent } from "../runner.ts";
+import { hiveMcpServer, hiveTools, toolName, waitForReplyTool } from "../tools.ts";
 
 export type QueryFn = (params: { prompt: string; options: Options }) => AsyncIterable<SDKMessage>;
 type Exit = Awaited<ReturnType<RunningAgent["waitForExit"]>>;
@@ -34,8 +38,17 @@ export const systemPrompt = ({ bot }: LaunchContext["context"]) =>
     .filter(Boolean)
     .join("\n\n");
 
-/** User message: Task, recent conversation (oldest first), then the trigger item's body or the batch's items. */
-export const userPrompt = ({ task, conversation, inboxItem, batch }: LaunchContext["context"]) => {
+/**
+ * User message: Task, recent conversation (oldest first), then the trigger item's body (naming the sending Bot) or the
+ * batch's items, then replies to this Job's earlier requests.
+ */
+export const userPrompt = ({
+  task,
+  conversation,
+  inboxItem,
+  batch,
+  replies,
+}: LaunchContext["context"]) => {
   const parts: string[] = [];
   if (task) parts.push(`Task ${task.key}: ${task.title}\n${task.description}`.trim());
   if (conversation?.recent.length) {
@@ -45,7 +58,12 @@ export const userPrompt = ({ task, conversation, inboxItem, batch }: LaunchConte
   const request = batch
     ? batch.items.map((i, n) => `[${n + 1}] ${i.body}`).join("\n")
     : (inboxItem?.body ?? "Work on the task above.");
-  parts.push(`Request:\n${request}`);
+  const from = inboxItem?.fromBot ? ` from bot ${inboxItem.fromBot.name} (${inboxItem.kind})` : "";
+  parts.push(`Request${from}:\n${request}`);
+  if (replies.length) {
+    const lines = replies.map((r) => `[bot ${r.fromBot.name}] ${r.body}`);
+    parts.push(`Replies to your requests:\n${lines.join("\n")}`);
+  }
   return parts.join("\n\n");
 };
 
@@ -116,6 +134,16 @@ export const claudeAdapter = ({
 
     const abort = new AbortController();
     let stopReason: string | undefined;
+    const tools = ctx.run ? hiveTools(ctx.context, ctx.run) : [];
+    // tool_use id → requestMessageId of `hive_wait_for_reply` calls not yet answered.
+    const waits = new Map<string, string>();
+    let waitingFor: string | undefined;
+    const waiting = (): Exit => ({
+      code: 0,
+      reason: "waiting",
+      summary: truncate(`claude: waiting for the reply to ${waitingFor}`, kib8),
+      waitingFor: { requestMessageId: waitingFor! },
+    });
     const run = async (): Promise<Exit> => {
       const file = await open(transcript, "a");
       try {
@@ -128,12 +156,12 @@ export const claudeAdapter = ({
             cwd,
             abortController: abort,
             systemPrompt: systemPrompt(ctx.context),
-            // No tools and no settings / MCP from the user's Claude config: a plain answering Bot.
+            // No built-in tools and no settings / MCP from the user's Claude config; only the hive tools.
             tools: [],
-            allowedTools: [],
+            allowedTools: tools.map((t) => toolName(t.name)),
             permissionMode: "dontAsk",
             settingSources: [],
-            mcpServers: {},
+            mcpServers: tools.length ? { hive: hiveMcpServer(tools) } : {},
             strictMcpConfig: true,
             maxTurns,
             ...(sessionId ? { resume: sessionId } : {}),
@@ -149,11 +177,32 @@ export const claudeAdapter = ({
               .catch((error: unknown) => console.error("runtime.run.started failed", error));
           }
           if (message.type === "result") result = message;
+          if (message.type === "assistant") {
+            for (const block of message.message.content) {
+              if (block.type === "tool_use" && block.name === waitForReplyTool) {
+                waits.set(block.id, (block.input as { requestMessageId: string }).requestMessageId);
+              }
+            }
+          }
+          if (message.type === "user" && Array.isArray(message.message.content)) {
+            for (const block of message.message.content) {
+              if (block.type === "tool_result" && !block.is_error && waits.has(block.tool_use_id)) {
+                waitingFor = waits.get(block.tool_use_id);
+              }
+            }
+          }
+          if (waitingFor) {
+            stopReason = "waiting";
+            abort.abort();
+            break;
+          }
         }
+        if (waitingFor) return waiting();
         if (result) return toExit(result);
         if (stopReason) return { code: null, reason: stopReason, summary: "claude: stopped" };
         return { code: 1, reason: "no result message", summary: "claude: no result" };
       } catch (error) {
+        if (waitingFor) return waiting();
         if (stopReason) return { code: null, reason: stopReason, summary: "claude: stopped" };
         const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
         return { code: 1, reason: truncate(message, kib8), summary: "claude: failed" };

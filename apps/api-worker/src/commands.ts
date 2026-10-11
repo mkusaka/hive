@@ -1,5 +1,7 @@
 // POST /v1/commands handlers (docs/architecture.md §22.3). Each runs inside `withOperationReceipt`.
 import {
+  AgentReply,
+  type AgentReplyAccepted,
   AgentSend,
   type AgentSendAccepted,
   BotCreate,
@@ -22,6 +24,9 @@ import {
   RoutineRun,
   type RoutineSchedule,
   RoutineUpdate,
+  RunAgentSend,
+  type RunAgentSendAccepted,
+  RunCommand,
   SubscriptionCreate,
   SubscriptionDelete,
   SubscriptionPause,
@@ -96,12 +101,22 @@ type Handler<T extends Command> = (
   envelope: Envelope & { command: T },
 ) => Promise<{ status: number; response: unknown; scopes?: string[] }>;
 
+/** Task writes are shared with Run commands: the receipt is keyed by the user or the Run. */
+type TaskHandler<T extends Command> = (
+  db: D1Database,
+  actorId: string,
+  envelope: Envelope & { command: T },
+) => ReturnType<Handler<T>>;
+
 type Change = Omit<Parameters<typeof appendChange>[1], "workspaceId">;
 
-/** Runs the batch with one change row per `changes` entry; returns the touched scopes unless replayed. */
+/**
+ * Runs the batch with one change row per `changes` entry; returns the touched scopes unless replayed. `actorId` keys
+ * the receipt: the user, or the Run for a Run command.
+ */
 const receipt = async <T>(
   db: D1Database,
-  user: User,
+  actorId: string,
   envelope: Envelope,
   statements: D1PreparedStatement[],
   response: T,
@@ -112,7 +127,7 @@ const receipt = async <T>(
     db,
     {
       workspaceId,
-      actorId: user.userId,
+      actorId,
       idempotencyKey: envelope.idempotencyKey,
       requestDigest: await digest(envelope.command),
     },
@@ -142,7 +157,7 @@ const workspaceCreate: Handler<v.InferOutput<typeof WorkspaceCreate>> = async (d
   if (exists && !member) throw new HttpError("FORBIDDEN", "workspace already exists");
   return receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -172,7 +187,7 @@ const deviceRegister: Handler<v.InferOutput<typeof DeviceRegister>> = async (db,
   const secret = newDeviceSecret();
   const result = await receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -210,7 +225,7 @@ const deviceRevoke: Handler<v.InferOutput<typeof DeviceRevoke>> = async (db, use
   const now = new Date().toISOString();
   return receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -275,7 +290,7 @@ const channelCreate: Handler<v.InferOutput<typeof ChannelCreate>> = async (db, u
   const conversationId = crypto.randomUUID();
   const run = receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -305,7 +320,7 @@ const botCreate: Handler<v.InferOutput<typeof BotCreate>> = async (db, user, env
   const botId = crypto.randomUUID();
   const run = receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -367,7 +382,7 @@ const agentSend: Handler<v.InferOutput<typeof AgentSend>> = async (db, user, env
   };
   return receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       insertMessage(db, {
@@ -438,7 +453,7 @@ const eventEmit: Handler<v.InferOutput<typeof EventEmit>> = async (db, user, env
   };
   return receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       insertEvent(db, {
@@ -571,7 +586,7 @@ const projectCreate: Handler<v.InferOutput<typeof ProjectCreate>> = async (db, u
   const projectId = crypto.randomUUID();
   const run = receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -585,7 +600,7 @@ const projectCreate: Handler<v.InferOutput<typeof ProjectCreate>> = async (db, u
 };
 
 /** The key `<projectKey>-<n>` comes from the Project's counter, advanced by CAS in the same batch. */
-const taskCreate: Handler<v.InferOutput<typeof TaskCreate>> = async (db, user, env) => {
+const taskCreate: TaskHandler<v.InferOutput<typeof TaskCreate>> = async (db, actorId, env) => {
   const { workspaceId, command } = env;
   const parent = command.parentTaskId
     ? await loadTask(db, workspaceId, command.parentTaskId)
@@ -611,7 +626,7 @@ const taskCreate: Handler<v.InferOutput<typeof TaskCreate>> = async (db, user, e
   const [setGuard, clearGuard] = guard(db);
   const run = receipt(
     db,
-    user,
+    actorId,
     env,
     [
       db
@@ -656,7 +671,7 @@ const taskCreate: Handler<v.InferOutput<typeof TaskCreate>> = async (db, user, e
   );
 };
 
-const taskAssign: Handler<v.InferOutput<typeof TaskAssign>> = async (db, user, env) => {
+const taskAssign: TaskHandler<v.InferOutput<typeof TaskAssign>> = async (db, actorId, env) => {
   const { workspaceId, command } = env;
   await loadTask(db, workspaceId, command.taskId);
   const { assignee } = command;
@@ -674,7 +689,7 @@ const taskAssign: Handler<v.InferOutput<typeof TaskAssign>> = async (db, user, e
   const cas = { workspaceId, taskId: command.taskId, expectedRevision: command.expectedRevision };
   const run = receipt(
     db,
-    user,
+    actorId,
     env,
     taskCas(
       db,
@@ -694,7 +709,7 @@ const taskAssign: Handler<v.InferOutput<typeof TaskAssign>> = async (db, user, e
  * Removes, then adds start dependencies; any cycle through dependencies or parent/child is 422 (AT-18). Bumps
  * `scope_revision`, so earlier Results no longer satisfy completion.
  */
-const taskPlan: Handler<v.InferOutput<typeof TaskPlan>> = async (db, user, env) => {
+const taskPlan: TaskHandler<v.InferOutput<typeof TaskPlan>> = async (db, actorId, env) => {
   const { workspaceId, command } = env;
   const { taskId } = command;
   await loadTask(db, workspaceId, taskId);
@@ -741,7 +756,7 @@ const taskPlan: Handler<v.InferOutput<typeof TaskPlan>> = async (db, user, env) 
   });
   const run = receipt(
     db,
-    user,
+    actorId,
     env,
     [
       ...taskCas(db, {
@@ -778,12 +793,12 @@ const taskPlan: Handler<v.InferOutput<typeof TaskPlan>> = async (db, user, env) 
 };
 
 /** `declaration` policy only: a succeeded Result for the current `scope_revision` must exist (§4.3). */
-const taskComplete: Handler<v.InferOutput<typeof TaskComplete>> = async (db, user, env) => {
+const taskComplete: TaskHandler<v.InferOutput<typeof TaskComplete>> = async (db, actorId, env) => {
   const { workspaceId, command } = env;
   await loadTask(db, workspaceId, command.taskId);
   const run = receipt(
     db,
-    user,
+    actorId,
     env,
     taskCas(db, {
       workspaceId,
@@ -825,7 +840,7 @@ const taskCancel: Handler<v.InferOutput<typeof TaskCancel>> = async (db, user, e
   await loadTask(db, workspaceId, command.taskId);
   const run = receipt(
     db,
-    user,
+    user.userId,
     env,
     taskCas(db, {
       workspaceId,
@@ -889,7 +904,7 @@ const jobStart: Handler<v.InferOutput<typeof JobStart>> = async (db, user, env) 
   const now = new Date().toISOString();
   const run = receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -1030,7 +1045,7 @@ const subscriptionCreate: Handler<SubscriptionCommand> = async (db, user, env) =
   const subscriptionId = crypto.randomUUID();
   return receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -1075,7 +1090,7 @@ const subscriptionUpdate: Handler<v.InferOutput<typeof SubscriptionUpdate>> = as
   const [setGuard, clearGuard] = guard(db);
   const run = receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -1131,7 +1146,7 @@ const subscriptionPause: Handler<v.InferOutput<typeof SubscriptionPause>> = asyn
   await loadSubscription(db, workspaceId, command.subscriptionId);
   return receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -1157,7 +1172,7 @@ const subscriptionDelete: Handler<v.InferOutput<typeof SubscriptionDelete>> = as
   await loadSubscription(db, workspaceId, command.subscriptionId);
   return receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -1212,7 +1227,7 @@ const integrationCreate: Handler<v.InferOutput<typeof IntegrationCreate>> = asyn
   const integrationId = crypto.randomUUID();
   return receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -1255,13 +1270,13 @@ const jobChanged = (state: string) =>
 const jobCancel: Handler<v.InferOutput<typeof JobCancel>> = async (db, user, env) => {
   const { workspaceId, command } = env;
   const job = await loadJob(db, workspaceId, command.jobId);
-  const waiting = job.state === "queued" || job.state === "waiting_device";
+  const waiting = ["queued", "waiting_device", "waiting_input"].includes(job.state);
   if (!waiting && job.state !== "active") throw jobChanged(job.state);
   const now = new Date().toISOString();
   const [setGuard, clearGuard] = guard(db);
   const run = receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -1338,7 +1353,7 @@ const jobResolve: Handler<v.InferOutput<typeof JobResolve>> = async (db, user, e
   const [setGuard, clearGuard] = guard(db);
   const run = receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -1414,7 +1429,7 @@ const routineCreate: Handler<v.InferOutput<typeof RoutineCreate>> = async (db, u
   const nextFireAt = firstFireAt(command.schedule, Date.now());
   return receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -1458,7 +1473,7 @@ const routineUpdate: Handler<v.InferOutput<typeof RoutineUpdate>> = async (db, u
   const [setGuard, clearGuard] = guard(db);
   const run = receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -1504,7 +1519,7 @@ const routinePause: Handler<v.InferOutput<typeof RoutinePause>> = async (db, use
   await loadRoutine(db, workspaceId, command.routineId);
   return receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -1526,7 +1541,7 @@ const routineResume: Handler<v.InferOutput<typeof RoutineResume>> = async (db, u
   const nextFireAt = firstFireAt(JSON.parse(current.schedule) as RoutineSchedule, Date.now());
   return receipt(
     db,
-    user,
+    user.userId,
     env,
     [
       db
@@ -1549,7 +1564,7 @@ const routineRun: Handler<v.InferOutput<typeof RoutineRun>> = async (db, user, e
   const occurrence = occurrenceStatements(db, routine, scheduledAt);
   return receipt(
     db,
-    user,
+    user.userId,
     env,
     occurrence.statements,
     {
@@ -1573,10 +1588,10 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "agent.send": agentSend,
   "event.emit": eventEmit,
   "project.create": projectCreate,
-  "task.create": taskCreate,
-  "task.assign": taskAssign,
-  "task.plan": taskPlan,
-  "task.complete": taskComplete,
+  "task.create": (db, user, env) => taskCreate(db, user.userId, env),
+  "task.assign": (db, user, env) => taskAssign(db, user.userId, env),
+  "task.plan": (db, user, env) => taskPlan(db, user.userId, env),
+  "task.complete": (db, user, env) => taskComplete(db, user.userId, env),
   "task.cancel": taskCancel,
   "job.start": jobStart,
   "subscription.create": subscriptionCreate,
@@ -1601,4 +1616,289 @@ export const runCommand = (db: D1Database, principal: Principal, envelope: Envel
     throw new HttpError("FORBIDDEN", "not a member of this workspace");
   }
   return (handlers[type] as Handler<Command>)(db, principal, envelope);
+};
+
+// ---------------------------------------- Run commands (docs/architecture.md §8, §18.2)
+// `POST /v1/run/commands` with a Run capability. The sender is the Run's Bot; the receipt is keyed by the Run.
+
+export const RunEnvelope = commandEnvelope(RunCommand);
+type RunEnvelopeValue = v.InferOutput<typeof RunEnvelope>;
+type Run = Extract<Principal, { kind: "run" }>;
+type RunHandler<T extends RunEnvelopeValue["command"]> = (
+  db: D1Database,
+  run: Run,
+  envelope: RunEnvelopeValue & { command: T },
+) => Promise<{ status: number; response: unknown; scopes?: string[] }>;
+
+/** docs/roadmap.md §1: max 4 hops / 20 correlated Jobs per bot-to-bot chain. Bots cannot raise them. */
+export const maxHops = 4;
+export const maxCorrelatedJobs = 20;
+
+const requireScope = (run: Run, scope: string) => {
+  if (!run.scopes.includes(scope)) throw new HttpError("FORBIDDEN", `capability lacks ${scope}`);
+};
+
+/** The private conversation of two Bots and its member-less backing Channel share this id (schema.ts). */
+const botPairId = (a: string, b: string) => `botpair:${[a, b].toSorted().join(":")}`;
+
+const chainLimit = (message: string, reason: string) =>
+  new HttpError("INVALID_INPUT", message, false, reason);
+
+/**
+ * Bot → Bot (§8): Message in the pair's conversation, Event, recipient Inbox item and Outbox in one batch; the pump
+ * routes it like a user's agent.send (a `request` wakes the recipient with a Job carrying the chain's correlation).
+ */
+const runAgentSend: RunHandler<v.InferOutput<typeof RunAgentSend>> = async (db, run, env) => {
+  requireScope(run, "agent.send");
+  const { workspaceId, command } = env;
+  const recipient = await db
+    .prepare(
+      `SELECT id FROM bots WHERE workspace_id = ? AND ${command.recipientBotId ? "id" : "name"} = ?`,
+    )
+    .bind(workspaceId, command.recipientBotId ?? command.recipientBotName)
+    .first<{ id: string }>();
+  if (!recipient) throw new HttpError("NOT_FOUND", "bot not found");
+  if (recipient.id === run.botId) throw chainLimit("a bot cannot message itself", "self_send");
+  const hop = run.hop + 1;
+  if (hop > maxHops) throw chainLimit(`bot-to-bot chain exceeds ${maxHops} hops`, "hop_limit");
+  const request = command.message.kind === "request";
+  if (request) {
+    // ponytail: checked before the batch, so concurrent requests of one chain can overshoot by a few Jobs.
+    const related = await db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM jobs WHERE workspace_id = ? AND (correlation_id = ? OR id = ?)",
+      )
+      .bind(workspaceId, run.correlationId, run.correlationId)
+      .first<{ n: number }>();
+    if ((related?.n ?? 0) >= maxCorrelatedJobs) {
+      throw chainLimit(`bot-to-bot chain exceeds ${maxCorrelatedJobs} jobs`, "budget_exceeded");
+    }
+  }
+  const conversationId = botPairId(run.botId, recipient.id);
+  if (command.replyToMessageId) {
+    const earlier = await db
+      .prepare("SELECT 1 FROM messages WHERE workspace_id = ? AND id = ? AND conversation_id = ?")
+      .bind(workspaceId, command.replyToMessageId, conversationId)
+      .first();
+    if (!earlier) {
+      throw new HttpError("INVALID_INPUT", "replyToMessageId is not in this bot conversation");
+    }
+  }
+  const receivedAt = new Date().toISOString();
+  const messageId = crypto.randomUUID();
+  const eventId = crypto.randomUUID();
+  const inboxItemId = crypto.randomUUID();
+  const delivery = request ? "wake" : "notify";
+  const scope = `workspace:${workspaceId}`;
+  const response: RunAgentSendAccepted = {
+    operationId: env.operationId,
+    status: "accepted",
+    messageId,
+    conversationId,
+    inboxItemId,
+    hop,
+  };
+  return receipt(
+    db,
+    run.runId,
+    env as unknown as Envelope,
+    [
+      db
+        .prepare(
+          "INSERT INTO channels (id, workspace_id, name) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(conversationId, workspaceId, conversationId),
+      db
+        .prepare(
+          `INSERT INTO conversations (id, workspace_id, channel_id, kind) VALUES (?, ?, ?, 'bot_pair')
+           ON CONFLICT DO NOTHING`,
+        )
+        .bind(conversationId, workspaceId, conversationId),
+      insertMessage(db, {
+        id: messageId,
+        workspaceId,
+        conversationId,
+        actorId: run.botActorId,
+        clientMessageId: env.idempotencyKey,
+        body: command.message.text,
+        kind: command.message.kind,
+        hop,
+        replyToMessageId: command.replyToMessageId,
+        jobId: run.jobId,
+      }),
+      insertEvent(db, {
+        id: eventId,
+        workspaceId,
+        type: "agent.message.sent",
+        schemaVersion: 1,
+        sourceKind: "bot",
+        actorKind: "bot",
+        actorId: run.botId,
+        subjectKind: "message",
+        subjectId: messageId,
+        // `channelId: null` routes into the conversation's lane with a workspace-wide scope (pump.ts).
+        data: {
+          messageId,
+          kind: command.message.kind,
+          recipientBotId: recipient.id,
+          channelId: null,
+          conversationId,
+          inboxItemId,
+          delivery,
+          hop,
+        },
+        correlationId: run.correlationId,
+        occurredAt: receivedAt,
+        receivedAt,
+      }),
+      insertInboxItem(db, {
+        id: inboxItemId,
+        workspaceId,
+        inputId: eventId,
+        botId: recipient.id,
+        conversationId,
+        lane: conversationId,
+        purpose: "agent.send",
+        deliveryMode: delivery,
+        hop,
+      }),
+      enqueueOutbox(db, { workspaceId, topic: "event.route", payload: { eventId } }),
+    ],
+    response,
+    [
+      { entityKind: "conversation", entityId: conversationId, scope },
+      { entityKind: "message", entityId: messageId, scope },
+      { entityKind: "inbox_item", entityId: inboxItemId, scope },
+    ],
+  );
+};
+
+/**
+ * The response to a request this Run's Bot received (§8.1): Message with `reply_to_message_id`, an Inbox item for the
+ * requester and, when the requester's Job is waiting for it, that Job back to `queued` for a successor Run (§8.2).
+ * A reply that arrives before the requester's Run ends is picked up by its `waiting` result (finishRun).
+ */
+const runAgentReply: RunHandler<v.InferOutput<typeof AgentReply>> = async (db, run, env) => {
+  requireScope(run, "agent.reply");
+  const { workspaceId, command } = env;
+  const request = await db
+    .prepare(
+      `SELECT m.id, m.conversation_id, m.job_id, j.bot_id FROM messages m
+         JOIN jobs j ON j.workspace_id = m.workspace_id AND j.id = m.job_id
+        WHERE m.workspace_id = ? AND m.id = ? AND m.kind = 'request'
+          AND EXISTS (SELECT 1 FROM inbox_items i JOIN events e ON e.workspace_id = i.workspace_id AND e.id = i.input_id
+                       WHERE i.workspace_id = m.workspace_id AND i.bot_id = ?
+                         AND e.subject_kind = 'message' AND e.subject_id = m.id)`,
+    )
+    .bind(workspaceId, command.requestMessageId, run.botId)
+    .first<{ id: string; conversation_id: string; job_id: string; bot_id: string }>();
+  if (!request) throw new HttpError("NOT_FOUND", "no bot request to this bot with that id");
+  const messageId = crypto.randomUUID();
+  const inboxItemId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const scope = `workspace:${workspaceId}`;
+  const response: AgentReplyAccepted = {
+    operationId: env.operationId,
+    status: "accepted",
+    messageId,
+    inboxItemId,
+  };
+  return receipt(
+    db,
+    run.runId,
+    env as unknown as Envelope,
+    [
+      insertMessage(db, {
+        id: messageId,
+        workspaceId,
+        conversationId: request.conversation_id,
+        actorId: run.botActorId,
+        clientMessageId: env.idempotencyKey,
+        body: command.text,
+        kind: "response",
+        hop: run.hop,
+        replyToMessageId: request.id,
+        jobId: run.jobId,
+      }),
+      insertInboxItem(db, {
+        id: inboxItemId,
+        workspaceId,
+        inputId: messageId,
+        botId: request.bot_id,
+        conversationId: request.conversation_id,
+        lane: request.conversation_id,
+        purpose: "agent.reply",
+        deliveryMode: "wake",
+        hop: run.hop,
+      }),
+      // Not guarded: the requester may still be running (then its `waiting` result sees this reply).
+      db
+        .prepare(
+          `UPDATE jobs SET state = 'queued', revision = revision + 1, updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND state = 'waiting_input' AND waiting_for_message_id = ?`,
+        )
+        .bind(now, workspaceId, request.job_id, request.id),
+    ],
+    response,
+    [
+      { entityKind: "message", entityId: messageId, scope },
+      { entityKind: "inbox_item", entityId: inboxItemId, scope },
+      { entityKind: "job", entityId: request.job_id, scope },
+    ],
+  );
+};
+
+const taskHandlers = {
+  "task.create": taskCreate,
+  "task.assign": taskAssign,
+  "task.plan": taskPlan,
+  "task.complete": taskComplete,
+} as const;
+
+/** Task writes need `task.write` and stay inside the Project of the Run's own Task (403 otherwise). */
+const runTaskCommand = async (
+  db: D1Database,
+  run: Run,
+  env: RunEnvelopeValue & { command: { type: keyof typeof taskHandlers } },
+) => {
+  requireScope(run, "task.write");
+  const { workspaceId, command } = env as unknown as Envelope & {
+    command: Extract<Command, { type: keyof typeof taskHandlers }>;
+  };
+  let projectId: string | null = null;
+  if (command.type !== "task.create") {
+    projectId = (await loadTask(db, workspaceId, command.taskId)).project_id;
+  } else if (command.projectKey) {
+    projectId =
+      (
+        await db
+          .prepare("SELECT id FROM projects WHERE workspace_id = ? AND key = ?")
+          .bind(workspaceId, command.projectKey)
+          .first<{ id: string }>()
+      )?.id ?? null;
+  } else if (command.parentTaskId) {
+    projectId = (await loadTask(db, workspaceId, command.parentTaskId)).project_id;
+  }
+  if (!run.taskProjectId || projectId !== run.taskProjectId) {
+    throw new HttpError("FORBIDDEN", "a run may only write tasks of its own task's project");
+  }
+  return (taskHandlers[command.type] as TaskHandler<Command>)(
+    db,
+    run.runId,
+    env as unknown as Envelope,
+  );
+};
+
+export const runRunCommand = (db: D1Database, run: Run, envelope: RunEnvelopeValue) => {
+  if (envelope.workspaceId !== run.workspaceId) {
+    throw new HttpError("FORBIDDEN", "capability is for another workspace");
+  }
+  const { command } = envelope;
+  if (command.type === "agent.send") {
+    return runAgentSend(db, run, envelope as RunEnvelopeValue & { command: typeof command });
+  }
+  if (command.type === "agent.reply") {
+    return runAgentReply(db, run, envelope as RunEnvelopeValue & { command: typeof command });
+  }
+  return runTaskCommand(db, run, envelope as RunEnvelopeValue & { command: typeof command });
 };

@@ -180,13 +180,20 @@ export const channelMembers = sqliteTable(
   ],
 );
 
-/** current state. Phase 1: one main conversation per channel. */
+/**
+ * current state. A Channel's one main conversation, or (`kind = 'bot_pair'`) the private conversation of two Bots
+ * (docs/architecture.md §8.1). A bot pair is backed by a Channel row without members, so it is in no user's channel
+ * list; both rows use the id `botpair:<botId>:<botId>` (sorted) and are created by the first message. Not a nullable
+ * `channel_id`: rebuilding this table fails on D1 once messages reference it (FKs cannot be switched off).
+ */
 export const conversations = sqliteTable(
   "conversations",
   {
     id: text("id").primaryKey(),
     workspaceId: workspaceId(),
     channelId: text("channel_id").notNull(),
+    // `channel` | `bot_pair`. No CHECK: added by ALTER TABLE.
+    kind: text("kind").notNull().default("channel"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -210,6 +217,13 @@ export const messages = sqliteTable(
     actorId: text("actor_id").notNull(),
     clientMessageId: text("client_message_id").notNull(),
     body: text("body").notNull(),
+    // Bot-to-bot messaging (docs/architecture.md §8). `kind` is request / response / notification (null for plain
+    // channel posts); `hop` counts bot-to-bot steps; `job_id` is the sending Run's Job. No CHECK / FK: added by
+    // ALTER TABLE (see jobs.task_id).
+    kind: text("kind"),
+    hop: integer("hop").notNull().default(0),
+    replyToMessageId: text("reply_to_message_id"),
+    jobId: text("job_id"),
     createdAt: createdAt(),
   },
   (t) => [
@@ -493,6 +507,8 @@ export const inboxItems = sqliteTable(
       .default("wake"),
     // `batch` items: the Inbox batch they joined. Single-column FK: added by ALTER TABLE (see jobs.task_id).
     batchId: text("batch_id").references((): AnySQLiteColumn => inboxBatches.id),
+    // The input message's bot-to-bot hop (docs/architecture.md §8.2); a Run's capability inherits its trigger item's.
+    hop: integer("hop").notNull().default(0),
     state: text("state", { enum: inboxStates }).notNull().default("pending"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
@@ -711,12 +727,17 @@ export const jobs = sqliteTable(
     taskId: text("task_id").references((): AnySQLiteColumn => tasks.id),
     // job.cancel (§9.3): a request, not a stop. An active Job stays active until its Run stops.
     cancelRequestedAt: text("cancel_requested_at"),
+    // Bot-to-bot chain (§8.2): Jobs caused by one originating request share it; capped at 20 per correlation.
+    correlationId: text("correlation_id"),
+    // `waiting_input`: the request message whose reply re-queues the Job.
+    waitingForMessageId: text("waiting_for_message_id"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
   (t) => [
     scoped(t),
     unique().on(t.workspaceId, t.triggerKey),
+    index("jobs_correlation").on(t.workspaceId, t.correlationId),
     oneOf("jobs_state", t.state, jobStates),
     foreignKey({ columns: [t.workspaceId, t.botId], foreignColumns: [bots.workspaceId, bots.id] }),
   ],
@@ -810,6 +831,30 @@ export const executions = sqliteTable(
       columns: [t.workspaceId, t.taskId],
       foreignColumns: [tasks.workspaceId, tasks.id],
     }),
+  ],
+);
+
+/**
+ * current state (docs/architecture.md §18.2). A Run's capability: what its Bot may do through `/v1/run/*`, valid while
+ * the Run is active at this generation and until `expires_at` (lease expiry + 5 min, extended on renew). Only
+ * SHA-256 of the secret is stored. Revoked when the Run submits its result.
+ */
+export const runCapabilities = sqliteTable(
+  "run_capabilities",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    runId: text("run_id").notNull(),
+    executionGeneration: integer("execution_generation").notNull(),
+    tokenHash: text("token_hash").notNull().unique(),
+    scopes: text("scopes", { mode: "json" }).notNull(),
+    expiresAt: text("expires_at").notNull(),
+    revokedAt: text("revoked_at"),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index("run_capabilities_run").on(t.runId),
+    foreignKey({ columns: [t.workspaceId, t.runId], foreignColumns: [runs.workspaceId, runs.id] }),
   ],
 );
 

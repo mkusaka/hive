@@ -29,10 +29,21 @@ adapter and submits the result. Providers: `claude` (Claude Agent SDK) and `fake
 
 - **Prompt.** `systemPrompt` = "You are <bot name>, a bot in a hive workspace." plus the Bot's `instructions`. The
   user message = the Task (if any), the Conversation's recent messages (oldest first) and the trigger item's body.
-- **No tools by default.** `tools: []`, `allowedTools: []`, `permissionMode: "dontAsk"`, `settingSources: []`
-  (no user / project settings, hooks or CLAUDE.md), `mcpServers: {}` with `strictMcpConfig`, `maxTurns: 4`,
-  `cwd` = `<state-dir>/runs/<runId>`. Organization-managed plugins and bundled skills still load (seen in
-  `system/init`), but no tool can be called.
+- **Only the hive tools.** `tools: []` (no built-in tools), `permissionMode: "dontAsk"`, `settingSources: []`
+  (no user / project settings, hooks or CLAUDE.md), `strictMcpConfig`, `maxTurns: 4`, `cwd` =
+  `<state-dir>/runs/<runId>`. With a Run capability, `mcpServers: {hive}` is an in-process SDK MCP server
+  (`src/tools.ts`) and `allowedTools` lists exactly its tools; without one (a Run resumed after a restart: the token
+  is returned once and not journaled) there are no tools.
+- **Hive tools.** `hive_send_request {botId | botName, text}`, `hive_notify {botId | botName, text}`,
+  `hive_wait_for_reply {requestMessageId}`, `hive_reply {text}` (only when the trigger item is a request from another
+  Bot), `hive_task_get {taskId}` and `hive_task_update {status?: "completed", assignee?}` (only for a Task Job). They
+  call `/v1/run/*` with the capability (`cloud.forRun`); the token never enters a prompt. Inputs are Zod shapes,
+  which the SDK turns into the model's JSON Schema and validates before a handler runs. A cloud error comes back
+  as tool text with `isError`, never as an exception in the SDK loop.
+- **Waiting.** When the tool result of `hive_wait_for_reply` appears in the stream, the adapter aborts the query
+  (no further model turn is spent) and exits with `waitingFor`; the runner submits `state: "waiting"` and the Job
+  waits in the cloud without holding the executor. The successor Run's prompt holds the original request and
+  "Replies to your requests". A Bot's final text is posted only into a Channel conversation, not a bot pair.
 - **Transcript journal.** Every SDK message is appended to `<state-dir>/transcripts/<runId>.jsonl` and fsynced
   before it is processed (§13.3: a durable local journal outside the SDK config dir). The SDK also keeps its own
   session files under `CLAUDE_CONFIG_DIR`.
@@ -82,7 +93,8 @@ loop claim new Jobs.
 ## Tests
 
 `bun run test` from the repo root. `test/runner.test.ts` runs in Node against an in-memory cloud;
-`test/claude.test.ts` drives the Claude adapter with a fake `queryFn` (SDK message shapes, no subprocess); the end-to-end
+`test/claude.test.ts` drives the Claude adapter with a fake `queryFn` (SDK message shapes, no subprocess);
+`test/tools.test.ts` covers the hive tools and the `waiting` exit; the end-to-end
 loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (workerd).
 
 ## Known gaps
@@ -91,7 +103,8 @@ loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (
   resume idempotent adapters.
 - No R2 upload of transcripts or artifacts (the JSONL transcript stays local); no SessionStore adapter (G-07), so
   no cross-device resume.
-- No tools / permission broker: the Claude provider answers without tools. No Codex adapter.
+- No permission broker beyond the hive tools; no Codex adapter. A Run resumed by reconcile has no capability, so no
+  hive tools.
 - Only `runtime.run.started` and `runtime.run.stopped` are observed; no usage / cost or other runtime events are
   sent to the cloud. The fake adapter sends no `runtime.run.started`, so its Runs stay `starting`.
 - Stop confirmation trusts the in-process adapter: with a real process supervisor it must check the process (PID +

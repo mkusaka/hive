@@ -5,34 +5,38 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 
 ## Routes
 
-| Route                                                           | Auth                                   | Purpose                                                                                        |
-| --------------------------------------------------------------- | -------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `GET /healthz`                                                  | none                                   | Liveness                                                                                       |
-| `GET /v1/me`                                                    | Access assertion (user)                | Returns the user principal (CLI login check)                                                   |
-| `POST /v1/commands`                                             | Access assertion (user)                | Command intake (see below)                                                                     |
-| `GET /v1/operations/:id`                                        | Access assertion (user)                | Receipt of the user's command; for `agent.send` also the inbox item, routing status and Job id |
-| `GET /v1/jobs/:id`                                              | Access assertion (user)                | A Job in one of the user's Workspaces, with `cancelRequestedAt` and its root `runs`            |
-| `GET /v1/inbox?botId=`                                          | Access assertion (user)                | The Bot's inbox items (first 100, no cursor yet)                                               |
-| `GET /v1/channels?workspaceId=`                                 | Access assertion (user)                | Channels the user is a member of, with the main `conversationId` (max 500)                     |
-| `GET /v1/channels/:id/messages`                                 | Access assertion (user)                | Newest-first messages of a member channel (limit 1..200, default 50; 404 if not a member)      |
-| `GET /v1/bots?workspaceId=`                                     | Access assertion (user)                | Bots of the Workspace (max 500)                                                                |
-| `GET /v1/devices?workspaceId=`                                  | Access assertion (user)                | Devices of the Workspace, no credentials (max 500)                                             |
-| `GET /v1/jobs?limit=&state=`                                    | Access assertion (user)                | Newest-first Jobs (limit 1..200, default 50), optionally of one state                          |
-| `GET /v1/routines?workspaceId=`                                 | Access assertion (user)                | Routines of the Workspace with their schedule (max 500); see Routines below                    |
-| `GET /v1/projects?workspaceId=`                                 | Access assertion (user)                | Projects of the Workspace (max 500)                                                            |
-| `GET /v1/tasks?workspaceId=&projectKey=&status=`                | Access assertion (user)                | Tasks with computed `display` and `prerequisites` (max 500); see Work below                    |
-| `GET /v1/tasks/:id`                                             | Access assertion (user)                | A Task with prerequisites, dependents, Results and Jobs                                        |
-| `GET /v1/subscriptions?workspaceId=`                            | Access assertion (user)                | Subscriptions of the Workspace with their spec (max 500); see Subscriptions below              |
-| `GET /v1/sync/changes?cursor=`                                  | Access assertion (user)                | Permitted changes after the cursor (limit 1..500, default 100); see Sync below                 |
-| `GET /v1/realtime?workspaceId=`                                 | Access assertion, or device Bearer     | WebSocket upgrade to the Workspace's Realtime DO; see Realtime below                           |
-| `GET /v1/executor/me`                                           | `Authorization: Bearer <device-token>` | Returns the device principal                                                                   |
-| `POST /v1/executor/pump`                                        | `Authorization: Bearer <device-token>` | Runs the outbox pump and time-driven work once; returns counts (see Outbox pump)               |
-| `POST /v1/executor/commands`                                    | `Authorization: Bearer <device-token>` | Executor command intake (see below)                                                            |
-| `POST /v1/executor/heartbeat`                                   | `Authorization: Bearer <device-token>` | Sets `devices.last_heartbeat_at` and requeues its `waiting_device` Jobs (no receipt)           |
-| `GET /v1/executor/jobs?state=queued&limit=`                     | `Authorization: Bearer <device-token>` | Queued Jobs in the device's Workspace it is eligible for (limit 1..100, default 50)            |
-| `GET /v1/executor/runs/:id`                                     | `Authorization: Bearer <device-token>` | The device's own Run: state, generation, `active` (startup reconcile)                          |
-| `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=` | `Authorization: Bearer <device-token>` | Run context for the adapter's prompt (see Executor commands)                                   |
-| `POST /v1/executor/observations`                                | `Authorization: Bearer <device-token>` | Runtime observations: `runtime.run.started`, `runtime.run.stopped`                             |
+| Route                                                           | Auth                                   | Purpose                                                                                         |
+| --------------------------------------------------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `GET /healthz`                                                  | none                                   | Liveness                                                                                        |
+| `GET /v1/me`                                                    | Access assertion (user)                | Returns the user principal (CLI login check)                                                    |
+| `POST /v1/commands`                                             | Access assertion (user)                | Command intake (see below)                                                                      |
+| `GET /v1/operations/:id`                                        | Access assertion (user)                | Receipt of the user's command; for `agent.send` also the inbox item, routing status and Job id  |
+| `GET /v1/jobs/:id`                                              | Access assertion (user)                | A Job in one of the user's Workspaces, with `cancelRequestedAt` and its root `runs`             |
+| `GET /v1/inbox?botId=`                                          | Access assertion (user)                | The Bot's inbox items (first 100, no cursor yet)                                                |
+| `GET /v1/channels?workspaceId=`                                 | Access assertion (user)                | Channels the user is a member of, with the main `conversationId` (max 500)                      |
+| `GET /v1/channels/:id/messages`                                 | Access assertion (user)                | Newest-first messages of a member channel (limit 1..200, default 50; 404 if not a member)       |
+| `GET /v1/bots?workspaceId=`                                     | Access assertion (user)                | Bots of the Workspace (max 500)                                                                 |
+| `GET /v1/bot-conversations?workspaceId=`                        | Access assertion (user)                | `bot_pair` conversations with both Bots and their last 20 messages (max 100); see Bot messaging |
+| `GET /v1/devices?workspaceId=`                                  | Access assertion (user)                | Devices of the Workspace, no credentials (max 500)                                              |
+| `GET /v1/jobs?limit=&state=`                                    | Access assertion (user)                | Newest-first Jobs (limit 1..200, default 50), optionally of one state                           |
+| `GET /v1/routines?workspaceId=`                                 | Access assertion (user)                | Routines of the Workspace with their schedule (max 500); see Routines below                     |
+| `GET /v1/projects?workspaceId=`                                 | Access assertion (user)                | Projects of the Workspace (max 500)                                                             |
+| `GET /v1/tasks?workspaceId=&projectKey=&status=`                | Access assertion (user)                | Tasks with computed `display` and `prerequisites` (max 500); see Work below                     |
+| `GET /v1/tasks/:id`                                             | Access assertion (user)                | A Task with prerequisites, dependents, Results and Jobs                                         |
+| `GET /v1/subscriptions?workspaceId=`                            | Access assertion (user)                | Subscriptions of the Workspace with their spec (max 500); see Subscriptions below               |
+| `GET /v1/sync/changes?cursor=`                                  | Access assertion (user)                | Permitted changes after the cursor (limit 1..500, default 100); see Sync below                  |
+| `GET /v1/realtime?workspaceId=`                                 | Access assertion, or device Bearer     | WebSocket upgrade to the Workspace's Realtime DO; see Realtime below                            |
+| `POST /v1/run/commands`                                         | `Authorization: Bearer cap.<run>.<s>`  | Run command intake for the in-run hive tools; see Bot messaging                                 |
+| `GET /v1/run/me`                                                | `Authorization: Bearer cap.<run>.<s>`  | The Run principal (`RunPrincipal`)                                                              |
+| `GET /v1/run/tasks/:id`                                         | `Authorization: Bearer cap.<run>.<s>`  | A Task of the Run's own Task's Project (`task.read`; 403 otherwise)                             |
+| `GET /v1/executor/me`                                           | `Authorization: Bearer <device-token>` | Returns the device principal                                                                    |
+| `POST /v1/executor/pump`                                        | `Authorization: Bearer <device-token>` | Runs the outbox pump and time-driven work once; returns counts (see Outbox pump)                |
+| `POST /v1/executor/commands`                                    | `Authorization: Bearer <device-token>` | Executor command intake (see below)                                                             |
+| `POST /v1/executor/heartbeat`                                   | `Authorization: Bearer <device-token>` | Sets `devices.last_heartbeat_at` and requeues its `waiting_device` Jobs (no receipt)            |
+| `GET /v1/executor/jobs?state=queued&limit=`                     | `Authorization: Bearer <device-token>` | Queued Jobs in the device's Workspace it is eligible for (limit 1..100, default 50)             |
+| `GET /v1/executor/runs/:id`                                     | `Authorization: Bearer <device-token>` | The device's own Run: state, generation, `active` (startup reconcile)                           |
+| `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=` | `Authorization: Bearer <device-token>` | Run context for the adapter's prompt (see Executor commands)                                    |
+| `POST /v1/executor/observations`                                | `Authorization: Bearer <device-token>` | Runtime observations: `runtime.run.started`, `runtime.run.stopped`                              |
 
 - **User auth.** `Cf-Access-Jwt-Assertion` is verified with `jose` against
   `https://<ACCESS_TEAM_DOMAIN>/cdn-cgi/access/certs` (issuer `https://<ACCESS_TEAM_DOMAIN>`, audience
@@ -74,7 +78,8 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
   placement must allow the device (403 `FORBIDDEN`, `reason: "not_eligible"`). Then `claimJob` commits the Job CAS,
   root Run, Execution, reservations and receipt in one batch with a 90 s lease. `resourceKeys` defaults to
   `["bot:<botId>"]`, so one Bot runs one root Run at a time (a simplification of §7.3's per-binding concurrency).
-  Returns `{runId, executionId, executionGeneration, leaseExpiresAt, job: {id, botId, inboxItemId, placement}}`.
+  Returns `{runId, executionId, executionGeneration, leaseExpiresAt, capability, job: {id, botId, inboxItemId,
+placement}}` (capability: see Bot messaging).
   Failures: `stale_revision` / `already_claimed` → 409 `REVISION_CONFLICT`, `resource_busy` → 409 `RESOURCE_BUSY`;
   the error body carries `reason`. Job state is checked by the CAS, not before it, so a replay of a successful claim
   returns the stored response. A `waiting_device` Job is claimable like a `queued` one (the claiming device is
@@ -312,6 +317,39 @@ expired, parked}`; the last two count Workspaces.
 
 It runs from the `scheduled()` cron trigger (every minute) and from `POST /v1/executor/pump`.
 
+## Bot messaging
+
+Bot-to-bot requests (docs/architecture.md §8, §18.2; AT-03, AT-26, AT-29).
+
+- **Run capability.** `job.claim` also returns `capability: {token, expiresAt}` with `token = cap.<runId>.<secret>`;
+  `run_capabilities` stores SHA-256(secret), the generation, the scopes and `expires_at` = lease expiry + 5 min, in
+  the claim batch. Like a device token it is returned once: a replayed claim has `capability: null`. `run.lease.renew`
+  extends `expires_at`; `run.result.submit` revokes it. Auth (`auth/run.ts`) requires the hash, not revoked, not
+  expired and the Run still active at that generation; anything else is 401. Scopes: `agent.send`, `agent.reply`,
+  `task.read`, plus `task.write` for a Task Job. The principal's `hop` is its trigger item's, its `correlationId`
+  the Job's (or the Job id when it has none).
+- **`POST /v1/run/commands`**, same envelope; the receipt is keyed by the Run.
+  - `agent.send {recipientBotId | recipientBotName, message: {kind: request | notification, text},
+replyToMessageId?}`. The sender is the Run's Bot. The message goes to the pair's private conversation
+    (`conversations.kind = 'bot_pair'`, id `botpair:<botId>:<botId>`, created by the first message), with
+    `hop = run hop + 1`, `job_id` = the Run's Job; an Event (correlation = the chain's), the recipient's Inbox item and
+    an Outbox row follow in the same batch, and the pump routes it like a user's `agent.send`: a `request` wakes the
+    recipient (Job with the same `correlation_id`), a `notification` is recorded only. 422: `self_send`,
+    `hop_limit` (hop > 4) and, for a request, `budget_exceeded` (20 Jobs already share the correlation).
+  - `agent.reply {requestMessageId, text}`: only the recipient of a Bot's request (404 otherwise). A `response`
+    message with `reply_to_message_id` in the same conversation, an Inbox item for the requester (`agent.reply`) and,
+    if its Job is `waiting_input` for that request, the Job back to `queued` (revision + 1).
+  - `task.create / assign / plan / complete`: the user handlers, only with `task.write` and inside the Project of the
+    Run's own Task (403 otherwise).
+- **Waiting (AT-29).** `run.result.submit {state: "waiting", waitingFor: {requestMessageId}}` (a request this Job sent;
+  422 `unknown_request` otherwise; 422 `already_replied` when the reply predates this Run, which would loop): the Run `succeeded`, Execution `finished`, reservations released, Job
+  `waiting_input` with `waiting_for_message_id`, or `queued` at once when the reply already arrived. Its Inbox items
+  stay pending. The successor Run (next claim, new generation) gets the original `inboxItem` plus `replies` in its
+  context; its final result settles the trigger item and the reply items.
+- **Why a backing Channel.** A bot pair is backed by a member-less Channel row with the same id instead of a nullable
+  `conversations.channel_id`: rebuilding `conversations` fails on D1 once messages reference it (D1 cannot switch
+  foreign keys off, and a renamed parent rewrites its children's REFERENCES). Its rows use the `workspace:<id>` scope.
+
 ## Known gaps
 
 - **No Queues yet.** The design (docs/architecture.md §6.1, §6.3) hands outbox rows to Cloudflare Queues and
@@ -351,6 +389,10 @@ It runs from the `scheduled()` cron trigger (every minute) and from `POST /v1/ex
   Routines (user principal only); `routine.update` cannot change the Bot, Conversation or Task. A Task Routine's
   Job carries the Task but does not move it to `in_progress` or check readiness like `job.start`. No sync change
   row when only `next_fire_at` advances.
+- **Bot messaging.** No `task.delegate` / delegation table, no approval for external effects, no reply policy or
+  deadline (a request nobody answers leaves the requester `waiting_input` until `job.cancel`), no per-conversation
+  token / time budget. The chain budget is checked before the batch, so concurrent requests can overshoot it
+  slightly. Limits are fixed at the roadmap defaults (no user setting yet).
 - **Bot channel membership.** `agent.send` does not require the recipient Bot to be a member of the channel;
   `bot.create` adds no membership.
 

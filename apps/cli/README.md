@@ -22,6 +22,8 @@ hive job get <job-id>
 hive job watch <job-id> [--timeout <s>]                # polls GET /v1/jobs/:id every 2 s
 hive inbox list --bot <bot-id>
 hive channel list | hive bot list | hive device list   # bootstrap lists of the workspace
+hive channel messages <channel-id>                     # newest-first messages of a member channel
+hive bot conversations                                 # private bot-to-bot conversations and their messages
 hive sync changes [--cursor <cursor>]                  # without --cursor: the bootstrap cursor
 hive executor run [--once] [--provider fake|claude]    # Local Executor with the stored token (default fake)
 hive project create --key <KEY> --name <name>

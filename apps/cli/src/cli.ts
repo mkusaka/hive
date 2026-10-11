@@ -203,9 +203,18 @@ const specs: Record<string, Spec> = {
     usage: "",
     run: async (c) => c.print(await cmd.listChannels(c.client(), c.workspace())),
   },
+  "channel messages": {
+    usage: "<channel-id>",
+    args: 1,
+    run: async (c) => c.print(await cmd.listMessages(c.client(), c.workspace(), c.args[0]!)),
+  },
   "bot list": {
     usage: "",
     run: async (c) => c.print(await cmd.listBots(c.client(), c.workspace())),
+  },
+  "bot conversations": {
+    usage: "",
+    run: async (c) => c.print(await cmd.listBotConversations(c.client(), c.workspace())),
   },
   "device list": {
     usage: "",

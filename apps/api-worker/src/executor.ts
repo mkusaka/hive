@@ -24,7 +24,9 @@ import {
   resumeWaitingJobs,
 } from "@hive/db";
 import type * as v from "valibot";
+import { hashSecret, newDeviceSecret } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
+import { capabilityExpiresAt, insertCapability } from "./auth/run.ts";
 import { HttpError } from "./errors.ts";
 
 export const ExecutorEnvelope = commandEnvelope(ExecutorCommand);
@@ -56,9 +58,10 @@ type JobRow = {
   revision: number;
   trigger_key: string;
   placement: string;
+  task_id: string | null;
   created_at: string;
 };
-const jobColumns = "id, bot_id, revision, trigger_key, placement, created_at";
+const jobColumns = "id, bot_id, revision, trigger_key, placement, task_id, created_at";
 
 const toQueuedJob = (row: JobRow): QueuedJob => ({
   id: row.id,
@@ -81,6 +84,10 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
   if (!row) throw new HttpError("NOT_FOUND", "job not found");
   const job = toQueuedJob(row);
   if (!eligible(job.placement, device.deviceId)) throw notEligible();
+  // The Run capability (§18.2) is committed with the claim. Task writes need a Task Job.
+  const secret = newDeviceSecret();
+  const tokenHash = await hashSecret(secret);
+  const scopes = ["agent.send", "agent.reply", "task.read", ...(row.task_id ? ["task.write"] : [])];
   // Job state is not checked here: the claim CAS decides, and a replay must reach the stored receipt.
   const result = await claimJob(db, {
     workspaceId,
@@ -90,6 +97,16 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
     leaseSeconds,
     resourceKeys: command.resourceKeys ?? [`bot:${job.botId}`],
     operationId: env.idempotencyKey,
+    statements: (claim) => [
+      insertCapability(db, {
+        workspaceId,
+        runId: claim.runId,
+        executionGeneration: claim.generation,
+        tokenHash,
+        scopes,
+        expiresAt: capabilityExpiresAt(claim.leaseExpiresAt),
+      }),
+    ],
   });
   if (!result.ok) {
     if (result.reason === "resource_busy") {
@@ -109,6 +126,13 @@ const jobClaim: Handler<v.InferOutput<typeof JobClaim>> = async (db, device, env
     executionId: result.executionId,
     executionGeneration: result.generation,
     leaseExpiresAt: result.leaseExpiresAt,
+    // Like a device token, the secret is returned once: a replayed claim has none (the run goes without tools).
+    capability: result.replayed
+      ? null
+      : {
+          token: `cap.${result.runId}.${secret}`,
+          expiresAt: capabilityExpiresAt(result.leaseExpiresAt),
+        },
     job: { id: job.id, botId: job.botId, inboxItemId: job.inboxItemId, placement: job.placement },
   };
   return { status: 200, response, scopes: [`workspace:${workspaceId}`] };
@@ -136,6 +160,10 @@ const runLeaseRenew: Handler<v.InferOutput<typeof RunLeaseRenew>> = async (db, d
     leaseSeconds,
   });
   if (!result.ok) throw staleGeneration();
+  await db
+    .prepare("UPDATE run_capabilities SET expires_at = ? WHERE run_id = ? AND revoked_at IS NULL")
+    .bind(capabilityExpiresAt(result.leaseExpiresAt), env.command.runId)
+    .run();
   const response: LeaseRenewed = {
     leaseExpiresAt: result.leaseExpiresAt,
     cancelRequested: await cancelRequested(db, env.workspaceId, env.command.runId),
@@ -143,25 +171,102 @@ const runLeaseRenew: Handler<v.InferOutput<typeof RunLeaseRenew>> = async (db, d
   return { status: 200, response };
 };
 
+/** The Run's capability ends with its result. */
+const revokeCapability = (db: D1Database, runId: string) =>
+  db
+    .prepare("UPDATE run_capabilities SET revoked_at = ? WHERE run_id = ? AND revoked_at IS NULL")
+    .bind(new Date().toISOString(), runId);
+
 /**
- * Run completion plus the Inbox outcome of the Job's trigger item, in `finishRun`'s batch (§11.1). A `failed` Run of
- * a Job with a cancel request finishes `cancelled` (Run and Job).
+ * `waiting` (§8.2, AT-29): the Run ends at a safe checkpoint, so it holds no slot or reservation while the other Bot
+ * works. Its Inbox items stay pending for the successor Run. `waitingFor` must be a request this Job sent.
+ */
+const submitWaiting = async (
+  db: D1Database,
+  device: Device,
+  env: Envelope & { command: v.InferOutput<typeof RunResultSubmit> },
+  requestMessageId: string,
+) => {
+  const { workspaceId, command } = env;
+  const request = await db
+    .prepare(
+      `SELECT 1 FROM messages m JOIN runs r ON r.workspace_id = m.workspace_id AND r.job_id = m.job_id
+        WHERE r.id = ? AND r.workspace_id = ? AND m.id = ? AND m.kind = 'request'`,
+    )
+    .bind(command.runId, workspaceId, requestMessageId)
+    .first();
+  if (!request) {
+    throw new HttpError(
+      "INVALID_INPUT",
+      "waitingFor must be a request message this job sent",
+      false,
+      "unknown_request",
+    );
+  }
+  // A reply older than this Run was already in its context: waiting again would re-queue the Job at once, forever.
+  // A reply that arrived while the Run worked is the race finishRun turns into an immediate `queued`.
+  const answered = await db
+    .prepare(
+      `SELECT 1 FROM messages m JOIN runs r ON r.id = ?
+        WHERE m.workspace_id = ? AND m.reply_to_message_id = ? AND m.created_at < r.created_at`,
+    )
+    .bind(command.runId, workspaceId, requestMessageId)
+    .first();
+  if (answered) {
+    throw new HttpError(
+      "INVALID_INPUT",
+      "that request was already answered before this run",
+      false,
+      "already_replied",
+    );
+  }
+  const result = await finishRun(db, {
+    runId: command.runId,
+    deviceId: device.deviceId,
+    executionGeneration: command.executionGeneration,
+    state: "succeeded",
+    summary: command.summary,
+    waitingFor: requestMessageId,
+    operationId: env.idempotencyKey,
+    statements: [revokeCapability(db, command.runId)],
+  });
+  if (!result.ok) throw staleGeneration();
+  const response: RunResultAccepted = { ok: true };
+  return { status: 200, response, scopes: [`workspace:${workspaceId}`] };
+};
+
+/**
+ * Run completion plus the Inbox outcome of the Job's input items, in `finishRun`'s batch (§11.1). A `failed` Run of
+ * a Job with a cancel request finishes `cancelled` (Run and Job); so does a `waiting` one.
  */
 const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (db, device, env) => {
   const { workspaceId, command } = env;
-  const state =
-    command.state === "failed" && (await cancelRequested(db, workspaceId, command.runId))
-      ? "cancelled"
-      : command.state;
+  if ((command.state === "waiting") !== (command.waitingFor !== undefined)) {
+    throw new HttpError(
+      "INVALID_INPUT",
+      "waitingFor is required with state waiting, and only then",
+    );
+  }
+  const cancel =
+    command.state !== "succeeded" && (await cancelRequested(db, workspaceId, command.runId));
+  if (command.waitingFor && !cancel) {
+    return submitWaiting(db, device, env, command.waitingFor.requestMessageId);
+  }
+  const state = cancel ? "cancelled" : (command.state as "succeeded" | "failed");
   // The Job's input items: its trigger item, or every member of its sealed Inbox batch (one lane, so one
-  // Conversation). The channel names their change scope; an item without a conversation is workspace-wide.
+  // Conversation), plus the replies to its requests (§8.2). The channel names an item's change scope; an item without
+  // a conversation is workspace-wide.
   const { results: items } = await db
     .prepare(
       `SELECT i.id, i.conversation_id, c.channel_id, b.actor_id FROM runs r
          JOIN jobs j ON j.workspace_id = r.workspace_id AND j.id = r.job_id
          JOIN bots b ON b.workspace_id = j.workspace_id AND b.id = j.bot_id
          JOIN inbox_items i ON i.workspace_id = j.workspace_id
-                           AND ('inbox:' || i.id = j.trigger_key OR i.batch_id = j.inbox_batch_id)
+                           AND ('inbox:' || i.id = j.trigger_key OR i.batch_id = j.inbox_batch_id
+                                OR (i.purpose = 'agent.reply' AND i.input_id IN (
+                                      SELECT m.id FROM messages m JOIN messages q
+                                          ON q.workspace_id = m.workspace_id AND q.id = m.reply_to_message_id
+                                       WHERE q.workspace_id = j.workspace_id AND q.job_id = j.id)))
          LEFT JOIN conversations c ON c.workspace_id = i.workspace_id AND c.id = i.conversation_id
         WHERE r.id = ? AND r.workspace_id = ?
         ORDER BY i.created_at, i.id`,
@@ -174,7 +279,9 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
       actor_id: string;
     }>();
   const item = items[0];
-  const itemScope = item?.channel_id ? `channel:${item.channel_id}` : `workspace:${workspaceId}`;
+  const scopeOf = (i: { channel_id: string | null } | undefined) =>
+    i?.channel_id ? `channel:${i.channel_id}` : `workspace:${workspaceId}`;
+  const itemScope = scopeOf(item);
   // Batch membership is fixed at seal, so the ids read here are the batch's.
   const inboxOutcome = db
     .prepare(
@@ -183,7 +290,7 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
     )
     // ponytail: schema state `processed` is the design's `handled` (§7.1); renaming needs a table rebuild.
     .bind(
-      command.state === "succeeded" ? "processed" : "failed",
+      state === "succeeded" ? "processed" : "failed",
       new Date().toISOString(),
       workspaceId,
       JSON.stringify(items.map((i) => i.id)),
@@ -206,7 +313,7 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
               `INSERT INTO task_results (id, workspace_id, task_id, execution_id, run_id, scope_revision, state, summary)
              SELECT ?, workspace_id, task_id, id, run_id, task_scope_revision, ?, ? FROM executions WHERE id = ?`,
             )
-            .bind(resultId, command.state, command.summary, execution.id),
+            .bind(resultId, state, command.summary, execution.id),
           appendChange(db, {
             workspaceId,
             entityKind: "task_result",
@@ -252,19 +359,24 @@ const runResultSubmit: Handler<v.InferOutput<typeof RunResultSubmit>> = async (d
       ...taskResult,
       ...replyMessage,
       inboxOutcome,
+      revokeCapability(db, command.runId),
       ...items.map((i) =>
         appendChange(db, {
           workspaceId,
           entityKind: "inbox_item",
           entityId: i.id,
-          scope: itemScope,
+          scope: scopeOf(i),
         }),
       ),
     ],
   });
   if (!result.ok) throw staleGeneration();
   const response: RunResultAccepted = { ok: true };
-  return { status: 200, response, scopes: [...new Set([`workspace:${workspaceId}`, itemScope])] };
+  return {
+    status: 200,
+    response,
+    scopes: [...new Set([`workspace:${workspaceId}`, ...items.map(scopeOf)])],
+  };
 };
 
 const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>> } = {
@@ -336,8 +448,9 @@ const fencedRun = async (
 };
 
 /**
- * Run context (SDK-01): Bot instructions, Task, recent Conversation and the trigger item's body, or for a batch Job
- * every member's body (its Conversation is the batch lane's).
+ * Run context (SDK-01): Bot instructions, Task, recent Conversation and the trigger item's body (with its sender
+ * Bot for a bot-to-bot message), or for a batch Job every member's body (its Conversation is the batch lane's), plus
+ * the replies to requests the Job sent (§8.2).
  */
 export const getRunContext = async (
   db: D1Database,
@@ -348,8 +461,9 @@ export const getRunContext = async (
   const workspaceId = device.workspaceIds[0];
   const row = await db
     .prepare(
-      `SELECT b.id AS bot_id, b.name, b.instructions, t.key, t.title, t.description, j.inbox_batch_id,
-              i.id AS item_id, i.conversation_id, c.channel_id,
+      `SELECT b.id AS bot_id, b.name, b.instructions, t.id AS task_id, t.key, t.title, t.description,
+              j.inbox_batch_id, i.id AS item_id, i.conversation_id, c.channel_id, c.kind AS conversation_kind,
+              m.id AS message_id, m.kind AS message_kind, fb.id AS from_bot_id, fb.name AS from_bot_name,
               COALESCE(m.body, CASE e.source_kind WHEN 'routine' THEN json_extract(e.data, '$.inputText') END,
                        e.data) AS body
          FROM jobs j
@@ -360,6 +474,7 @@ export const getRunContext = async (
          LEFT JOIN events e ON e.workspace_id = i.workspace_id AND e.id = i.input_id
          LEFT JOIN messages m ON m.workspace_id = e.workspace_id AND e.subject_kind = 'message'
                              AND m.id = e.subject_id
+         LEFT JOIN bots fb ON fb.workspace_id = e.workspace_id AND e.actor_kind = 'bot' AND fb.id = e.actor_id
         WHERE j.workspace_id = ? AND j.id = ?`,
     )
     .bind(workspaceId, input.jobId)
@@ -367,6 +482,7 @@ export const getRunContext = async (
       bot_id: string;
       name: string;
       instructions: string;
+      task_id: string | null;
       key: string | null;
       title: string | null;
       description: string | null;
@@ -374,6 +490,11 @@ export const getRunContext = async (
       item_id: string | null;
       conversation_id: string | null;
       channel_id: string | null;
+      conversation_kind: "channel" | "bot_pair" | null;
+      message_id: string | null;
+      message_kind: string | null;
+      from_bot_id: string | null;
+      from_bot_name: string | null;
       body: string | null;
     }>();
   if (!row) throw new HttpError("NOT_FOUND", "job not found");
@@ -381,7 +502,7 @@ export const getRunContext = async (
   if (row.inbox_batch_id) {
     const { results } = await db
       .prepare(
-        `SELECT i.id, i.conversation_id, c.channel_id, COALESCE(m.body, e.data) AS body
+        `SELECT i.id, i.conversation_id, c.channel_id, c.kind, COALESCE(m.body, e.data) AS body
            FROM inbox_items i
            LEFT JOIN conversations c ON c.workspace_id = i.workspace_id AND c.id = i.conversation_id
            LEFT JOIN events e ON e.workspace_id = i.workspace_id AND e.id = i.input_id
@@ -394,11 +515,13 @@ export const getRunContext = async (
         id: string;
         conversation_id: string | null;
         channel_id: string | null;
+        kind: "channel" | "bot_pair";
         body: string;
       }>();
     batch = { id: row.inbox_batch_id, items: results.map(({ id, body }) => ({ id, body })) };
     row.conversation_id = results[0]?.conversation_id ?? null;
     row.channel_id = results[0]?.channel_id ?? null;
+    row.conversation_kind = results[0]?.kind ?? null;
   }
   let conversation: RunContext["conversation"] = null;
   if (row.conversation_id && row.channel_id) {
@@ -415,18 +538,57 @@ export const getRunContext = async (
     conversation = {
       id: row.conversation_id,
       channelId: row.channel_id,
+      kind: row.conversation_kind ?? "channel",
       recent: results,
     };
   }
+  const { results: replies } = await db
+    .prepare(
+      `SELECT m.id, m.reply_to_message_id, b.id AS bot_id, b.name, m.body, m.created_at
+         FROM messages q
+         JOIN messages m ON m.workspace_id = q.workspace_id AND m.reply_to_message_id = q.id
+         JOIN bots b ON b.workspace_id = m.workspace_id AND b.actor_id = m.actor_id
+        WHERE q.workspace_id = ? AND q.job_id = ? AND q.kind = 'request'
+        ORDER BY m.created_at, m.id`,
+    )
+    .bind(workspaceId, input.jobId)
+    .all<{
+      id: string;
+      reply_to_message_id: string;
+      bot_id: string;
+      name: string;
+      body: string;
+      created_at: string;
+    }>();
   return {
     bot: { id: row.bot_id, name: row.name, instructions: row.instructions },
     task:
-      row.key === null
+      row.task_id === null
         ? null
-        : { key: row.key, title: row.title ?? "", description: row.description ?? "" },
+        : {
+            id: row.task_id,
+            key: row.key ?? "",
+            title: row.title ?? "",
+            description: row.description ?? "",
+          },
     conversation,
-    inboxItem: row.item_id ? { id: row.item_id, body: row.body ?? "" } : null,
+    inboxItem: row.item_id
+      ? {
+          id: row.item_id,
+          body: row.body ?? "",
+          messageId: row.message_id,
+          kind: row.message_kind,
+          fromBot: row.from_bot_id ? { id: row.from_bot_id, name: row.from_bot_name ?? "" } : null,
+        }
+      : null,
     batch,
+    replies: replies.map((r) => ({
+      messageId: r.id,
+      requestMessageId: r.reply_to_message_id,
+      fromBot: { id: r.bot_id, name: r.name },
+      body: r.body,
+      createdAt: r.created_at,
+    })),
   };
 };
 

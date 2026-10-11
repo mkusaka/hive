@@ -7,6 +7,7 @@ import type {
   JobClaimed,
   LeaseRenewed,
   QueuedJob,
+  RunCommand,
   RunContext,
   RunObservation,
 } from "@hive/contracts";
@@ -26,6 +27,12 @@ export class CloudError extends Error {
   }
 }
 
+/** `/v1/run/*` with a Run capability (§18.2): what the in-run hive tools call. */
+export type RunApi = {
+  command(body: RunCommand): Promise<Record<string, unknown>>;
+  getTask(taskId: string): Promise<Record<string, unknown>>;
+};
+
 export type CloudClient = {
   heartbeat(): Promise<void>;
   listQueuedJobs(limit: number): Promise<QueuedJob[]>;
@@ -34,7 +41,8 @@ export type CloudClient = {
   submitResult(input: {
     runId: string;
     executionGeneration: number;
-    state: "succeeded" | "failed";
+    state: "succeeded" | "failed" | "waiting";
+    waitingFor?: { requestMessageId: string };
     summary: string;
     error?: string;
     reply?: { conversationId: string; text: string };
@@ -46,6 +54,8 @@ export type CloudClient = {
     executionGeneration: number;
   }): Promise<RunContext>;
   observe(input: RunObservation): Promise<void>;
+  /** A client acting as the Run behind `capabilityToken`. */
+  forRun(capabilityToken: string): RunApi;
 };
 
 export const createCloudClient = ({
@@ -57,10 +67,15 @@ export const createCloudClient = ({
   token: string;
   fetch?: (input: URL, init: RequestInit) => Promise<Response>;
 }): CloudClient => {
-  const request = async <T>(method: "GET" | "POST", path: string, body?: unknown) => {
+  const request = async <T>(
+    method: "GET" | "POST",
+    path: string,
+    body?: unknown,
+    bearer: string = token,
+  ) => {
     const res = await fetchImpl(new URL(path, apiUrl), {
       method,
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const json: unknown = await res.json().catch(() => null);
@@ -128,5 +143,22 @@ export const createCloudClient = ({
     observe: async (input) => {
       await request("POST", "/v1/executor/observations", input);
     },
+    forRun: (capabilityToken) => ({
+      // A random key per call: each tool call is a new operation (the model retries by calling again).
+      command: async (body) =>
+        request(
+          "POST",
+          "/v1/run/commands",
+          {
+            operationId: crypto.randomUUID(),
+            idempotencyKey: crypto.randomUUID(),
+            workspaceId: await workspace(),
+            command: body,
+          },
+          capabilityToken,
+        ),
+      getTask: (taskId) =>
+        request("GET", `/v1/run/tasks/${encodeURIComponent(taskId)}`, undefined, capabilityToken),
+    }),
   };
 };

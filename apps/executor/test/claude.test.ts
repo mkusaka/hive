@@ -73,6 +73,7 @@ const launch = (overrides: Partial<LaunchContext> = {}): LaunchContext => ({
   executionGeneration: 1,
   inboxItemId: "inbox-1",
   context,
+  run: null,
   observe: async () => {},
   ...overrides,
 });

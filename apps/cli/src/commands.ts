@@ -62,6 +62,12 @@ const inWorkspace = (resource: string, workspaceId: string, query: Record<string
 export const listChannels = (c: Client, workspaceId: string) =>
   c.get(inWorkspace("channels", workspaceId));
 export const listBots = (c: Client, workspaceId: string) => c.get(inWorkspace("bots", workspaceId));
+/** Newest first (`limit` default 50). */
+export const listMessages = (c: Client, workspaceId: string, channelId: string) =>
+  c.get(inWorkspace(`channels/${encodeURIComponent(channelId)}/messages`, workspaceId));
+/** Private bot-to-bot conversations with their last messages. */
+export const listBotConversations = (c: Client, workspaceId: string) =>
+  c.get(inWorkspace("bot-conversations", workspaceId));
 export const listDevices = (c: Client, workspaceId: string) =>
   c.get(inWorkspace("devices", workspaceId));
 /** No cursor: the bootstrap cursor (§12.3). */

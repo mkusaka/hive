@@ -109,6 +109,43 @@ export const listBots = async (db: D1Database, workspaceId: string) => {
   return { bots: results };
 };
 
+/** `bot_pair` conversations (§8.1) with both Bots and their last 20 messages, oldest first (max 100). */
+export const listBotConversations = async (db: D1Database, workspaceId: string) => {
+  const { results } = await db
+    .prepare(
+      `SELECT id, created_at AS createdAt FROM conversations
+        WHERE workspace_id = ? AND kind = 'bot_pair' ORDER BY created_at DESC, id LIMIT 100`,
+    )
+    .bind(workspaceId)
+    .all<{ id: string; createdAt: string }>();
+  const conversations = await Promise.all(
+    results.map(async (c) => {
+      const [bots, messages] = await Promise.all([
+        db
+          .prepare(
+            `SELECT id, name FROM bots WHERE workspace_id = ? AND id IN (SELECT value FROM json_each(?))
+              ORDER BY name`,
+          )
+          .bind(workspaceId, JSON.stringify(c.id.split(":").slice(1)))
+          .all(),
+        db
+          .prepare(
+            `SELECT * FROM (
+               SELECT m.id, m.seq, b.name AS bot, m.kind, m.hop, m.reply_to_message_id AS replyToMessageId,
+                      m.body, m.created_at AS createdAt
+                 FROM messages m LEFT JOIN bots b ON b.workspace_id = m.workspace_id AND b.actor_id = m.actor_id
+                WHERE m.workspace_id = ? AND m.conversation_id = ? ORDER BY m.seq DESC LIMIT 20
+             ) ORDER BY seq`,
+          )
+          .bind(workspaceId, c.id)
+          .all(),
+      ]);
+      return Object.assign(c, { bots: bots.results, messages: messages.results });
+    }),
+  );
+  return { conversations };
+};
+
 export const listDevices = async (db: D1Database, workspaceId: string) => {
   const { results } = await db
     .prepare(
@@ -203,6 +240,7 @@ const taskColumns = `t.id, t.workspace_id AS workspaceId, t.project_id AS projec
   t.created_at AS createdAt, t.updated_at AS updatedAt`;
 type TaskRow = {
   id: string;
+  projectId: string | null;
   status: string;
   assignee_kind: string | null;
   assignee_id: string | null;

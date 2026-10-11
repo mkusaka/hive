@@ -104,6 +104,8 @@ export type ClaimInput = {
   leaseSeconds: number;
   resourceKeys: string[];
   operationId: string;
+  /** Extra statements for the claim batch, e.g. the Run capability (§18.2). */
+  statements?: (claim: Claim) => D1PreparedStatement[];
 };
 export type Claim = {
   runId: string;
@@ -114,7 +116,7 @@ export type Claim = {
 export type ClaimFailure =
   | { ok: false; reason: "stale_revision" | "resource_busy" }
   | { ok: false; reason: "already_claimed"; jobState: string };
-export type ClaimResult = ({ ok: true } & Claim) | ClaimFailure;
+export type ClaimResult = ({ ok: true; replayed: boolean } & Claim) | ClaimFailure;
 
 /** job.claim (§9.2 step 4): Job CAS, root Run, Execution, reservations, change rows and receipt in one batch. */
 export const claimJob = async (db: D1Database, input: ClaimInput): Promise<ClaimResult> => {
@@ -145,7 +147,7 @@ export const claimJob = async (db: D1Database, input: ClaimInput): Promise<Claim
   };
   const [setGuard, clearGuard] = guard(db, operationId);
   try {
-    const { response } = await withOperationReceipt(db, key, () => ({
+    const { response, replayed } = await withOperationReceipt(db, key, () => ({
       status: 201,
       response: claim,
       statements: [
@@ -192,10 +194,11 @@ export const claimJob = async (db: D1Database, input: ClaimInput): Promise<Claim
             )
             .bind(crypto.randomUUID(), workspaceId, resourceKey, claim.runId),
         ),
+        ...(input.statements?.(claim) ?? []),
         clearGuard,
       ],
     }));
-    return { ok: true, ...response };
+    return { ok: true, replayed, ...response };
   } catch (error) {
     if (error instanceof IdempotencyConflict) throw error;
     const failure = await diagnoseClaimFailure(db, input);
@@ -256,7 +259,8 @@ export const renewLease = async (
  * Run completion (§11.1): fenced terminal Run with its result, Execution, released reservations, Job state,
  * outbox, change rows, the caller's extra `statements` (e.g. the Inbox outcome) and receipt. A replay with the same
  * operationId returns the stored `{ ok: true }`. `cancelled` (a stop after job.cancel) leaves the Execution
- * `interrupted`.
+ * `interrupted`. `waitingFor` (a `succeeded` Run waiting for the reply to that request message, §8.2) puts the Job in
+ * `waiting_input`, or straight back to `queued` when the reply already arrived.
  */
 const executionOutcome = { succeeded: "finished", failed: "failed", cancelled: "interrupted" };
 
@@ -267,6 +271,7 @@ export const finishRun = async (
     operationId: string;
     summary?: string;
     error?: string;
+    waitingFor?: string;
     statements?: D1PreparedStatement[];
   },
 ): Promise<{ ok: true } | { ok: false; reason: "stale_generation" }> => {
@@ -285,9 +290,25 @@ export const finishRun = async (
       input.state,
       input.summary ?? null,
       input.error ?? null,
+      input.waitingFor ?? null,
     ]),
   };
   const now = iso();
+  const jobUpdate = input.waitingFor
+    ? db
+        .prepare(
+          `UPDATE jobs SET waiting_for_message_id = ?, revision = revision + 1, updated_at = ?,
+                  state = CASE WHEN EXISTS (SELECT 1 FROM messages WHERE reply_to_message_id = ?)
+                               THEN 'queued' ELSE 'waiting_input' END
+            WHERE workspace_id = ? AND id = ? AND state = 'active'`,
+        )
+        .bind(input.waitingFor, now, input.waitingFor, run.workspace_id, run.job_id)
+    : db
+        .prepare(
+          `UPDATE jobs SET state = ?, revision = revision + 1, updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND state = 'active'`,
+        )
+        .bind(input.state, now, run.workspace_id, run.job_id);
   const [setGuard, clearGuard] = guard(db, input.operationId);
   try {
     const { response } = await withOperationReceipt(db, key, () => ({
@@ -319,12 +340,7 @@ export const finishRun = async (
             "UPDATE resource_reservations SET released_at = ? WHERE run_id = ? AND released_at IS NULL",
           )
           .bind(now, input.runId),
-        db
-          .prepare(
-            `UPDATE jobs SET state = ?, revision = revision + 1, updated_at = ?
-            WHERE workspace_id = ? AND id = ? AND state = 'active'`,
-          )
-          .bind(input.state, now, run.workspace_id, run.job_id),
+        jobUpdate,
         enqueueOutbox(db, {
           workspaceId: run.workspace_id,
           topic: "run.finished",
@@ -729,12 +745,18 @@ export const insertMessage = (
     actorId: string;
     clientMessageId: string;
     body: string;
+    /** Bot-to-bot fields (§8.1). */
+    kind?: "request" | "response" | "notification";
+    hop?: number;
+    replyToMessageId?: string;
+    jobId?: string;
   },
 ) =>
   db
     .prepare(
-      `INSERT INTO messages (id, workspace_id, conversation_id, seq, actor_id, client_message_id, body)
-       VALUES (?, ?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE conversation_id = ?), ?, ?, ?)`,
+      `INSERT INTO messages (id, workspace_id, conversation_id, seq, actor_id, client_message_id, body, kind, hop,
+         reply_to_message_id, job_id)
+       VALUES (?, ?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE conversation_id = ?), ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       input.id,
@@ -744,6 +766,10 @@ export const insertMessage = (
       input.actorId,
       input.clientMessageId,
       input.body,
+      input.kind ?? null,
+      input.hop ?? 0,
+      input.replyToMessageId ?? null,
+      input.jobId ?? null,
     );
 
 export const insertEvent = (db: D1Database, e: typeof events.$inferInsert) =>
@@ -787,11 +813,11 @@ type InboxInput = {
   deliveryMode: "wake" | "notify" | "batch";
 };
 
-export const insertInboxItem = (db: D1Database, input: InboxInput) =>
+export const insertInboxItem = (db: D1Database, input: InboxInput & { hop?: number }) =>
   db
     .prepare(
-      `INSERT INTO inbox_items (id, workspace_id, input_id, bot_id, conversation_id, lane, purpose, delivery_mode)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO inbox_items (id, workspace_id, input_id, bot_id, conversation_id, lane, purpose, delivery_mode, hop)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       input.id,
@@ -802,6 +828,7 @@ export const insertInboxItem = (db: D1Database, input: InboxInput) =>
       input.lane,
       input.purpose,
       input.deliveryMode,
+      input.hop ?? 0,
     );
 
 /**
@@ -818,12 +845,15 @@ export const createJob = (
     taskId?: string;
     inboxBatchId?: string;
     placement?: unknown;
+    /** The causing event's correlation id (§8.2 budget). */
+    correlationId?: string;
   },
 ) =>
   db
     .prepare(
-      `INSERT INTO jobs (id, workspace_id, bot_id, state, trigger_key, task_id, inbox_batch_id, placement)
-       VALUES (?, ?, ?, 'queued', ?, ?, ?,
+      `INSERT INTO jobs (id, workspace_id, bot_id, state, trigger_key, task_id, inbox_batch_id, correlation_id,
+         placement)
+       VALUES (?, ?, ?, 'queued', ?, ?, ?, ?,
          COALESCE(?, (SELECT placement_policy FROM bots WHERE workspace_id = ? AND id = ?)))`,
     )
     .bind(
@@ -833,6 +863,7 @@ export const createJob = (
       input.triggerKey,
       input.taskId ?? null,
       input.inboxBatchId ?? null,
+      input.correlationId ?? null,
       input.placement === undefined ? null : JSON.stringify(input.placement),
       input.workspaceId,
       input.botId,
@@ -899,7 +930,7 @@ export type Recipient = InboxInput & {
  */
 const deliveryStatements = (
   db: D1Database,
-  input: Recipient & { eventId: string },
+  input: Recipient & { eventId: string; correlationId?: string },
   deliveryId: string,
   jobId: string | null,
 ) => {
@@ -978,6 +1009,7 @@ const deliveryStatements = (
             workspaceId: input.workspaceId,
             botId: input.botId,
             triggerKey: `inbox:${input.id}`,
+            correlationId: input.correlationId,
           }),
           appendChange(db, {
             workspaceId: input.workspaceId,
@@ -997,7 +1029,12 @@ const deliveryStatements = (
  */
 export const routeToRecipients = async (
   db: D1Database,
-  input: { workspaceId: string; eventId: string; recipients: Omit<Recipient, "workspaceId">[] },
+  input: {
+    workspaceId: string;
+    eventId: string;
+    correlationId?: string;
+    recipients: Omit<Recipient, "workspaceId">[];
+  },
 ): Promise<
   { routed: false } | { routed: true; deliveries: { deliveryId: string; jobId: string | null }[] }
 > => {
@@ -1008,7 +1045,12 @@ export const routeToRecipients = async (
   const statements = input.recipients.flatMap((r, i) =>
     deliveryStatements(
       db,
-      { ...r, workspaceId: input.workspaceId, eventId: input.eventId },
+      {
+        ...r,
+        workspaceId: input.workspaceId,
+        eventId: input.eventId,
+        correlationId: input.correlationId,
+      },
       deliveries[i]!.deliveryId,
       deliveries[i]!.jobId,
     ),
@@ -1020,10 +1062,15 @@ export const routeToRecipients = async (
 /** A single recipient (agent.send). */
 export const createDeliveryAndInbox = async (
   db: D1Database,
-  input: InboxInput & { eventId: string; scope: string },
+  input: InboxInput & { eventId: string; scope: string; correlationId?: string },
 ): Promise<{ routed: false } | { routed: true; deliveryId: string; jobId: string | null }> => {
-  const { workspaceId, eventId, ...recipient } = input;
-  const result = await routeToRecipients(db, { workspaceId, eventId, recipients: [recipient] });
+  const { workspaceId, eventId, correlationId, ...recipient } = input;
+  const result = await routeToRecipients(db, {
+    workspaceId,
+    eventId,
+    correlationId,
+    recipients: [recipient],
+  });
   return result.routed ? { routed: true, ...result.deliveries[0]! } : result;
 };
 

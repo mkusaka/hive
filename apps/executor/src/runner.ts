@@ -3,7 +3,7 @@
 // Claims, runs and reconciles are sequential on purpose: one Run at a time per executor (capacity 1).
 /* oxlint-disable no-await-in-loop */
 import type { RunContext } from "@hive/contracts";
-import { CloudError, type CloudClient } from "./cloudClient.ts";
+import { CloudError, type CloudClient, type RunApi } from "./cloudClient.ts";
 
 export type JournalEntry =
   | {
@@ -32,17 +32,26 @@ export type ClaimedRun = {
 export type LaunchContext = ClaimedRun & {
   /** From `GET /v1/executor/jobs/:id/context`, fetched after the claim. */
   context: RunContext;
+  /**
+   * `/v1/run/*` bound to the Run's capability (§18.2), for the in-run hive tools; the token itself stays here, never
+   * in a prompt. Null for a Run resumed after a restart: the token is returned once and not journaled.
+   */
+  run: RunApi | null;
   /** Sends a fenced runtime observation for this Run (§9.2 step 7). */
   observe(kind: string, payload: Record<string, unknown>): Promise<void>;
 };
 export type RunningAgent = {
   requestStop(reason: string): Promise<void>;
-  /** `replyText` is posted to the trigger Conversation as the Bot's message. */
+  /**
+   * `replyText` is posted to the trigger Conversation as the Bot's message. `waitingFor`: the agent stopped to wait
+   * for the reply to that request (§8.2); the Run is submitted as `waiting`.
+   */
   waitForExit(): Promise<{
     code: number | null;
     reason: string;
     summary: string;
     replyText?: string;
+    waitingFor?: { requestMessageId: string };
   }>;
 };
 export type AgentAdapter = { start(input: LaunchContext): Promise<RunningAgent> };
@@ -74,12 +83,18 @@ const confirmStopped = (
  * renews the lease every quarter of its remaining time. A stale generation stops the agent, submits nothing and
  * confirms the stop. `cancelRequested` on renewal stops the agent and submits `failed` with error `cancelled`.
  */
-const execute = async (deps: RunnerDeps, claimed: ClaimedRun, leaseExpiresAt: string) => {
+const execute = async (
+  deps: RunnerDeps,
+  claimed: ClaimedRun,
+  leaseExpiresAt: string,
+  capabilityToken?: string,
+) => {
   const { cloud, journal } = deps;
   const fence = { runId: claimed.runId, executionGeneration: claimed.executionGeneration };
   const ctx: LaunchContext = {
     ...claimed,
     context: await cloud.getRunContext({ jobId: claimed.jobId, ...fence }),
+    run: capabilityToken ? cloud.forRun(capabilityToken) : null,
     observe: (kind, payload) => cloud.observe({ ...fence, kind, payload }),
   };
   await journal.append({ kind: "intent", runId: ctx.runId });
@@ -105,8 +120,14 @@ const execute = async (deps: RunnerDeps, claimed: ClaimedRun, leaseExpiresAt: st
   }, renewEveryMs);
   const exit = await agent.waitForExit().finally(() => clearInterval(timer));
 
-  const outcome = exit.code === 0 && !cancelled ? "succeeded" : "failed";
+  const outcome =
+    exit.code !== 0 || cancelled ? "failed" : exit.waitingFor ? "waiting" : "succeeded";
   const conversation = ctx.context.conversation;
+  // A Bot answers a bot request with its reply tool, so the final text is posted only in a Channel.
+  const reply =
+    outcome === "succeeded" && exit.replyText && conversation?.kind === "channel"
+      ? { reply: { conversationId: conversation.id, text: exit.replyText } }
+      : {};
   if (!stale) {
     try {
       await cloud.submitResult({
@@ -114,9 +135,8 @@ const execute = async (deps: RunnerDeps, claimed: ClaimedRun, leaseExpiresAt: st
         state: outcome,
         summary: exit.summary,
         ...(outcome === "failed" ? { error: cancelled ? "cancelled" : exit.reason } : {}),
-        ...(exit.replyText && conversation
-          ? { reply: { conversationId: conversation.id, text: exit.replyText } }
-          : {}),
+        ...(outcome === "waiting" ? { waitingFor: exit.waitingFor } : {}),
+        ...reply,
       });
     } catch (error) {
       if (!isStale(error)) throw error;
@@ -200,7 +220,7 @@ export const runOnce = async (deps: RunnerDeps) => {
       inboxItemId: claim.job.inboxItemId,
     };
     await deps.journal.append({ kind: "claim", ...ctx });
-    return execute(deps, ctx, claim.leaseExpiresAt);
+    return execute(deps, ctx, claim.leaseExpiresAt, claim.capability?.token);
   }
   return null;
 };

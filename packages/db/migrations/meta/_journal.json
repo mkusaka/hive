@@ -64,6 +64,13 @@
       "when": 1791687380342,
       "tag": "0008_routines_recovery",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1791689068044,
+      "tag": "0009_bot_messaging",
+      "breakpoints": true
     }
   ]
 }

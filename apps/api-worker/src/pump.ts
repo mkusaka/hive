@@ -28,7 +28,8 @@ const leaseSeconds = 60;
 type AgentMessageSent = {
   inboxItemId: string;
   recipientBotId: string;
-  channelId: string;
+  /** Null for a bot-to-bot message: its lane is the bot pair's conversation (§8). */
+  channelId: string | null;
   conversationId: string;
   delivery: "wake" | "notify";
 };
@@ -43,9 +44,10 @@ export type EventRow = {
   subject_id: string | null;
   data: string;
   received_at: string;
+  correlation_id: string;
 };
 export const eventColumns =
-  "id, workspace_id, type, source_kind, integration_id, subject_kind, subject_id, data, received_at";
+  "id, workspace_id, type, source_kind, integration_id, subject_kind, subject_id, data, received_at, correlation_id";
 
 export type SubscriptionRow = {
   id: string;
@@ -146,7 +148,12 @@ export const routeEvent = async (db: D1Database, eventId: string): Promise<Notif
       await recordEventRouted(db, { workspaceId, eventId });
       return null;
     }
-    const routed = await routeToRecipients(db, { workspaceId, eventId, recipients });
+    const routed = await routeToRecipients(db, {
+      workspaceId,
+      eventId,
+      correlationId: event.correlation_id,
+      recipients,
+    });
     if (!routed.routed) return null;
     const jobAvailable = routed.deliveries.some((d) => d.jobId !== null);
     const scopes = [...new Set(recipients.map((r) => r.scope))];
@@ -155,15 +162,16 @@ export const routeEvent = async (db: D1Database, eventId: string): Promise<Notif
       : { workspaceId, scopes };
   }
   const data = JSON.parse(event.data) as AgentMessageSent;
-  const scope = `channel:${data.channelId}`;
+  const scope = data.channelId ? `channel:${data.channelId}` : `workspace:${workspaceId}`;
   const routed = await createDeliveryAndInbox(db, {
     id: data.inboxItemId,
     workspaceId,
     eventId,
+    correlationId: event.correlation_id,
     inputId: eventId,
     botId: data.recipientBotId,
     conversationId: data.conversationId,
-    lane: data.channelId,
+    lane: data.channelId ?? data.conversationId,
     purpose: "agent.send",
     deliveryMode: data.delivery,
     scope,

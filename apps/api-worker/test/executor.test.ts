@@ -49,10 +49,11 @@ describe("executor job.claim", () => {
     ).toBe(1);
     expect(await (await device.get("/v1/executor/jobs?state=queued")).json()).toEqual({ jobs: [] });
 
-    // A replay with the same key returns the stored claim even though the Job is no longer queued.
+    // A replay with the same key returns the stored claim even though the Job is no longer queued; the capability
+    // token is returned only once.
     const replay = await device.command(claim(jobId), "claim-1");
     expect(replay.status).toBe(200);
-    expect(await replay.json()).toEqual(body);
+    expect(await replay.json()).toEqual({ ...body, capability: null });
   });
 
   it("lets only one device hold the active root Run (AT-11)", async () => {

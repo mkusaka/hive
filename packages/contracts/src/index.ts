@@ -131,6 +131,65 @@ export const AgentSend = v.strictObject({
   delivery: v.picklist(["wake", "notify"]),
 });
 
+// --------------------------------------------- Run commands (docs/architecture.md §8, §18.2)
+// `POST /v1/run/commands` with a Run capability: the sender is the Run's Bot, never a declared one.
+
+/**
+ * Bot-to-bot message into the private `bot_pair` conversation. A `request` wakes the recipient (a Job); a
+ * `notification` is only recorded in its Inbox (§7.2 notify, never auto-answered). Exactly one recipient field.
+ */
+export const RunAgentSend = v.pipe(
+  v.strictObject({
+    type: v.literal("agent.send"),
+    recipientBotId: v.optional(BotId),
+    recipientBotName: v.optional(Name),
+    message: v.strictObject({ kind: v.picklist(["request", "notification"]), text: MessageText }),
+    /** A message of the same conversation this one follows up on. */
+    replyToMessageId: v.optional(v.pipe(v.string(), v.minLength(1))),
+  }),
+  v.check(
+    (c) => (c.recipientBotId === undefined) !== (c.recipientBotName === undefined),
+    "exactly one of recipientBotId / recipientBotName is required",
+  ),
+);
+
+/** The response to a request delivered to this Run's Bot; re-queues the requester's waiting Job. */
+export const AgentReply = v.strictObject({
+  type: v.literal("agent.reply"),
+  requestMessageId: v.pipe(v.string(), v.minLength(1)),
+  text: MessageText,
+});
+
+export type RunAgentSendAccepted = {
+  operationId: string;
+  status: "accepted";
+  messageId: string;
+  conversationId: string;
+  inboxItemId: string;
+  hop: number;
+};
+export type AgentReplyAccepted = {
+  operationId: string;
+  status: "accepted";
+  messageId: string;
+  inboxItemId: string;
+};
+
+/** `GET /v1/run/me`: the Run principal behind a capability. */
+export type RunPrincipal = {
+  kind: "run";
+  runId: string;
+  jobId: string;
+  botId: string;
+  workspaceId: string;
+  executionGeneration: number;
+  conversationId: string | null;
+  taskId: string | null;
+  hop: number;
+  correlationId: string;
+  scopes: string[];
+};
+
 // ---------------------------------------------------- Work (docs/architecture.md §4)
 // Task edits carry the Task's `expectedRevision`; a stale one is 409 REVISION_CONFLICT.
 
@@ -433,7 +492,12 @@ export const RunResultSubmit = v.strictObject({
   type: v.literal("run.result.submit"),
   runId: RunId,
   executionGeneration: Generation,
-  state: v.picklist(["succeeded", "failed"]),
+  /**
+   * `waiting` (§8.2, AT-29): the Run stopped at a safe checkpoint to wait for the reply to `waitingFor`. The Run
+   * succeeds, the Job goes `waiting_input` and the reply queues it again for a successor Run.
+   */
+  state: v.picklist(["succeeded", "failed", "waiting"]),
+  waitingFor: v.optional(v.strictObject({ requestMessageId: v.pipe(v.string(), v.minLength(1)) })),
   summary: v.pipe(
     v.string(),
     v.check((s) => utf8Bytes(s) <= 8 * 1024, "summary must be at most 8 KiB"),
@@ -446,6 +510,17 @@ export const RunResultSubmit = v.strictObject({
 });
 
 export const ExecutorCommand = v.variant("type", [JobClaim, RunLeaseRenew, RunResultSubmit]);
+
+/** Task writes need the `task.write` scope and a target in the Run's Task's Project. */
+export const RunCommand = v.variant("type", [
+  RunAgentSend,
+  AgentReply,
+  TaskCreate,
+  TaskAssign,
+  TaskPlan,
+  TaskComplete,
+]);
+export type RunCommand = v.InferInput<typeof RunCommand>;
 export type ExecutorCommand = v.InferInput<typeof ExecutorCommand>;
 
 export type JobClaimed = {
@@ -453,6 +528,8 @@ export type JobClaimed = {
   executionId: string;
   executionGeneration: number;
   leaseExpiresAt: string;
+  /** `Bearer` token for `/v1/run/*` (§18.2). Returned once: null on a replayed claim. */
+  capability: { token: string; expiresAt: string } | null;
   job: { id: string; botId: string; inboxItemId: string | null; placement: PlacementPolicy };
 };
 export type ClaimFailureReason =
@@ -478,16 +555,32 @@ export type QueuedJob = {
 /** `GET /v1/executor/jobs/:id/context?runId=&executionGeneration=`: what the adapter builds its prompt from. */
 export type RunContext = {
   bot: { id: string; name: string; instructions: string };
-  task: { key: string; title: string; description: string } | null;
+  task: { id: string; key: string; title: string; description: string } | null;
   conversation: {
     id: string;
     channelId: string;
+    kind: "channel" | "bot_pair";
     /** The last 20 messages, oldest first. */
     recent: { actorKind: string; actorId: string; body: string; createdAt: string }[];
   } | null;
-  inboxItem: { id: string; body: string } | null;
+  /** `fromBot` is set when another Bot sent the message (kind `request` / `notification`). */
+  inboxItem: {
+    id: string;
+    body: string;
+    messageId: string | null;
+    kind: string | null;
+    fromBot: { id: string; name: string } | null;
+  } | null;
   /** A batch Job's sealed Inbox batch, items oldest first; `inboxItem` is then null. */
   batch: { id: string; items: { id: string; body: string }[] } | null;
+  /** Replies to requests this Job's Runs sent (§8.2), oldest first: what a successor Run continues from. */
+  replies: {
+    messageId: string;
+    requestMessageId: string;
+    fromBot: { id: string; name: string };
+    body: string;
+    createdAt: string;
+  }[];
 };
 
 /**
