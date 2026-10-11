@@ -338,7 +338,7 @@ export const listTasks = async (
   };
 };
 
-/** One Task with its prerequisites, dependents, Results and Jobs. */
+/** One Task with its prerequisites, dependents, Results, Jobs and Delegations. */
 export const getTask = async (db: D1Database, wsIds: string[], id: string) => {
   if (wsIds.length === 0) throw notFound("task");
   const task = await db
@@ -351,7 +351,7 @@ export const getTask = async (db: D1Database, wsIds: string[], id: string) => {
     .first<TaskRow & { workspaceId: string }>();
   if (!task) throw notFound("task");
   const { workspaceId } = task;
-  const [prerequisites, dependents, results, jobs, git] = await Promise.all([
+  const [prerequisites, dependents, results, jobs, git, delegations] = await Promise.all([
     prerequisitesOf(db, workspaceId, id),
     db
       .prepare(
@@ -385,6 +385,15 @@ export const getTask = async (db: D1Database, wsIds: string[], id: string) => {
       )
       .bind(workspaceId, workspaceId, id)
       .all<{ repository: string; commits: string; prs: string }>(),
+    db
+      .prepare(
+        `SELECT id, from_kind AS fromKind, from_id AS fromId, to_bot_id AS toBotId, mode, state, deadline,
+                scope_revision AS scopeRevision, job_id AS jobId, outcome_summary AS outcomeSummary,
+                created_at AS createdAt, closed_at AS closedAt
+           FROM delegations WHERE workspace_id = ? AND task_id = ? ORDER BY created_at, id`,
+      )
+      .bind(workspaceId, id)
+      .all(),
   ]);
   // GIT-01 rollup over the Task's Runs: distinct commits, PRs unique by URL, repositories.
   const shas = new Set<string>();
@@ -400,6 +409,7 @@ export const getTask = async (db: D1Database, wsIds: string[], id: string) => {
     dependents: dependents.results,
     results: results.results,
     jobs: jobs.results,
+    delegations: delegations.results,
     git: { commits: shas.size, prs: [...prs.values()], repositories: [...repositories] },
   };
 };

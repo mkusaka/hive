@@ -317,6 +317,31 @@ export const TaskCancel = v.strictObject({
   expectedRevision: Revision,
 });
 
+/**
+ * Formal delegation (§8.1): the Bot `toBotId` gets its own Job on the Task, bounded by `mode`; the Task's assignee does
+ * not change. A user must be a member; a Bot (from a Run) must be the Task's assignee or hold an active `write`
+ * delegation on it. Returns `{ delegationId, jobId }`.
+ */
+export const TaskDelegate = v.strictObject({
+  type: v.literal("task.delegate"),
+  taskId: TaskId,
+  toBotId: BotId,
+  mode: v.picklist(["read", "write"]),
+  instructions: v.pipe(
+    v.string(),
+    v.minLength(1),
+    v.check((s) => utf8Bytes(s) <= 8 * 1024, "instructions must be at most 8 KiB"),
+  ),
+  deadline: v.optional(Timestamp),
+  expectedRevision: Revision,
+});
+
+/** Closes an active Delegation `revoked`; its Job is cancelled unless already terminal (an active one is asked to stop). */
+export const TaskDelegateRevoke = v.strictObject({
+  type: v.literal("task.delegate.revoke"),
+  delegationId: v.pipe(v.string(), v.minLength(1)),
+});
+
 /** Explicit Task execution (§23): a queued Job for the Bot, optionally pinned to one device. */
 export const JobStart = v.strictObject({
   type: v.literal("job.start"),
@@ -777,6 +802,7 @@ export const RunCommand = v.variant("type", [
   TaskAssign,
   TaskPlan,
   TaskComplete,
+  TaskDelegate,
   MemoryWrite,
   EffectPrepare,
 ]);
@@ -849,6 +875,15 @@ export type RunContext = {
   related: { sourceKind: SearchKind; sourceId: string; title: string; snippet: string }[];
   /** The native session of the latest earlier Run of this Job that reported one: what a successor resumes (§13.3). */
   previousProviderSessionId: string | null;
+  /** Set when this Job works a task.delegate (§8.1); task writes need `mode: write`. */
+  delegation: {
+    id: string;
+    mode: "read" | "write";
+    deadline: string | null;
+    fromBot: { id: string; name: string } | null;
+    fromUser: { id: string } | null;
+    instructions: string;
+  } | null;
 };
 
 /**

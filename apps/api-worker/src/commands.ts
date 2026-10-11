@@ -45,6 +45,8 @@ import {
   TaskCancel,
   TaskComplete,
   TaskCreate,
+  TaskDelegate,
+  TaskDelegateRevoke,
   TaskPlan,
   userEventType,
   WorkspaceCreate,
@@ -91,6 +93,8 @@ export const CommandEnvelope = commandEnvelope(
     TaskPlan,
     TaskComplete,
     TaskCancel,
+    TaskDelegate,
+    TaskDelegateRevoke,
     JobStart,
     JobCancel,
     JobResolve,
@@ -1092,6 +1096,225 @@ const jobStart: Handler<v.InferOutput<typeof JobStart>> = async (db, user, env) 
       "concurrent_start",
     );
   });
+};
+
+// ------------------------------------------ Delegation (docs/architecture.md §8.1)
+
+type Delegator = { kind: "user"; userId: string } | { kind: "run"; run: Run };
+
+/**
+ * Delegation, the receiving Bot's Job (`delegation:<id>`, the Bot's placement) and a Task CAS in one batch. The CAS
+ * bumps the Task's revision, so the assignee read for a Bot's authority is current; the assignee itself is unchanged.
+ * From a Run the instructions also become a message in the two Bots' `bot_pair` conversation, and the §8.2 hop and
+ * chain limits apply. Bot pause state and Channel/Project ACL are not built, so they are not checked.
+ */
+const taskDelegate = async (
+  db: D1Database,
+  from: Delegator,
+  env: Envelope & { command: v.InferOutput<typeof TaskDelegate> },
+) => {
+  const { workspaceId, command } = env;
+  const task = await loadTask(db, workspaceId, command.taskId);
+  const bot = await db
+    .prepare("SELECT 1 FROM bots WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, command.toBotId)
+    .first();
+  if (!bot) throw new HttpError("NOT_FOUND", "bot not found");
+  const run = from.kind === "run" ? from.run : null;
+  let parentExecutionId: string | null = null;
+  if (run) {
+    if (command.toBotId === run.botId) {
+      throw chainLimit("a bot cannot delegate to itself", "self_delegation");
+    }
+    const authority = await db
+      .prepare(
+        `SELECT EXISTS (SELECT 1 FROM tasks WHERE workspace_id = ?1 AND id = ?2
+                          AND assignee_kind = 'bot' AND assignee_id = ?3) AS assignee,
+                EXISTS (SELECT 1 FROM delegations WHERE workspace_id = ?1 AND task_id = ?2
+                          AND to_bot_id = ?3 AND state = 'active' AND mode = 'write') AS writer`,
+      )
+      .bind(workspaceId, command.taskId, run.botId)
+      .first<{ assignee: number; writer: number }>();
+    if (!authority?.assignee && !authority?.writer) {
+      throw new HttpError(
+        "FORBIDDEN",
+        "only the task's assignee bot or an active write delegate may delegate it",
+        false,
+        "not_delegator",
+      );
+    }
+    if (run.hop + 1 > maxHops) {
+      throw chainLimit(`bot-to-bot chain exceeds ${maxHops} hops`, "hop_limit");
+    }
+    await checkChainBudget(db, run);
+    parentExecutionId =
+      (
+        await db
+          .prepare("SELECT id FROM executions WHERE workspace_id = ? AND run_id = ?")
+          .bind(workspaceId, run.runId)
+          .first<{ id: string }>()
+      )?.id ?? null;
+  }
+  const delegationId = crypto.randomUUID();
+  const jobId = crypto.randomUUID();
+  const messageId = crypto.randomUUID();
+  const hop = run ? run.hop + 1 : 0;
+  const conversationId = run ? botPairId(run.botId, command.toBotId) : null;
+  const scope = `workspace:${workspaceId}`;
+  const instructions =
+    run && conversationId
+      ? [
+          ...botPair(db, workspaceId, conversationId),
+          insertMessage(db, {
+            id: messageId,
+            workspaceId,
+            conversationId,
+            actorId: run.botActorId,
+            clientMessageId: env.idempotencyKey,
+            body: command.instructions,
+            kind: "delegation",
+            hop,
+            jobId: run.jobId,
+          }),
+          indexLater(db, workspaceId, "message", messageId),
+        ]
+      : [];
+  const result = receipt(
+    db,
+    run ? run.runId : (from as { userId: string }).userId,
+    env,
+    [
+      // No field changes: the CAS checks the revision and that the Task is open.
+      ...taskCas(db, {
+        workspaceId,
+        taskId: command.taskId,
+        expectedRevision: command.expectedRevision,
+        set: "status = status",
+        where: `status IN ${openStatuses}`,
+      }),
+      ...instructions,
+      createJob(db, {
+        id: jobId,
+        workspaceId,
+        botId: command.toBotId,
+        triggerKey: `delegation:${delegationId}`,
+        taskId: command.taskId,
+        correlationId: run?.correlationId,
+        delegationId,
+      }),
+      db
+        .prepare(
+          `INSERT INTO delegations (id, workspace_id, task_id, from_kind, from_id, parent_run_id, parent_execution_id,
+             to_bot_id, mode, instructions, scope_revision, deadline, conversation_id, hop, job_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          delegationId,
+          workspaceId,
+          command.taskId,
+          run ? "bot" : "user",
+          run ? run.botId : (from as { userId: string }).userId,
+          run?.runId ?? null,
+          parentExecutionId,
+          command.toBotId,
+          command.mode,
+          command.instructions,
+          task.scope_revision,
+          command.deadline ?? null,
+          conversationId,
+          hop,
+          jobId,
+        ),
+    ],
+    { operationId: env.operationId, status: "accepted", delegationId, jobId },
+    [
+      taskChange(workspaceId, command.taskId, command.expectedRevision + 1),
+      { entityKind: "job", entityId: jobId, revision: 1, scope },
+      { entityKind: "delegation", entityId: delegationId, scope },
+      ...(conversationId
+        ? [
+            { entityKind: "conversation", entityId: conversationId, scope },
+            { entityKind: "message", entityId: messageId, scope },
+          ]
+        : []),
+    ],
+  );
+  return explainFailure(result, async () => {
+    const common = await explainTask(db, workspaceId, command.taskId, command.expectedRevision);
+    if (common) return common;
+    const active = await db
+      .prepare(
+        "SELECT 1 FROM delegations WHERE workspace_id = ? AND task_id = ? AND to_bot_id = ? AND state = 'active'",
+      )
+      .bind(workspaceId, command.taskId, command.toBotId)
+      .first();
+    return active
+      ? new HttpError(
+          "RESOURCE_BUSY",
+          "the bot already holds an active delegation on this task",
+          false,
+          "already_delegated",
+        )
+      : null;
+  });
+};
+
+const delegationClosed = (state: string) =>
+  new HttpError("REVISION_CONFLICT", `delegation is ${state}`, false, `delegation_${state}`);
+
+/** `revoked`, and the Job cancelled like job.cancel: at once unless active (then a cancel request). */
+const taskDelegateRevoke: Handler<v.InferOutput<typeof TaskDelegateRevoke>> = async (
+  db,
+  user,
+  env,
+) => {
+  const { workspaceId, command } = env;
+  const state = async () => {
+    const row = await db
+      .prepare("SELECT job_id, state FROM delegations WHERE workspace_id = ? AND id = ?")
+      .bind(workspaceId, command.delegationId)
+      .first<{ job_id: string; state: string }>();
+    if (!row) throw new HttpError("NOT_FOUND", "delegation not found");
+    return row;
+  };
+  const delegation = await state();
+  if (delegation.state !== "active") throw delegationClosed(delegation.state);
+  const now = new Date().toISOString();
+  const [setGuard, clearGuard] = guard(db);
+  const scope = `workspace:${workspaceId}`;
+  const run = receipt(
+    db,
+    user.userId,
+    env,
+    [
+      db
+        .prepare(
+          `UPDATE delegations SET state = 'revoked', closed_at = ?
+            WHERE workspace_id = ? AND id = ? AND state = 'active'`,
+        )
+        .bind(now, workspaceId, command.delegationId),
+      setGuard,
+      clearGuard,
+      db
+        .prepare(
+          `UPDATE jobs SET state = CASE WHEN state = 'active' THEN state ELSE 'cancelled' END,
+             cancel_requested_at = COALESCE(cancel_requested_at, ?), revision = revision + 1, updated_at = ?
+            WHERE workspace_id = ? AND id = ? AND state IN ('queued', 'waiting_device', 'waiting_input', 'active')`,
+        )
+        .bind(now, now, workspaceId, delegation.job_id),
+    ],
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      delegationId: command.delegationId,
+      state: "revoked",
+    },
+    [
+      { entityKind: "delegation", entityId: command.delegationId, scope },
+      { entityKind: "job", entityId: delegation.job_id, scope },
+    ],
+  );
+  return explainFailure(run, async () => delegationClosed((await state()).state));
 };
 
 // ------------------------------------------ Subscriptions (docs/architecture.md §17.1)
@@ -2130,6 +2353,8 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "task.plan": (db, user, env) => taskPlan(db, user.userId, env),
   "task.complete": (db, user, env) => taskComplete(db, user.userId, env),
   "task.cancel": taskCancel,
+  "task.delegate": (db, user, env) => taskDelegate(db, { kind: "user", userId: user.userId }, env),
+  "task.delegate.revoke": taskDelegateRevoke,
   "job.start": jobStart,
   "subscription.create": subscriptionCreate,
   "subscription.update": subscriptionUpdate,
@@ -2185,6 +2410,35 @@ const botPairId = (a: string, b: string) => `botpair:${[a, b].toSorted().join(":
 const chainLimit = (message: string, reason: string) =>
   new HttpError("INVALID_INPUT", message, false, reason);
 
+/** At most `maxCorrelatedJobs` Jobs per chain (§8.2), for a Run that is about to add one. */
+const checkChainBudget = async (db: D1Database, run: Run) => {
+  // ponytail: checked before the batch, so concurrent requests of one chain can overshoot by a few Jobs.
+  const related = await db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM jobs WHERE workspace_id = ? AND (correlation_id = ? OR id = ?)",
+    )
+    .bind(run.workspaceId, run.correlationId, run.correlationId)
+    .first<{ n: number }>();
+  if ((related?.n ?? 0) >= maxCorrelatedJobs) {
+    throw chainLimit(`bot-to-bot chain exceeds ${maxCorrelatedJobs} jobs`, "budget_exceeded");
+  }
+};
+
+/** The bot pair's member-less Channel and its conversation, created by the first message. */
+const botPair = (db: D1Database, workspaceId: string, conversationId: string) => [
+  db
+    .prepare(
+      "INSERT INTO channels (id, workspace_id, name) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+    )
+    .bind(conversationId, workspaceId, conversationId),
+  db
+    .prepare(
+      `INSERT INTO conversations (id, workspace_id, channel_id, kind) VALUES (?, ?, ?, 'bot_pair')
+       ON CONFLICT DO NOTHING`,
+    )
+    .bind(conversationId, workspaceId, conversationId),
+];
+
 /**
  * Bot → Bot (§8): Message in the pair's conversation, Event, recipient Inbox item and Outbox in one batch; the pump
  * routes it like a user's agent.send (a `request` wakes the recipient with a Job carrying the chain's correlation).
@@ -2203,18 +2457,7 @@ const runAgentSend: RunHandler<v.InferOutput<typeof RunAgentSend>> = async (db, 
   const hop = run.hop + 1;
   if (hop > maxHops) throw chainLimit(`bot-to-bot chain exceeds ${maxHops} hops`, "hop_limit");
   const request = command.message.kind === "request";
-  if (request) {
-    // ponytail: checked before the batch, so concurrent requests of one chain can overshoot by a few Jobs.
-    const related = await db
-      .prepare(
-        "SELECT COUNT(*) AS n FROM jobs WHERE workspace_id = ? AND (correlation_id = ? OR id = ?)",
-      )
-      .bind(workspaceId, run.correlationId, run.correlationId)
-      .first<{ n: number }>();
-    if ((related?.n ?? 0) >= maxCorrelatedJobs) {
-      throw chainLimit(`bot-to-bot chain exceeds ${maxCorrelatedJobs} jobs`, "budget_exceeded");
-    }
-  }
+  if (request) await checkChainBudget(db, run);
   const conversationId = botPairId(run.botId, recipient.id);
   if (command.replyToMessageId) {
     const earlier = await db
@@ -2244,17 +2487,7 @@ const runAgentSend: RunHandler<v.InferOutput<typeof RunAgentSend>> = async (db, 
     run.runId,
     env as unknown as Envelope,
     [
-      db
-        .prepare(
-          "INSERT INTO channels (id, workspace_id, name) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
-        )
-        .bind(conversationId, workspaceId, conversationId),
-      db
-        .prepare(
-          `INSERT INTO conversations (id, workspace_id, channel_id, kind) VALUES (?, ?, ?, 'bot_pair')
-           ON CONFLICT DO NOTHING`,
-        )
-        .bind(conversationId, workspaceId, conversationId),
+      ...botPair(db, workspaceId, conversationId),
       insertMessage(db, {
         id: messageId,
         workspaceId,
@@ -2684,6 +2917,15 @@ const runTaskCommand = async (
   env: RunEnvelopeValue & { command: { type: keyof typeof taskHandlers } },
 ) => {
   requireScope(run, "task.write");
+  // A delegated Run writes Tasks only under an active `write` Delegation (§8.1).
+  if (run.delegation && (run.delegation.mode !== "write" || run.delegation.state !== "active")) {
+    throw new HttpError(
+      "FORBIDDEN",
+      "this run's delegation does not allow task writes",
+      false,
+      "delegation_read_only",
+    );
+  }
   const { workspaceId, command } = env as unknown as Envelope & {
     command: Extract<Command, { type: keyof typeof taskHandlers }>;
   };
@@ -2730,6 +2972,15 @@ export const runRunCommand = (db: D1Database, run: Run, envelope: RunEnvelopeVal
   }
   if (command.type === "effect.prepare") {
     return runEffectPrepare(db, run, envelope as RunEnvelopeValue & { command: typeof command });
+  }
+  if (command.type === "task.delegate") {
+    return taskDelegate(
+      db,
+      { kind: "run", run },
+      envelope as unknown as Envelope & {
+        command: typeof command;
+      },
+    );
   }
   return runTaskCommand(db, run, envelope as RunEnvelopeValue & { command: typeof command });
 };

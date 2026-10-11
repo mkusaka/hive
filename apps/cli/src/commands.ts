@@ -234,6 +234,19 @@ export const taskAssign = (
 export const taskComplete = (c: Client, e: Envelope, task: TaskRef) =>
   c.command(e, { type: "task.complete", taskId: task.id, expectedRevision: task.revision });
 
+export const taskDelegate = (
+  c: Client,
+  e: Envelope,
+  task: TaskRef,
+  input: { toBotId: string; mode: string; instructions: string; deadline?: string },
+) =>
+  c.command(e, {
+    type: "task.delegate",
+    taskId: task.id,
+    ...input,
+    expectedRevision: task.revision,
+  });
+
 export const jobStart = (
   c: Client,
   e: Envelope,

@@ -763,6 +763,9 @@ export const jobs = sqliteTable(
     correlationId: text("correlation_id"),
     // `waiting_input`: the request message whose reply re-queues the Job.
     waitingForMessageId: text("waiting_for_message_id"),
+    // task.delegate (§8.1): the Delegation this Job works under. No FK: `delegations.job_id` references the Job, which
+    // is inserted first.
+    delegationId: text("delegation_id"),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -1082,6 +1085,72 @@ export const effects = sqliteTable(
     foreignKey({
       columns: [t.workspaceId, t.integrationId],
       foreignColumns: [integrationInstallations.workspaceId, integrationInstallations.id],
+    }),
+  ],
+);
+
+const delegationStates = ["active", "completed", "revoked", "expired"] as const;
+const delegationModes = ["read", "write"] as const;
+
+/**
+ * current state (docs/architecture.md §8.1). Limited authority over a Task handed to another Bot, worked by its own Job
+ * (`trigger_key = delegation:<id>`). `from_kind` / `from_id` is the user or Bot that delegated; from a Run,
+ * `parent_run_id` / `parent_execution_id`, the `bot_pair` `conversation_id` holding the instructions message and the
+ * chain's `hop` are set too. `scope_revision` is the Task's at delegation. One `active` Delegation per (Task, Bot).
+ * The Job's end closes it `completed` with `outcome_summary`; `revoked` / `expired` cancel a Job that has not started.
+ */
+export const delegations = sqliteTable(
+  "delegations",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    taskId: text("task_id").notNull(),
+    fromKind: text("from_kind", { enum: assigneeKinds }).notNull(),
+    fromId: text("from_id").notNull(),
+    parentRunId: text("parent_run_id"),
+    parentExecutionId: text("parent_execution_id"),
+    toBotId: text("to_bot_id").notNull(),
+    mode: text("mode", { enum: delegationModes }).notNull(),
+    instructions: text("instructions").notNull(),
+    scopeRevision: integer("scope_revision").notNull(),
+    deadline: text("deadline"),
+    conversationId: text("conversation_id"),
+    hop: integer("hop").notNull().default(0),
+    state: text("state", { enum: delegationStates }).notNull().default("active"),
+    jobId: text("job_id").notNull(),
+    outcomeSummary: text("outcome_summary"),
+    createdAt: createdAt(),
+    closedAt: text("closed_at"),
+  },
+  (t) => [
+    scoped(t),
+    uniqueIndex("delegations_one_active")
+      .on(t.workspaceId, t.taskId, t.toBotId)
+      .where(sql`${t.state} = 'active'`),
+    index("delegations_state").on(t.state, t.deadline),
+    oneOf("delegations_from_kind", t.fromKind, assigneeKinds),
+    oneOf("delegations_mode", t.mode, delegationModes),
+    oneOf("delegations_state", t.state, delegationStates),
+    foreignKey({
+      columns: [t.workspaceId, t.taskId],
+      foreignColumns: [tasks.workspaceId, tasks.id],
+    }),
+    foreignKey({
+      columns: [t.workspaceId, t.toBotId],
+      foreignColumns: [bots.workspaceId, bots.id],
+    }),
+    foreignKey({ columns: [t.workspaceId, t.jobId], foreignColumns: [jobs.workspaceId, jobs.id] }),
+    foreignKey({
+      columns: [t.workspaceId, t.parentRunId],
+      foreignColumns: [runs.workspaceId, runs.id],
+    }),
+    foreignKey({
+      columns: [t.workspaceId, t.parentExecutionId],
+      foreignColumns: [executions.workspaceId, executions.id],
+    }),
+    foreignKey({
+      columns: [t.workspaceId, t.conversationId],
+      foreignColumns: [conversations.workspaceId, conversations.id],
     }),
   ],
 );

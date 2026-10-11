@@ -658,6 +658,33 @@ const specs: Record<string, Spec> = {
       c.print(await cmd.taskComplete(c.client(), c.envelope(), task));
     },
   },
+  "task delegate": {
+    usage:
+      "<task> --to <bot-id> --mode <read|write> --instructions <text> [--deadline <iso-timestamp>]",
+    args: 1,
+    options: { to: str, mode: str, instructions: str, deadline: str },
+    run: async (c) => {
+      const mode = need(c.values, "mode");
+      if (mode !== "read" && mode !== "write") throw invalid("--mode must be read or write");
+      const task = await cmd.findTask(c.client(), c.workspace(), c.args[0]!);
+      c.print(
+        await cmd.taskDelegate(c.client(), c.envelope(), task, {
+          toBotId: need(c.values, "to"),
+          mode,
+          instructions: need(c.values, "instructions"),
+          deadline: c.values.deadline as string | undefined,
+        }),
+      );
+    },
+  },
+  "task delegations": {
+    usage: "<task>",
+    args: 1,
+    run: async (c) => {
+      const task = await cmd.findTask(c.client(), c.workspace(), c.args[0]!);
+      c.print({ delegations: ((await cmd.getTask(c.client(), task.id)) as cmd.Json).delegations });
+    },
+  },
   "job start": {
     usage: "--task <task> --bot <bot-id> [--device <device-id>] [--wait [--timeout <s>]]",
     options: { task: str, bot: str, device: str, wait: flag, timeout: str },

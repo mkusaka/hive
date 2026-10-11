@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { RunContext } from "@hive/contracts";
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import { claudeAdapter, type QueryFn } from "../src/adapters/claude.ts";
 import { CloudError, createCloudClient } from "../src/cloudClient.ts";
 import { runOnce } from "../src/runner.ts";
@@ -107,6 +108,46 @@ describe("hive tools", () => {
     expect(task.calls).toEqual([
       { getTask: "task-1" },
       { type: "task.complete", taskId: "task-1", expectedRevision: 3 },
+    ]);
+  });
+});
+
+describe("hive_task_delegate", () => {
+  it("is offered for a Task, validates its input and delegates this run's Task", async () => {
+    const withTask = {
+      ...context,
+      task: { id: "task-1", key: "APP-1", title: "t", description: "" },
+    };
+    const { api, calls } = fakeRunApi();
+    const found = hiveTools(withTask, api).find((t) => t.name === "hive_task_delegate");
+    expect(found).toBeDefined();
+    expect(names(context)).not.toContain("hive_task_delegate");
+    const schema = z.object(found!.inputSchema);
+    expect(schema.safeParse({ botId: "b", mode: "admin", instructions: "x" }).success).toBe(false);
+    expect(
+      schema.safeParse({ botId: "b", mode: "read", instructions: "x", deadline: "tomorrow" })
+        .success,
+    ).toBe(false);
+    const args = {
+      botId: "bot-2",
+      mode: "read",
+      instructions: "review",
+      deadline: "2026-10-12T00:00:00Z",
+    };
+    expect(schema.safeParse(args).success).toBe(true);
+
+    await handler(hiveTools(withTask, api), "hive_task_delegate")(args);
+    expect(calls).toEqual([
+      { getTask: "task-1" },
+      {
+        type: "task.delegate",
+        taskId: "task-1",
+        toBotId: "bot-2",
+        mode: "read",
+        instructions: "review",
+        deadline: "2026-10-12T00:00:00Z",
+        expectedRevision: 3,
+      },
     ]);
   });
 });

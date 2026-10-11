@@ -50,10 +50,12 @@ hive executor run [--once] [--provider fake|claude|codex] [--concurrency N]  # L
 hive project create --key <KEY> --name <name>
 hive task create (--project <KEY> | --parent <task>) --title <title> [--priority <n>]
 hive task list [--project <KEY>] [--status <status>]
-hive task get <task>                                   # Task, results, Jobs, git rollup (commits, PRs, repositories)
+hive task get <task>                                   # Task, results, Jobs, delegations, git rollup (commits, PRs, repositories)
 hive task plan <task> --after <task>...                # adds prerequisites
 hive task assign <task> (--bot <bot-id> | --user <user-id> | --none)
 hive task complete <task>
+hive task delegate <task> --to <bot-id> --mode <read|write> --instructions <text> [--deadline <iso-timestamp>]
+hive task delegations <task>                           # the Task's delegations (also in task get)
 hive job start --task <task> --bot <bot-id> [--device <device-id>] [--wait [--timeout <s>]]
 hive subscription create --file <path|->           # JSON: the subscription.create fields without "type"
 hive subscription list

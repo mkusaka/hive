@@ -35,6 +35,7 @@ export const context: RunContext = {
   memories: [],
   related: [],
   previousProviderSessionId: null,
+  delegation: null,
 };
 
 /**

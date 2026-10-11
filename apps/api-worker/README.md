@@ -233,6 +233,28 @@ receipt and a concurrent change rolls the batch back; the failure is then re-rea
   Job with `task_id` and trigger key `task:<taskId>:<scope_revision>:<n>` (n = prior Jobs of the Task + 1). The
   placement is the Bot's policy; with `deviceId` it is pinned to that device, which must be inside the Bot's
   non-empty `allowedDeviceIds` (422 `not_eligible`) and not revoked (404). Returns `{jobId, taskId, triggerKey}`.
+- **`task.delegate {taskId, toBotId, mode: read | write, instructions (≤ 8 KiB), deadline?, expectedRevision}`**
+  (§8.1). Also a Run command. One batch writes a `delegations` row (`active`; Task `scope_revision`, delegator, from a
+  Run its parent Run / Execution and `hop`), a queued Job for the receiving Bot (trigger key `delegation:<id>`,
+  `jobs.delegation_id`, the Task, the Bot's placement, the delegating Run's `correlation_id`) and a Task CAS that changes
+  no field but bumps the revision (409 `stale_revision`; 422 `invalid_status` for a closed Task). The assignee is not
+  changed. From a Run the instructions are also a `delegation` message in the two Bots' `bot_pair` conversation, and the
+  Run's Bot must be the Task's assignee or hold an active `write` delegation on it (403 `not_delegator`); 422
+  `self_delegation`, `hop_limit` (hop > 4), `budget_exceeded` (20 correlated Jobs). One active delegation per (Task,
+  Bot): 409 `already_delegated`. Returns `{delegationId, jobId}`.
+- **`task.delegate.revoke {delegationId}`.** User only. `active` → `revoked` (409 `delegation_<state>` otherwise); the
+  Job is cancelled at once, or gets a cancel request when it is `active`.
+- **Delegated Runs.** The run context carries `delegation {id, mode, deadline, fromBot | fromUser, instructions}`
+  and, from a Bot, the `bot_pair` conversation; the principal's hop is the delegation's. Task writes from a delegated
+  Run need an active `write` delegation (403 `delegation_read_only`); reads work in both modes. Other Task Runs keep
+  the Project rule below.
+- **Delegation close** (pump, `settleDelegations`): an `active` delegation whose Job is `succeeded` / `failed` /
+  `cancelled` (Run result, `job.cancel`, `job.resolve`) goes `completed` with `outcome_summary` `<job state>:
+<last Run summary>`; a Bot delegator gets a `delegation_result` message from the receiver in the `bot_pair`
+  conversation and a `notify` Inbox item (`delegation.result`, no Job); a user delegator sees the delegation's change
+  row. Past `deadline` it goes `expired` and a Job not yet started is cancelled (an active Run is left alone). One
+  guarded batch per delegation, so a repeat or a concurrent pump closes it once. `GET /v1/tasks/:id` lists
+  `delegations`.
 - **Executor side.** `job.claim` copies `jobs.task_id` and the Task's `scope_revision` into the Execution.
   `run.result.submit` on such a Run inserts an immutable `task_results` row (state, summary, the Execution's scope
   revision) in `finishRun`'s batch. It never changes the Task status: Run success is not Task completion (AT-16).
@@ -303,6 +325,8 @@ member).
   | `task.create / assign / complete / cancel` | task (workspace)                                                         |
   | `task.plan`                                | task, task_dependency `<prereq>:<dependent>` upsert / delete (workspace) |
   | `job.start`                                | Job, task (workspace)                                                    |
+  | `task.delegate`                            | task, Job, delegation, from a Run conversation and message (workspace)   |
+  | `task.delegate.revoke`, delegation close   | delegation, Job; message, inbox item for a Bot delegator (workspace)     |
   | `subscription.*` (not `test`)              | subscription, delete on `delete` (workspace)                             |
   | `integration.create`                       | integration (workspace)                                                  |
   | event route via Subscriptions              | inbox item (destination channel), Job (workspace) for `wake`             |
@@ -349,8 +373,9 @@ WebSocket Hibernation API. It holds connections only, never state (ADR-04); ever
   inbox item to it and, for `wake`, inserts a `queued` Job with trigger key `inbox:<inboxItemId>`.
 - Any other event: Subscription routing (see Subscriptions above); no match writes only the consumer receipt.
 - Then due Inbox batches are sealed into one Job each, due Routines fire, expired leases are recovered and Jobs of
-  offline devices are parked (see Recovery and Routines). The response is `{processed, dead, sealed, routineJobs,
-expired, parked}`; the last two count Workspaces.
+  offline devices are parked (see Recovery and Routines), timed-out approvals expire and delegations are closed (see
+  Work). The response is `{processed, dead, sealed, routineJobs, expired, parked, approvalsExpired, delegations}`; the
+  last four count Workspaces.
 - Routing twice is a no-op (consumer receipt PK; UNIQUE trigger key as backstop). A failed row keeps its lease
   and is retried when it expires; after 5 attempts it is marked `dead`. Topics without a consumer yet
   (`run.finished`) are marked `sent`.
@@ -384,7 +409,8 @@ replyToMessageId?}`. The sender is the Run's Bot. The message goes to the pair's
     message with `reply_to_message_id` in the same conversation, an Inbox item for the requester (`agent.reply`) and,
     if its Job is `waiting_input` for that request, the Job back to `queued` (revision + 1).
   - `task.create / assign / plan / complete`: the user handlers, only with `task.write` and inside the Project of the
-    Run's own Task (403 otherwise).
+    Run's own Task (403 otherwise); a delegated Run also needs an active `write` delegation.
+  - `task.delegate`: see Work; the delegator is the Run's Bot.
 - **Waiting (AT-29).** `run.result.submit {state: "waiting", waitingFor: {requestMessageId}}` (a request this Job sent;
   422 `unknown_request` otherwise; 422 `already_replied` when the reply predates this Run, which would loop): the Run `succeeded`, Execution `finished`, reservations released, Job
   `waiting_input` with `waiting_for_message_id`, or `queued` at once when the reply already arrived. Its Inbox items
@@ -583,7 +609,7 @@ Raw provider transcripts in R2 with a D1 manifest (docs/architecture.md §3.3, �
   upgrade, so a channel joined later needs a reconnect, and they live in the socket attachment (16 KiB cap, about
   350 channels). The list routes are bounded but not paginated. G-04
   (Access + WebSocket from native clients) is not executed. Notify hints are sent per request, not batched.
-- **Work.** Only the `declaration` completion policy; no `task.replan`, delegation, `task_holds`, Git/PR collector
+- **Work.** Only the `declaration` completion policy; no `task.replan`, `task_holds`, Git/PR collector
   or Task-scoped Realtime / sync scopes (all Work rows use `workspace:<id>`). `task.plan` reads the Workspace's whole
   graph and its CAS covers only the edited Task, so two concurrent plans on different Tasks can still close a
   cycle (`workspaces.control_revision`, §11.2, does not exist yet). `task.cancel` does not stop Jobs. Task lists
@@ -603,7 +629,13 @@ Raw provider transcripts in R2 with a D1 manifest (docs/architecture.md §3.3, �
   Routines (user principal only); `routine.update` cannot change the Bot, Conversation or Task. A Task Routine's
   Job carries the Task but does not move it to `in_progress` or check readiness like `job.start`. No sync change
   row when only `next_fire_at` advances.
-- **Bot messaging.** No `task.delegate` / delegation table, no approval for external effects, no reply policy or
+- **Delegation.** The receiver's authority is Workspace membership plus the assignee / `write`-delegate rule and the
+  mode; Bots have no pause state and Channel / Project ACL is not built, so neither is checked. No resource scope,
+  reservations or requirement versions beyond `scope_revision`; the assignee rule applies to delegated Runs and to
+  `task.delegate` only, not to every Task Run. A `write` delegate's own write delegation being revoked does not
+  narrow the delegations it made. Closing and expiry lag up to a pump tick; an expired delegation's active Run keeps
+  running. No Run-side revoke.
+- **Bot messaging.** No approval for external effects, no reply policy or
   deadline (a request nobody answers leaves the requester `waiting_input` until `job.cancel`), no per-conversation
   token / time budget. The chain budget is checked before the batch, so concurrent requests can overshoot it
   slightly. Limits are fixed at the roadmap defaults (no user setting yet).

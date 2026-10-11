@@ -608,6 +608,130 @@ export const expireApprovals = async (db: D1Database, limit = 50) => {
   return [...new Set(results.map((a) => a.workspace_id))];
 };
 
+// --------------------------------------------------- Delegations (§8.1)
+
+/**
+ * Pump side: an active Delegation whose Job is terminal (Run result, job.cancel, job.resolve) goes `completed` with the
+ * outcome; one past its deadline goes `expired` and its Job is cancelled if it has not started (an active Run is left
+ * alone). One guarded batch per Delegation, so a retry or a concurrent pump changes nothing twice. A Bot delegator is
+ * told in the `bot_pair` conversation: a `delegation_result` message and a `notify` Inbox item (no Job). A user
+ * delegator sees the Delegation's change row. Returns the touched Workspaces.
+ */
+export const settleDelegations = async (db: D1Database, limit = 50) => {
+  const now = iso();
+  const { results } = await db
+    .prepare(
+      `SELECT d.id, d.workspace_id, d.job_id, d.from_kind, d.from_id, d.conversation_id, d.hop, j.state AS job_state,
+              t.key, b.actor_id,
+              (SELECT result_summary FROM runs r WHERE r.workspace_id = j.workspace_id AND r.job_id = j.id
+                ORDER BY r.execution_generation DESC LIMIT 1) AS summary
+         FROM delegations d
+         JOIN jobs j ON j.workspace_id = d.workspace_id AND j.id = d.job_id
+         JOIN tasks t ON t.workspace_id = d.workspace_id AND t.id = d.task_id
+         JOIN bots b ON b.workspace_id = d.workspace_id AND b.id = d.to_bot_id
+        WHERE d.state = 'active' AND (j.state IN ('succeeded', 'failed', 'cancelled') OR d.deadline < ?)
+        LIMIT ?`,
+    )
+    .bind(now, limit)
+    .all<{
+      id: string;
+      workspace_id: string;
+      job_id: string;
+      from_kind: "user" | "bot";
+      from_id: string;
+      conversation_id: string | null;
+      hop: number;
+      job_state: string;
+      key: string;
+      actor_id: string;
+      summary: string | null;
+    }>();
+  const settled = await Promise.all(
+    results.map(async (d) => {
+      const terminal = ["succeeded", "failed", "cancelled"].includes(d.job_state);
+      const outcome = `${d.job_state}: ${d.summary ?? ""}`.trim();
+      const scope = `workspace:${d.workspace_id}`;
+      const change = (entityKind: string, entityId: string) =>
+        appendChange(db, { workspaceId: d.workspace_id, entityKind, entityId, scope });
+      const [setGuard, clearGuard] = guard(db);
+      const messageId = crypto.randomUUID();
+      const inboxItemId = crypto.randomUUID();
+      const notice =
+        terminal && d.from_kind === "bot" && d.conversation_id
+          ? [
+              insertMessage(db, {
+                id: messageId,
+                workspaceId: d.workspace_id,
+                conversationId: d.conversation_id,
+                actorId: d.actor_id,
+                clientMessageId: `delegation:${d.id}:result`,
+                body: `Delegation of ${d.key} ${outcome}`,
+                kind: "delegation_result",
+                hop: d.hop,
+                jobId: d.job_id,
+              }),
+              insertInboxItem(db, {
+                id: inboxItemId,
+                workspaceId: d.workspace_id,
+                inputId: messageId,
+                botId: d.from_id,
+                conversationId: d.conversation_id,
+                lane: d.conversation_id,
+                purpose: "delegation.result",
+                deliveryMode: "notify",
+                hop: d.hop,
+              }),
+              change("message", messageId),
+              change("inbox_item", inboxItemId),
+            ]
+          : [];
+      try {
+        await db.batch([
+          terminal
+            ? db
+                .prepare(
+                  `UPDATE delegations SET state = 'completed', outcome_summary = ?, closed_at = ?
+                    WHERE id = ? AND state = 'active'`,
+                )
+                .bind(outcome, now, d.id)
+            : db
+                .prepare(
+                  `UPDATE delegations SET state = 'expired', closed_at = ?
+                    WHERE id = ? AND state = 'active' AND deadline < ?`,
+                )
+                .bind(now, d.id, now),
+          setGuard,
+          clearGuard,
+          ...notice,
+          ...(terminal
+            ? []
+            : [
+                db
+                  .prepare(
+                    `UPDATE jobs SET state = 'cancelled', cancel_requested_at = COALESCE(cancel_requested_at, ?),
+                       revision = revision + 1, updated_at = ?
+                      WHERE workspace_id = ? AND id = ? AND state IN ('queued', 'waiting_device', 'waiting_input')`,
+                  )
+                  .bind(now, now, d.workspace_id, d.job_id),
+                change("job", d.job_id),
+              ]),
+          change("delegation", d.id),
+        ]);
+        return d.workspace_id;
+      } catch (error) {
+        // Settled meanwhile by a concurrent pump: its batch won.
+        const row = await db
+          .prepare("SELECT state FROM delegations WHERE id = ?")
+          .bind(d.id)
+          .first<{ state: string }>();
+        if (row?.state !== "active") return null;
+        throw error;
+      }
+    }),
+  );
+  return [...new Set(settled.filter((w) => w !== null))];
+};
+
 /**
  * An external effect's approval was decided (docs/architecture.md §19): its `prepared` effect goes `approved` with an
  * `effect.perform` outbox row, or `failed` with `reason`. For the batch that resolves the approval.
@@ -853,7 +977,7 @@ export const insertMessage = (
     clientMessageId: string;
     body: string;
     /** Bot-to-bot fields (§8.1). */
-    kind?: "request" | "response" | "notification";
+    kind?: "request" | "response" | "notification" | "delegation" | "delegation_result";
     hop?: number;
     replyToMessageId?: string;
     jobId?: string;
@@ -954,13 +1078,14 @@ export const createJob = (
     placement?: unknown;
     /** The causing event's correlation id (§8.2 budget). */
     correlationId?: string;
+    delegationId?: string;
   },
 ) =>
   db
     .prepare(
       `INSERT INTO jobs (id, workspace_id, bot_id, state, trigger_key, task_id, inbox_batch_id, correlation_id,
-         placement)
-       VALUES (?, ?, ?, 'queued', ?, ?, ?, ?,
+         delegation_id, placement)
+       VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?,
          COALESCE(?, (SELECT placement_policy FROM bots WHERE workspace_id = ? AND id = ?)))`,
     )
     .bind(
@@ -971,6 +1096,7 @@ export const createJob = (
       input.taskId ?? null,
       input.inboxBatchId ?? null,
       input.correlationId ?? null,
+      input.delegationId ?? null,
       input.placement === undefined ? null : JSON.stringify(input.placement),
       input.workspaceId,
       input.botId,

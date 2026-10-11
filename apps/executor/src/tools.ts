@@ -202,6 +202,32 @@ export const hiveTools = (
             return done;
           }),
       ),
+      tool(
+        "hive_task_delegate",
+        `Delegate this run's Task ${task.key} to another Bot: it gets its own run with your instructions, read or ` +
+          "write access to the Task, and you are notified of the outcome. You stay responsible for the Task.",
+        {
+          botId: z.string().min(1).describe("Receiving Bot id"),
+          mode: z.enum(["read", "write"]),
+          instructions: z
+            .string()
+            .min(1)
+            .max(8 * 1024),
+          deadline: z.iso.datetime().optional().describe("ISO 8601 deadline"),
+        },
+        async (args) =>
+          cloud(async () =>
+            run.command({
+              type: "task.delegate",
+              taskId: task.id,
+              toBotId: args.botId,
+              mode: args.mode,
+              instructions: args.instructions,
+              ...(args.deadline ? { deadline: args.deadline } : {}),
+              expectedRevision: ((await run.getTask(task.id)) as { revision: number }).revision,
+            }),
+          ),
+      ),
     );
   }
   // Memory (§13.6): only the Run's own scopes; Workspace scope is a promotion the Run cannot make (AT-33).

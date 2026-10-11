@@ -459,6 +459,13 @@ Bot A / Run A
 - The receiver's capability is the **intersection** of Workspace policy, Bot policy, Channel/Project ACL and the
   delegator's own authority. Nobody can delegate rights they do not hold.
 
+Implemented as (DELEGATE-01): `task.delegate` / `task.delegate.revoke` with a `delegations` row and the receiver's own
+Job (`delegation:<id>`). The intersection covers Workspace membership, the delegator's authority (a Bot must be the
+Task's assignee or an active `write` delegate) and the read / write mode on the delegated Run's Task writes. Bots have
+no pause state yet, Channel / Project ACL beyond that is not built, and resource scope / requirement versions are only
+the Task's `scope_revision` at delegation. The pump closes a delegation when its Job ends (the delegator Bot gets a
+`notify` message in the `bot_pair` conversation) and expires it at its deadline.
+
 ### 8.2 Chain and wait control (§11.2)
 
 - Notifications are never auto-answered; reply policy applies only to explicit Requests. Each conversation has a

@@ -20,5 +20,7 @@ export type Principal =
       correlationId: string;
       taskId: string | null;
       taskProjectId: string | null;
+      /** The task.delegate this Run's Job works under (§8.1); a delegated Task write needs an active `write` one. */
+      delegation: { id: string; mode: "read" | "write"; state: string } | null;
       scopes: string[];
     };

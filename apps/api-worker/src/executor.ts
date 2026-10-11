@@ -518,7 +518,8 @@ const fencedRun = async (
 /**
  * Run context (SDK-01): Bot instructions, Task, recent Conversation and the trigger item's body (with its sender
  * Bot for a bot-to-bot message), or for a batch Job every member's body (its Conversation is the batch lane's), plus
- * the replies to requests the Job sent (§8.2), and the native session an earlier Run of the Job left (§13.3).
+ * the replies to requests the Job sent (§8.2), and the native session an earlier Run of the Job left (§13.3). A
+ * delegated Job (§8.1) carries its Delegation; from a Bot, its Conversation is the two Bots' `bot_pair`.
  */
 export const getRunContext = async (
   db: D1Database,
@@ -530,15 +531,20 @@ export const getRunContext = async (
   const row = await db
     .prepare(
       `SELECT b.id AS bot_id, b.name, b.instructions, b.tool_policy, j.placement, t.id AS task_id, t.key, t.title, t.description,
-              j.inbox_batch_id, i.id AS item_id, i.conversation_id, c.channel_id, c.kind AS conversation_kind,
+              j.inbox_batch_id, i.id AS item_id, c.id AS conversation_id, c.channel_id, c.kind AS conversation_kind,
               m.id AS message_id, m.kind AS message_kind, fb.id AS from_bot_id, fb.name AS from_bot_name,
               COALESCE(m.body, CASE e.source_kind WHEN 'routine' THEN json_extract(e.data, '$.inputText') END,
-                       e.data) AS body
+                       e.data) AS body,
+              d.id AS delegation_id, d.mode, d.deadline, d.from_kind, d.from_id, d.instructions AS delegation_text,
+              db.name AS delegator_name
          FROM jobs j
          JOIN bots b ON b.workspace_id = j.workspace_id AND b.id = j.bot_id
          LEFT JOIN tasks t ON t.workspace_id = j.workspace_id AND t.id = j.task_id
          LEFT JOIN inbox_items i ON i.workspace_id = j.workspace_id AND 'inbox:' || i.id = j.trigger_key
-         LEFT JOIN conversations c ON c.workspace_id = i.workspace_id AND c.id = i.conversation_id
+         LEFT JOIN delegations d ON d.workspace_id = j.workspace_id AND d.id = j.delegation_id
+         LEFT JOIN bots db ON db.workspace_id = d.workspace_id AND d.from_kind = 'bot' AND db.id = d.from_id
+         LEFT JOIN conversations c ON c.workspace_id = j.workspace_id
+                                  AND c.id = COALESCE(i.conversation_id, d.conversation_id)
          LEFT JOIN events e ON e.workspace_id = i.workspace_id AND e.id = i.input_id
          LEFT JOIN messages m ON m.workspace_id = e.workspace_id AND e.subject_kind = 'message'
                              AND m.id = e.subject_id
@@ -566,6 +572,13 @@ export const getRunContext = async (
       from_bot_id: string | null;
       from_bot_name: string | null;
       body: string | null;
+      delegation_id: string | null;
+      mode: "read" | "write" | null;
+      deadline: string | null;
+      from_kind: "user" | "bot" | null;
+      from_id: string | null;
+      delegation_text: string | null;
+      delegator_name: string | null;
     }>();
   if (!row) throw new HttpError("NOT_FOUND", "job not found");
   let batch: RunContext["batch"] = null;
@@ -727,6 +740,17 @@ export const getRunContext = async (
     })),
     memories,
     related,
+    delegation: row.delegation_id
+      ? {
+          id: row.delegation_id,
+          mode: row.mode!,
+          deadline: row.deadline,
+          fromBot:
+            row.from_kind === "bot" ? { id: row.from_id!, name: row.delegator_name ?? "" } : null,
+          fromUser: row.from_kind === "user" ? { id: row.from_id! } : null,
+          instructions: row.delegation_text ?? "",
+        }
+      : null,
   };
 };
 

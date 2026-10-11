@@ -37,7 +37,7 @@ export const systemPrompt = ({ bot }: LaunchContext["context"]) =>
 
 /**
  * User message: Task, recent conversation (oldest first), Memory, Related search hits, then the trigger item's body
- * (naming the sending Bot) or the batch's items, then replies to this Job's earlier requests.
+ * (naming the sending Bot), the batch's items or a Delegation's instructions, then replies to this Job's earlier requests.
  */
 export const userPrompt = ({
   task,
@@ -47,6 +47,7 @@ export const userPrompt = ({
   replies,
   memories,
   related,
+  delegation,
 }: LaunchContext["context"]) => {
   const parts: string[] = [];
   if (task) parts.push(`Task ${task.key}: ${task.title}\n${task.description}`.trim());
@@ -65,8 +66,13 @@ export const userPrompt = ({
   }
   const request = batch
     ? batch.items.map((i, n) => `[${n + 1}] ${i.body}`).join("\n")
-    : (inboxItem?.body ?? "Work on the task above.");
-  const from = inboxItem?.fromBot ? ` from bot ${inboxItem.fromBot.name} (${inboxItem.kind})` : "";
+    : (delegation?.instructions ?? inboxItem?.body ?? "Work on the task above.");
+  const from = delegation
+    ? ` delegated by ${delegation.fromBot ? `bot ${delegation.fromBot.name}` : `user ${delegation.fromUser?.id}`}` +
+      ` (${delegation.mode} access${delegation.deadline ? `, deadline ${delegation.deadline}` : ""})`
+    : inboxItem?.fromBot
+      ? ` from bot ${inboxItem.fromBot.name} (${inboxItem.kind})`
+      : "";
   parts.push(`Request${from}:\n${request}`);
   if (replies.length) {
     const lines = replies.map((r) => `[bot ${r.fromBot.name}] ${r.body}`);

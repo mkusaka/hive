@@ -19,6 +19,7 @@ import {
   type Recipient,
   routeToRecipients,
   sealDueBatches,
+  settleDelegations,
 } from "@hive/db";
 import { performEffect, type Performers, reconcileEffect } from "./effects.ts";
 import { parkWaitingJobs } from "./executor.ts";
@@ -190,8 +191,9 @@ export const routeEvent = async (db: D1Database, eventId: string): Promise<Notif
  * Acquires ready outbox rows and handles them. A failed row keeps its lease and is retried after it expires; at
  * `maxAttempts` it goes `dead`. Topics without a consumer yet (e.g. `run.finished`) are marked sent so they do not
  * cycle to dead. Then the time-driven work: due Inbox batches are sealed, due Routines fire, expired leases go
- * `unknown`, Jobs whose devices are all offline go `waiting_device` and timed-out approvals `expired` (`expired` / `parked` /
- * `approvalsExpired` count Workspaces).
+ * `unknown`, Jobs whose devices are all offline go `waiting_device`, timed-out approvals `expired`, and Delegations whose
+ * Job ended or whose deadline passed are closed (`expired` / `parked` / `approvalsExpired` / `delegations` count
+ * Workspaces).
  * `notify` receives the realtime hints.
  */
 export const pump = async (
@@ -263,7 +265,9 @@ export const pump = async (
   const parked = await parkWaitingJobs(db);
   // Approval timeout (§19, roadmap §1): pending past expires_at, or for a Run no longer current, is a deny.
   const approvals = await expireApprovals(db);
-  for (const workspaceId of new Set([...expired, ...parked, ...approvals])) {
+  // Delegations (§8.1): closed once their Job is terminal, expired past their deadline.
+  const delegations = await settleDelegations(db);
+  for (const workspaceId of new Set([...expired, ...parked, ...approvals, ...delegations])) {
     input.notify?.({ workspaceId, scopes: [`workspace:${workspaceId}`] });
   }
   return {
@@ -274,5 +278,6 @@ export const pump = async (
     expired: expired.length,
     parked: parked.length,
     approvalsExpired: approvals.length,
+    delegations: delegations.length,
   };
 };
