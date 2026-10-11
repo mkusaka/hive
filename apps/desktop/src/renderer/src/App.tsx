@@ -361,12 +361,17 @@ type Inspected = {
   /** Null when the transcript is not readable (not a member of the Run's channel, or a bot-pair Run). */
   entries: { seq: number; kind: string; text: string; toolName?: string }[] | null;
   error: string | null;
+  /** The Run's external effects (§19). */
+  effects: Row[];
 };
 
 /** `GET /v1/runs/:id` and every confirmed page of its normalized transcript (a page is one ≤ 1 MiB part). */
 const inspect = async (id: string): Promise<Inspected> => {
   const run = `/v1/runs/${encodeURIComponent(id)}`;
   const detail = await get(run);
+  const { effects } = await get(
+    inWorkspace("effects", String(detail.workspaceId), { runId: String(detail.id) }),
+  );
   const entries: NonNullable<Inspected["entries"]> = [];
   try {
     for (let cursor: unknown = "0"; typeof cursor === "string";) {
@@ -374,9 +379,9 @@ const inspect = async (id: string): Promise<Inspected> => {
       entries.push(...(page.entries as typeof entries));
       cursor = page.nextCursor;
     }
-    return { detail, entries, error: null };
+    return { detail, entries, error: null, effects: effects as Row[] };
   } catch (error) {
-    return { detail, entries: null, error: String(error) };
+    return { detail, entries: null, error: String(error), effects: effects as Row[] };
   }
 };
 
@@ -398,6 +403,40 @@ const RunInspector = ({ run }: { run: Inspected }) => {
       </p>
       {d.resultError ? <p className="error">{text(d.resultError)}</p> : null}
       {d.resultSummary ? <p>{text(d.resultSummary)}</p> : null}
+      {run.effects.length > 0 && (
+        <>
+          <h4>Effects</h4>
+          <table>
+            <thead>
+              <tr>
+                <th>Kind</th>
+                <th>State</th>
+                <th>Request</th>
+                <th>External</th>
+                <th>Attempts</th>
+                <th>Last error</th>
+              </tr>
+            </thead>
+            <tbody>
+              {run.effects.map((e) => (
+                <tr key={e.id}>
+                  <td>{text(e.kind)}</td>
+                  <td>
+                    <Badge state={e.state} />
+                  </td>
+                  <td>
+                    <pre className="mono">{text(e.summary)}</pre>
+                  </td>
+                  {/* Plain text: the window denies opening links. */}
+                  <td className="mono">{text(e.externalUrl ?? e.externalId)}</td>
+                  <td>{text(e.attempts)}</td>
+                  <td className="error">{e.lastError ? text(e.lastError) : ""}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
       {run.entries === null ? (
         <p className="error">Transcript unavailable: {run.error}</p>
       ) : (
@@ -415,7 +454,10 @@ const RunInspector = ({ run }: { run: Inspected }) => {
   );
 };
 
-/** Pending approvals, newest first. The command is a device-side redacted summary; the full input never leaves it. */
+/**
+ * Pending approvals, newest first. For a tool the arguments are a device-side redacted summary (the full input never
+ * leaves it); for an external effect (`slack.post`, `github.comment`, where `cloud`) the target and text to be posted.
+ */
 const ApprovalsView = (props: {
   approvals: Row[];
   resolve: (approvalId: string, decision: "allow" | "deny") => void;

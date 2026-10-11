@@ -134,9 +134,15 @@ export type ToolName = v.InferOutput<typeof ToolName>;
  * human approval per call. `cwdMode: environment` runs in the checkout root of the placement's `environmentId` on the
  * device; `run_scratch` in an empty per-run directory.
  */
+/** External writes the cloud performs for a Bot (docs/architecture.md §19). */
+export const effectKinds = ["slack.post", "github.comment"] as const;
+export type EffectKind = (typeof effectKinds)[number];
+
 export const ToolPolicy = v.strictObject({
   tools: v.optional(v.record(ToolName, v.picklist(["allow", "ask", "deny"])), {}),
   cwdMode: v.optional(v.picklist(["run_scratch", "environment"]), "run_scratch"),
+  /** Per effect kind; a kind not listed is `deny`. Absent on Bots created before EFFECT-01. */
+  effects: v.optional(v.record(v.picklist(effectKinds), v.picklist(["allow", "ask", "deny"]))),
 });
 export type ToolPolicy = v.InferOutput<typeof ToolPolicy>;
 
@@ -603,6 +609,95 @@ export const ApprovalResolve = v.strictObject({
   reason: v.optional(v.pipe(v.string(), v.maxLength(1024))),
 });
 
+// ------------------------------------------------- External effects (docs/architecture.md §19)
+
+const effectRequestBytes = 32 * 1024;
+const effectCommand = <K extends EffectKind, R extends v.GenericSchema>(kind: K, request: R) =>
+  v.strictObject({
+    type: v.literal("effect.prepare"),
+    kind: v.literal(kind),
+    /** Omitted: the Workspace's only enabled installation of the kind's provider. */
+    integrationId: v.optional(v.pipe(v.string(), v.minLength(1))),
+    request: v.pipe(
+      request,
+      v.check((r) => jsonBytes(r) <= effectRequestBytes, "request must be at most 32 KiB"),
+    ),
+  });
+
+/** Slack `chat.postMessage`: `channel` is a conversation id (reconcile reads its history by id). */
+export const SlackPostRequest = v.strictObject({
+  channel: v.pipe(
+    v.string(),
+    v.regex(/^[CDG][A-Z0-9]{2,}$/, "channel must be a Slack conversation id"),
+  ),
+  text: v.pipe(v.string(), v.minLength(1), v.maxLength(40_000)),
+  threadTs: v.optional(v.pipe(v.string(), v.regex(/^\d+\.\d+$/))),
+});
+/** GitHub issue / pull request comment. */
+export const GithubCommentRequest = v.strictObject({
+  owner: v.pipe(v.string(), v.regex(/^[A-Za-z0-9-]{1,39}$/)),
+  repo: v.pipe(v.string(), v.regex(/^[A-Za-z0-9._-]{1,100}$/)),
+  issueNumber: v.pipe(v.number(), v.integer(), v.minValue(1)),
+  body: v.pipe(v.string(), v.minLength(1), v.maxLength(65_536)),
+});
+
+/**
+ * A Run asks the cloud to write externally. The Bot's `toolPolicy.effects` decides: `deny` → 403, `ask` → a pending
+ * approval (the Run waits like for a tool approval), `allow` → performed at once. The same request twice from one Run
+ * returns the same effect.
+ */
+export const EffectPrepare = v.variant("kind", [
+  effectCommand("slack.post", SlackPostRequest),
+  effectCommand("github.comment", GithubCommentRequest),
+]);
+
+/**
+ * Manual recovery: `mark_succeeded` (with the external object's id) / `mark_failed` settle an `unknown` effect; `retry`
+ * performs an `unknown` or `failed` effect that was performed before (an effect never approved cannot be retried).
+ */
+export const EffectResolve = v.pipe(
+  v.strictObject({
+    type: v.literal("effect.resolve"),
+    effectId: v.pipe(v.string(), v.minLength(1)),
+    action: v.picklist(["mark_succeeded", "mark_failed", "retry"]),
+    externalId: v.optional(v.pipe(v.string(), v.minLength(1), v.maxLength(255))),
+    externalUrl: v.optional(v.pipe(v.string(), v.url(), v.maxLength(2048))),
+  }),
+  v.check(
+    (c) => (c.action === "mark_succeeded") === (c.externalId !== undefined),
+    "externalId is required for mark_succeeded and only for it",
+  ),
+);
+
+export const effectStates = [
+  "prepared",
+  "approved",
+  "executing",
+  "succeeded",
+  "failed",
+  "unknown",
+] as const;
+export type EffectState = (typeof effectStates)[number];
+
+/** `GET /v1/run/effects/:id` (what the waiting tool polls) and the items of `GET /v1/effects`. */
+export type Effect = {
+  id: string;
+  runId: string;
+  botId: string;
+  integrationId: string;
+  kind: EffectKind;
+  state: EffectState;
+  /** The redacted request a human approves (at most 2 KiB). */
+  summary: string;
+  approvalId: string | null;
+  externalId: string | null;
+  externalUrl: string | null;
+  attempts: number;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 /** `GET /v1/run/approvals/:id`: what the waiting executor polls. `expired` and `denied` both mean deny. */
 export type ApprovalStatus = {
   id: string;
@@ -683,6 +778,7 @@ export const RunCommand = v.variant("type", [
   TaskPlan,
   TaskComplete,
   MemoryWrite,
+  EffectPrepare,
 ]);
 export type RunCommand = v.InferInput<typeof RunCommand>;
 export type ExecutorCommand = v.InferInput<typeof ExecutorCommand>;

@@ -193,6 +193,76 @@ const stream = [
   },
 ] as unknown as SDKMessage[];
 
+describe("effect tools", () => {
+  const withEffects: RunContext = {
+    ...context,
+    bot: {
+      ...context.bot,
+      toolPolicy: {
+        tools: {},
+        cwdMode: "run_scratch",
+        effects: { "github.comment": "ask", "slack.post": "deny" },
+      },
+    },
+  };
+  const comment = { owner: "o", repo: "r", issueNumber: 7, body: "LGTM" };
+
+  it("are offered only for kinds the policy allows or asks", () => {
+    expect(names(context)).not.toContain("hive_github_comment");
+    expect(names(withEffects)).toContain("hive_github_comment");
+    expect(names(withEffects)).not.toContain("hive_slack_post");
+  });
+
+  it("prepare, poll until the effect settles and return only id, state and URL", async () => {
+    const { api, calls } = fakeRunApi(undefined, [], ["prepared", "executing", "succeeded"]);
+    const tools = hiveTools(withEffects, api, { pollMs: 1 });
+    const result = await handler(
+      tools,
+      "hive_github_comment",
+    )({ ...comment, integrationId: "gh-1" });
+    expect(JSON.parse(textOf(result))).toEqual({
+      effectId: "effect-1",
+      state: "succeeded",
+      externalUrl: "https://github.com/o/r/issues/7#issuecomment-1",
+    });
+    expect(calls[0]).toEqual({
+      type: "effect.prepare",
+      kind: "github.comment",
+      integrationId: "gh-1",
+      request: comment,
+    });
+    expect(calls.slice(1)).toEqual(Array.from({ length: 3 }, () => ({ getEffect: "effect-1" })));
+  });
+
+  it("report failed as an error and unknown as a do-not-repeat note", async () => {
+    const failed = fakeRunApi(undefined, [], ["failed"]);
+    const out = await handler(
+      hiveTools(withEffects, failed.api, { pollMs: 1 }),
+      "hive_github_comment",
+    )(comment);
+    expect(out).toMatchObject({ isError: true });
+    expect(textOf(out)).toContain("failed: create comment: HTTP 404");
+    const unknown = fakeRunApi(undefined, [], ["unknown"]);
+    const res = await handler(
+      hiveTools(withEffects, unknown.api, { pollMs: 1 }),
+      "hive_github_comment",
+    )(comment);
+    expect(JSON.parse(textOf(res))).toMatchObject({ state: "unknown" });
+  });
+
+  it("stop waiting when the Run is aborted", async () => {
+    const abort = new AbortController();
+    const { api, calls } = fakeRunApi();
+    const tools = hiveTools(withEffects, api, { signal: abort.signal, pollMs: 60_000 });
+    const pending = handler(tools, "hive_github_comment")(comment);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    abort.abort();
+    const out = await pending;
+    expect(out).toMatchObject({ isError: true });
+    expect(calls).toHaveLength(2);
+  });
+});
+
 describe("claudeAdapter with hive tools", () => {
   it("ends the Run as waiting after hive_wait_for_reply; the token is in no prompt", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hive-tools-"));

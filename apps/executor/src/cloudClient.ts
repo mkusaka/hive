@@ -3,6 +3,7 @@
 import type {
   ApiError,
   ApprovalStatus,
+  Effect,
   ExecutorCommand,
   ExecutorHeartbeat,
   ExecutorRun,
@@ -39,6 +40,8 @@ export type RunApi = {
   getTask(taskId: string): Promise<Record<string, unknown>>;
   /** The Run's own approval (§19), polled while a tool call waits for a human. */
   getApproval(approvalId: string): Promise<ApprovalStatus>;
+  /** The Run's own external effect (§19), polled while an effect tool waits for it to settle. */
+  getEffect(effectId: string): Promise<Effect>;
   /** Search limited to what the Run may read (its Workspace, Channel, Bot and Task scopes). */
   search(q: string): Promise<SearchResult>;
 };
@@ -190,6 +193,13 @@ export const createCloudClient = ({
         request(
           "GET",
           `/v1/run/approvals/${encodeURIComponent(approvalId)}`,
+          undefined,
+          capabilityToken,
+        ),
+      getEffect: (effectId) =>
+        request(
+          "GET",
+          `/v1/run/effects/${encodeURIComponent(effectId)}`,
           undefined,
           capabilityToken,
         ),

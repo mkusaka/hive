@@ -74,6 +74,32 @@ export const approvalResolve = (
     ...(reason === undefined ? {} : { reason }),
   });
 
+// ------------------------------------------------- External effects (§19)
+
+export const listEffects = (
+  c: Client,
+  workspaceId: string,
+  filter: { state?: string; runId?: string },
+) =>
+  c.get(
+    inWorkspace("effects", workspaceId, {
+      ...(filter.state ? { state: filter.state } : {}),
+      ...(filter.runId ? { runId: filter.runId } : {}),
+    }),
+  );
+
+/** Manual recovery of an `unknown` (or a performed `failed`) effect. */
+export const effectResolve = (
+  c: Client,
+  e: Envelope,
+  effectId: string,
+  resolution: {
+    action: "mark_succeeded" | "mark_failed" | "retry";
+    externalId?: string;
+    externalUrl?: string;
+  },
+) => c.command(e, { type: "effect.resolve", effectId, ...resolution });
+
 /** Polls pending approvals until `deadline`, calling `onApproval` once per new one. */
 export const watchApprovals = async (
   c: Client,

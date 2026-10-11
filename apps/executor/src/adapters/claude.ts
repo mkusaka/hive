@@ -155,7 +155,9 @@ export const claudeAdapter = ({
 
     const abort = new AbortController();
     let stopReason: string | undefined;
-    const tools = ctx.run ? hiveTools(ctx.context, ctx.run) : [];
+    const tools = ctx.run
+      ? hiveTools(ctx.context, ctx.run, { signal: abort.signal, pollMs: approvalPollMs })
+      : [];
     const hive = tools.map((t) => toolName(t.name));
     // tool_use id → requestMessageId of `hive_wait_for_reply` calls not yet answered.
     const waits = new Map<string, string>();

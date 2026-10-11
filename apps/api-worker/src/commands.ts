@@ -13,6 +13,8 @@ import {
   DeviceEnvironmentRegister,
   DeviceRegister,
   DeviceRevoke,
+  EffectPrepare,
+  EffectResolve,
   EventEmit,
   type EventEmitAccepted,
   firstFireAt,
@@ -29,6 +31,7 @@ import {
   RoutineResume,
   RoutineRun,
   type RoutineSchedule,
+  type ToolPolicy,
   RoutineUpdate,
   RunAgentSend,
   type RunAgentSendAccepted,
@@ -58,12 +61,14 @@ import {
   insertMessage,
   readiness,
   resumeRunAfterApproval,
+  settleEffectApproval,
   withOperationReceipt,
   wouldCreateCycle,
 } from "@hive/db";
 import * as v from "valibot";
 import { hashSecret, newDeviceSecret } from "./auth/device.ts";
 import type { Principal } from "./auth/principal.ts";
+import { queuePerform, summarize } from "./effects.ts";
 import { HttpError } from "./errors.ts";
 import { eventColumns, type EventRow, type SubscriptionRow, subscriptionMatches } from "./pump.ts";
 import { occurrenceStatements, routineColumns, routineFrom, type RoutineRow } from "./routines.ts";
@@ -103,6 +108,7 @@ export const CommandEnvelope = commandEnvelope(
     ApprovalResolve,
     MemoryWrite,
     MemoryDelete,
+    EffectResolve,
   ]),
 );
 type Envelope = v.InferOutput<typeof CommandEnvelope>;
@@ -1754,10 +1760,12 @@ const approvalResolve: Handler<v.InferOutput<typeof ApprovalResolve>> = async (d
   const { workspaceId, command } = env;
   const problem = await explainApproval(db, workspaceId, command.approvalId);
   if (problem) throw problem;
-  const { run_id: runId } = (await db
-    .prepare("SELECT run_id FROM approvals WHERE id = ?")
+  const { run_id: runId, effect_id: effectId } = (await db
+    .prepare(
+      "SELECT run_id, (SELECT id FROM effects WHERE approval_id = approvals.id) AS effect_id FROM approvals WHERE id = ?",
+    )
     .bind(command.approvalId)
-    .first<{ run_id: string }>())!;
+    .first<{ run_id: string; effect_id: string | null }>())!;
   const now = new Date().toISOString();
   const state = command.decision === "allow" ? "approved" : "denied";
   const [setGuard, clearGuard] = guard(db);
@@ -1787,11 +1795,14 @@ const approvalResolve: Handler<v.InferOutput<typeof ApprovalResolve>> = async (d
       setGuard,
       clearGuard,
       resumeRunAfterApproval(db, runId),
+      // An effect approval (§19): the effect goes `approved` + `effect.perform`, or `failed`.
+      ...settleEffectApproval(db, command.approvalId, state === "approved", "approval_denied"),
     ],
     { operationId: env.operationId, status: "accepted", approvalId: command.approvalId, state },
     [
       { entityKind: "approval", entityId: command.approvalId, scope },
       { entityKind: "run", entityId: runId, scope },
+      ...(effectId ? [{ entityKind: "effect", entityId: effectId, scope }] : []),
     ],
   );
   return explainFailure(run, () => explainApproval(db, workspaceId, command.approvalId));
@@ -2023,6 +2034,80 @@ const memoryDelete: Handler<v.InferOutput<typeof MemoryDelete>> = async (db, use
   );
 };
 
+const loadEffectState = async (db: D1Database, workspaceId: string, effectId: string) => {
+  const row = await db
+    .prepare("SELECT state, attempts FROM effects WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, effectId)
+    .first<{ state: string; attempts: number }>();
+  if (!row) throw new HttpError("NOT_FOUND", "effect not found");
+  return row;
+};
+
+/**
+ * Manual recovery (§19 "if unreconcilable, manual recovery"): `mark_succeeded` / `mark_failed` an `unknown` effect;
+ * `retry` an `unknown` or `failed` one that was performed before, which re-sends it: the human owns the duplicate risk.
+ */
+const effectResolve: Handler<v.InferOutput<typeof EffectResolve>> = async (db, user, env) => {
+  const { workspaceId, command } = env;
+  const effect = await loadEffectState(db, workspaceId, command.effectId);
+  const allowed =
+    command.action === "retry"
+      ? (effect.state === "unknown" || effect.state === "failed") && effect.attempts > 0
+      : effect.state === "unknown";
+  const conflict = () =>
+    new HttpError(
+      "REVISION_CONFLICT",
+      `cannot ${command.action} an effect that is ${effect.state}${effect.attempts === 0 ? " and was never performed" : ""}`,
+      false,
+      `effect_${effect.state}`,
+    );
+  if (!allowed) throw conflict();
+  const now = new Date().toISOString();
+  const update =
+    command.action === "retry"
+      ? db
+          .prepare(
+            `UPDATE effects SET state = 'approved', last_error = NULL, updated_at = ?
+              WHERE workspace_id = ? AND id = ? AND state = ? AND attempts = ?`,
+          )
+          .bind(now, workspaceId, command.effectId, effect.state, effect.attempts)
+      : db
+          .prepare(
+            `UPDATE effects SET state = ?, external_id = ?, external_url = ?, last_error = ?, updated_at = ?
+              WHERE workspace_id = ? AND id = ? AND state = 'unknown' AND attempts = ?`,
+          )
+          .bind(
+            command.action === "mark_succeeded" ? "succeeded" : "failed",
+            command.externalId ?? null,
+            command.externalUrl ?? null,
+            command.action === "mark_failed" ? "marked failed by a user" : null,
+            now,
+            workspaceId,
+            command.effectId,
+            effect.attempts,
+          );
+  const [setGuard, clearGuard] = guard(db);
+  const resolved = receipt(
+    db,
+    user.userId,
+    env,
+    [
+      update,
+      setGuard,
+      clearGuard,
+      ...(command.action === "retry" ? [queuePerform(db, command.effectId)] : []),
+    ],
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      effectId: command.effectId,
+      action: command.action,
+    },
+    [{ entityKind: "effect", entityId: command.effectId, scope: `workspace:${workspaceId}` }],
+  );
+  return explainFailure(resolved, async () => conflict());
+};
+
 const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>> } = {
   "workspace.create": workspaceCreate,
   "device.register": deviceRegister,
@@ -2056,6 +2141,7 @@ const handlers: { [T in Command["type"]]: Handler<Extract<Command, { type: T }>>
   "approval.resolve": approvalResolve,
   "memory.write": userMemoryWrite,
   "memory.delete": memoryDelete,
+  "effect.resolve": effectResolve,
 };
 
 export const runCommand = (db: D1Database, principal: Principal, envelope: Envelope) => {
@@ -2312,15 +2398,40 @@ const runApprovalRequest: RunHandler<v.InferOutput<typeof ApprovalRequest>> = as
   env,
 ) => {
   const { workspaceId, command } = env;
-  const approvalId = crypto.randomUUID();
-  const expiresAt = new Date(Date.now() + approvalTimeoutSeconds * 1000).toISOString();
-  const scope = `workspace:${workspaceId}`;
-  const [setGuard, clearGuard] = guard(db);
+  const approval = pendingApproval(db, run, command);
   const pending = receipt(
     db,
     run.runId,
     env as unknown as Envelope,
-    [
+    approval.statements,
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      approvalId: approval.approvalId,
+      expiresAt: approval.expiresAt,
+    },
+    approval.changes,
+  );
+  return explainFailure(pending, () => explainRunNotRunning(db, workspaceId, run));
+};
+
+/**
+ * The approval row and the Run's move to `waiting_approval` (fenced on its generation): one batch with the caller's
+ * statements.
+ */
+const pendingApproval = (
+  db: D1Database,
+  run: Run,
+  input: { actionKind: string; argsHash: string; argsSummary: string; cwdLabel: string },
+) => {
+  const approvalId = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + approvalTimeoutSeconds * 1000).toISOString();
+  const scope = `workspace:${run.workspaceId}`;
+  const [setGuard, clearGuard] = guard(db);
+  return {
+    approvalId,
+    expiresAt,
+    statements: [
       db
         .prepare(
           `INSERT INTO approvals (id, workspace_id, run_id, execution_generation, job_id, bot_id, action_kind, args_hash,
@@ -2329,15 +2440,15 @@ const runApprovalRequest: RunHandler<v.InferOutput<typeof ApprovalRequest>> = as
         )
         .bind(
           approvalId,
-          workspaceId,
+          run.workspaceId,
           run.runId,
           run.executionGeneration,
           run.jobId,
           run.botId,
-          command.actionKind,
-          command.argsHash,
-          command.argsSummary,
-          command.cwdLabel,
+          input.actionKind,
+          input.argsHash,
+          input.argsSummary,
+          input.cwdLabel,
           expiresAt,
         ),
       db
@@ -2346,28 +2457,185 @@ const runApprovalRequest: RunHandler<v.InferOutput<typeof ApprovalRequest>> = as
             WHERE workspace_id = ? AND id = ? AND execution_generation = ?
               AND state IN ('starting', 'running', 'waiting_approval')`,
         )
-        .bind(new Date().toISOString(), workspaceId, run.runId, run.executionGeneration),
+        .bind(new Date().toISOString(), run.workspaceId, run.runId, run.executionGeneration),
       setGuard,
       clearGuard,
     ],
-    { operationId: env.operationId, status: "accepted", approvalId, expiresAt },
-    [
+    changes: [
       { entityKind: "approval", entityId: approvalId, scope },
       { entityKind: "run", entityId: run.runId, scope },
-    ],
-  );
-  // Only a Run that left `starting / running / waiting_approval` explains a failed batch; anything else rethrows.
-  return explainFailure(pending, async () =>
-    (await db
+    ] as Change[],
+  };
+};
+
+/** Only a Run that left `starting / running / waiting_approval` explains a failed batch; anything else rethrows. */
+const explainRunNotRunning = async (db: D1Database, workspaceId: string, run: Run) =>
+  (await db
+    .prepare(
+      `SELECT 1 FROM runs WHERE workspace_id = ? AND id = ? AND execution_generation = ?
+        AND state IN ('starting', 'running', 'waiting_approval')`,
+    )
+    .bind(workspaceId, run.runId, run.executionGeneration)
+    .first())
+    ? null
+    : new HttpError("STALE_GENERATION", "run is not running", false, "stale_generation");
+
+// ------------------------------------------- External effects (docs/architecture.md §19)
+
+type EffectPrepareCommand = v.InferOutput<typeof EffectPrepare>;
+const providerOf = { "slack.post": "slack", "github.comment": "github" } as const;
+
+/** The named installation (404 outside the Workspace, 422 wrong kind / disabled) or the only enabled one. */
+const effectIntegration = async (
+  db: D1Database,
+  workspaceId: string,
+  command: EffectPrepareCommand,
+) => {
+  const provider = providerOf[command.kind];
+  if (command.integrationId) {
+    const row = await db
       .prepare(
-        `SELECT 1 FROM runs WHERE workspace_id = ? AND id = ? AND execution_generation = ?
-          AND state IN ('starting', 'running', 'waiting_approval')`,
+        "SELECT kind, enabled FROM integration_installations WHERE workspace_id = ? AND id = ?",
       )
-      .bind(workspaceId, run.runId, run.executionGeneration)
-      .first())
-      ? null
-      : new HttpError("STALE_GENERATION", "run is not running", false, "stale_generation"),
+      .bind(workspaceId, command.integrationId)
+      .first<{ kind: string; enabled: number }>();
+    if (!row) throw new HttpError("NOT_FOUND", "integration not found");
+    if (row.kind !== provider) {
+      throw new HttpError(
+        "INVALID_INPUT",
+        `${command.kind} needs a ${provider} integration`,
+        false,
+        "integration_kind",
+      );
+    }
+    if (!row.enabled)
+      throw new HttpError(
+        "INVALID_INPUT",
+        "integration is disabled",
+        false,
+        "integration_disabled",
+      );
+    return command.integrationId;
+  }
+  const { results } = await db
+    .prepare(
+      "SELECT id FROM integration_installations WHERE workspace_id = ? AND kind = ? AND enabled = 1 LIMIT 2",
+    )
+    .bind(workspaceId, provider)
+    .all<{ id: string }>();
+  if (results.length !== 1) {
+    throw new HttpError(
+      "INVALID_INPUT",
+      `give integrationId: the workspace has ${results.length === 0 ? "no" : "several"} ${provider} integrations`,
+      false,
+      "integration_ambiguous",
+    );
+  }
+  return results[0]!.id;
+};
+
+/**
+ * Records the intent (§19). Policy `deny` → 403; `ask` → `prepared` + a pending approval (the Run waits as for a tool
+ * approval); `allow` → `approved` + `effect.perform`. The same normalized request from the same Run returns the
+ * existing effect (UNIQUE run_id, request_digest); the random per-call idempotency key would not dedupe it.
+ */
+const runEffectPrepare: RunHandler<EffectPrepareCommand> = async (db, run, env) => {
+  const { workspaceId, command } = env;
+  const integrationId = await effectIntegration(db, workspaceId, command);
+  const bot = (await db
+    .prepare("SELECT tool_policy FROM bots WHERE workspace_id = ? AND id = ?")
+    .bind(workspaceId, run.botId)
+    .first<{ tool_policy: string }>())!;
+  const mode = ((JSON.parse(bot.tool_policy) as ToolPolicy).effects ?? {})[command.kind] ?? "deny";
+  if (mode === "deny") {
+    throw new HttpError(
+      "FORBIDDEN",
+      `${command.kind} is not allowed for this bot`,
+      false,
+      "effect_denied",
+    );
+  }
+  // Valibot output keys follow the schema order, so this JSON is canonical.
+  const request = JSON.stringify(command.request);
+  const requestDigest = await digest({
+    kind: command.kind,
+    integrationId,
+    request: command.request,
+  });
+  const existing = () =>
+    db
+      .prepare("SELECT id, state, approval_id FROM effects WHERE run_id = ? AND request_digest = ?")
+      .bind(run.runId, requestDigest)
+      .first<{ id: string; state: string; approval_id: string | null }>();
+  const accepted = (row: { id: string; state: string; approval_id: string | null }) => ({
+    status: 200,
+    response: {
+      operationId: env.operationId,
+      status: "accepted",
+      effectId: row.id,
+      state: row.state,
+      approvalId: row.approval_id,
+    },
+  });
+  const found = await existing();
+  if (found) return accepted(found);
+
+  const effectId = crypto.randomUUID();
+  const approval =
+    mode === "ask"
+      ? pendingApproval(db, run, {
+          actionKind: command.kind,
+          argsHash: requestDigest,
+          argsSummary: summarize(command.kind, command.request),
+          cwdLabel: "cloud",
+        })
+      : null;
+  const state = approval ? "prepared" : "approved";
+  const scope = `workspace:${workspaceId}`;
+  const prepared = receipt(
+    db,
+    run.runId,
+    env as unknown as Envelope,
+    [
+      ...(approval?.statements ?? []),
+      db
+        .prepare(
+          `INSERT INTO effects (id, workspace_id, run_id, execution_generation, bot_id, integration_id, kind, request,
+             request_digest, operation_marker, state, approval_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(
+          effectId,
+          workspaceId,
+          run.runId,
+          run.executionGeneration,
+          run.botId,
+          integrationId,
+          command.kind,
+          request,
+          requestDigest,
+          `hive:${effectId}`,
+          state,
+          approval?.approvalId ?? null,
+        ),
+      queuePerform(db, effectId),
+    ],
+    {
+      operationId: env.operationId,
+      status: "accepted",
+      effectId,
+      state,
+      approvalId: approval?.approvalId ?? null,
+    },
+    [{ entityKind: "effect", entityId: effectId, scope }, ...(approval?.changes ?? [])],
   );
+  return prepared.catch(async (error: unknown) => {
+    if (error instanceof IdempotencyConflict) throw error;
+    // A concurrent identical prepare won the UNIQUE (run_id, request_digest).
+    const raced = await existing();
+    if (raced) return accepted(raced);
+    throw (await explainRunNotRunning(db, workspaceId, run)) ?? error;
+  });
 };
 
 /**
@@ -2453,6 +2721,9 @@ export const runRunCommand = (db: D1Database, run: Run, envelope: RunEnvelopeVal
   }
   if (command.type === "memory.write") {
     return runMemoryWrite(db, run, envelope as RunEnvelopeValue & { command: typeof command });
+  }
+  if (command.type === "effect.prepare") {
+    return runEffectPrepare(db, run, envelope as RunEnvelopeValue & { command: typeof command });
   }
   return runTaskCommand(db, run, envelope as RunEnvelopeValue & { command: typeof command });
 };

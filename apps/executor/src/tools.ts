@@ -7,7 +7,8 @@ import {
   type SdkMcpToolDefinition,
   tool,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { RunContext } from "@hive/contracts";
+import { setTimeout as sleep } from "node:timers/promises";
+import type { EffectKind, RunCommand, RunContext } from "@hive/contracts";
 import { z } from "zod";
 import { CloudError, type RunApi } from "./cloudClient.ts";
 
@@ -62,8 +63,61 @@ const send =
     );
   };
 
-/** The tools this Run may use: `hive_reply` only for a request from another Bot, task tools only for a Task Job. */
-export const hiveTools = (context: RunContext, run: RunApi) => {
+/**
+ * External write through the cloud's effect broker (§19): prepare, then poll every `pollMs` until the effect settles.
+ * A pending approval keeps it `prepared` (the Run is `waiting_approval` meanwhile). The provider response never reaches
+ * the model: only the effect id, state and URL.
+ */
+const effect =
+  (run: RunApi, kind: EffectKind, opts: { signal?: AbortSignal; pollMs?: number }) =>
+  async ({ integrationId, ...request }: Record<string, unknown>) =>
+    cloud(async () => {
+      const { effectId } = (await run.command({
+        type: "effect.prepare",
+        kind,
+        ...(integrationId ? { integrationId } : {}),
+        request,
+      } as RunCommand)) as { effectId: string };
+      for (;;) {
+        opts.signal?.throwIfAborted();
+        // oxlint-disable-next-line no-await-in-loop -- one poll at a time
+        const e = await run.getEffect(effectId);
+        if (e.state === "failed")
+          throw new Error(`effect ${effectId} failed: ${e.lastError ?? ""}`);
+        if (e.state === "succeeded") {
+          return {
+            effectId,
+            state: e.state,
+            ...(e.externalUrl ? { externalUrl: e.externalUrl } : {}),
+          };
+        }
+        if (e.state === "unknown") {
+          return {
+            effectId,
+            state: e.state,
+            note: "the outcome is unknown; hive reconciles it. Do not post the same thing again.",
+          };
+        }
+        // oxlint-disable-next-line no-await-in-loop -- one poll at a time
+        await sleep(opts.pollMs ?? 2000, undefined, { signal: opts.signal });
+      }
+    });
+
+const integrationId = z
+  .string()
+  .min(1)
+  .optional()
+  .describe("Integration id; omit when the workspace has one of this kind");
+
+/**
+ * The tools this Run may use: `hive_reply` only for a request from another Bot, task tools only for a Task Job, effect
+ * tools only for kinds the Bot's policy does not deny. `signal` (the Run's stop) ends an effect tool's wait.
+ */
+export const hiveTools = (
+  context: RunContext,
+  run: RunApi,
+  opts: { signal?: AbortSignal; pollMs?: number } = {},
+) => {
   const tools: SdkMcpToolDefinition<any>[] = [
     tool(
       "hive_send_request",
@@ -184,6 +238,43 @@ export const hiveTools = (context: RunContext, run: RunApi) => {
       async (args) => cloud(() => run.search(args.q)),
     ),
   );
+  const effects = context.bot.toolPolicy.effects ?? {};
+  const offered = (kind: EffectKind) => effects[kind] === "allow" || effects[kind] === "ask";
+  if (offered("slack.post")) {
+    tools.push(
+      tool(
+        "hive_slack_post",
+        "Post a Slack message as the hive app, in a channel or a thread. May wait for a human approval.",
+        {
+          integrationId,
+          channel: z.string().min(1).describe("Slack conversation id, e.g. C0123ABCD"),
+          text: z.string().min(1).max(40_000),
+          threadTs: z
+            .string()
+            .min(1)
+            .optional()
+            .describe("Parent message ts to reply in its thread"),
+        },
+        effect(run, "slack.post", opts),
+      ),
+    );
+  }
+  if (offered("github.comment")) {
+    tools.push(
+      tool(
+        "hive_github_comment",
+        "Comment on a GitHub issue or pull request as the hive GitHub App. May wait for a human approval.",
+        {
+          integrationId,
+          owner: z.string().min(1),
+          repo: z.string().min(1),
+          issueNumber: z.number().int().min(1).describe("Issue or pull request number"),
+          body: z.string().min(1).max(65_536),
+        },
+        effect(run, "github.comment", opts),
+      ),
+    );
+  }
   return tools;
 };
 

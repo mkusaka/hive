@@ -1,4 +1,4 @@
-import type { ApprovalStatus, RunContext } from "@hive/contracts";
+import type { ApprovalStatus, Effect, RunContext } from "@hive/contracts";
 import { CloudError, type CloudClient, type RunApi } from "../src/cloudClient.ts";
 import type { JournalEntry } from "../src/runner.ts";
 
@@ -38,9 +38,14 @@ export const context: RunContext = {
 
 /**
  * Records `/v1/run/*` calls; `fail` makes every call throw that error. Approval polls answer `approvalStates` in order
- * (then `pending`), with the hash of the last `approval.request`.
+ * (then `pending`), with the hash of the last `approval.request`. Effect polls answer `effectStates` in order (then
+ * `prepared`).
  */
-export const fakeRunApi = (fail?: Error, approvalStates: ApprovalStatus["state"][] = []) => {
+export const fakeRunApi = (
+  fail?: Error,
+  approvalStates: ApprovalStatus["state"][] = [],
+  effectStates: Effect["state"][] = [],
+) => {
   const calls: unknown[] = [];
   let argsHash = "";
   const api: RunApi = {
@@ -51,6 +56,7 @@ export const fakeRunApi = (fail?: Error, approvalStates: ApprovalStatus["state"]
         argsHash = body.argsHash;
         return { status: "accepted", approvalId: "approval-1" };
       }
+      if (body.type === "effect.prepare") return { status: "accepted", effectId: "effect-1" };
       return { status: "accepted", messageId: "msg-sent" };
     },
     getApproval: async (id) => {
@@ -64,6 +70,18 @@ export const fakeRunApi = (fail?: Error, approvalStates: ApprovalStatus["state"]
         expiresAt: "",
         decisionReason: state === "expired" ? "timeout" : null,
       };
+    },
+    getEffect: async (id) => {
+      calls.push({ getEffect: id });
+      if (fail) throw fail;
+      const state = effectStates.shift() ?? "prepared";
+      return {
+        id,
+        state,
+        externalUrl:
+          state === "succeeded" ? "https://github.com/o/r/issues/7#issuecomment-1" : null,
+        lastError: state === "failed" ? "create comment: HTTP 404" : null,
+      } as Effect;
     },
     getTask: async (taskId) => {
       calls.push({ getTask: taskId });

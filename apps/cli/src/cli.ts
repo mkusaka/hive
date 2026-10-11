@@ -79,23 +79,32 @@ const need = (values: Values, name: string) => {
 const exitForJob = (job: cmd.Json) => (job.state === "succeeded" ? 0 : 5);
 
 /** `--tools Read=allow,Bash=ask` (+ `--cwd-mode`) → a ToolPolicy; the server validates names and modes. */
+/** `Name=mode,...` for `--tools` / `--effects`. */
+const modes = (option: string, value: string) =>
+  Object.fromEntries(
+    value
+      .split(",")
+      .filter(Boolean)
+      .map((pair) => {
+        const [name, mode, ...rest] = pair.split("=");
+        if (!name || !mode || rest.length > 0) throw invalid(`--${option}: bad entry ${pair}`);
+        return [name.trim(), mode.trim()];
+      }),
+  );
+
+/** `--tools` / `--effects` replace their list; an omitted part keeps the Bot's own. */
 const toolPolicy = (values: Values, current?: cmd.Json) => {
-  const { tools, "cwd-mode": cwdMode } = values;
-  if (tools === undefined && cwdMode === undefined) return undefined;
-  const parsed =
-    typeof tools === "string"
-      ? Object.fromEntries(
-          tools
-            .split(",")
-            .filter(Boolean)
-            .map((pair) => {
-              const [name, mode, ...rest] = pair.split("=");
-              if (!name || !mode || rest.length > 0) throw invalid(`--tools: bad entry ${pair}`);
-              return [name.trim(), mode.trim()];
-            }),
-        )
-      : (current?.tools ?? {});
-  return { tools: parsed, cwdMode: cwdMode ?? current?.cwdMode ?? "run_scratch" };
+  const { tools, effects, "cwd-mode": cwdMode } = values;
+  if (tools === undefined && effects === undefined && cwdMode === undefined) return undefined;
+  const effectModes =
+    typeof effects === "string"
+      ? modes("effects", effects)
+      : (current?.effects as cmd.Json | undefined);
+  return {
+    tools: typeof tools === "string" ? modes("tools", tools) : (current?.tools ?? {}),
+    cwdMode: cwdMode ?? current?.cwdMode ?? "run_scratch",
+    ...(effectModes ? { effects: effectModes } : {}),
+  };
 };
 
 const list = (value: unknown) =>
@@ -185,12 +194,13 @@ const specs: Record<string, Spec> = {
       c.print(await cmd.channelCreate(c.client(), c.envelope(), need(c.values, "name"))),
   },
   "bot create": {
-    usage: `--name <name> [--instructions <text> | --instructions-file <path|->] [--tools <Tool=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] ${placementUsage}`,
+    usage: `--name <name> [--instructions <text> | --instructions-file <path|->] [--tools <Tool=allow|ask|deny,...>] [--effects <slack.post|github.comment=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] ${placementUsage}`,
     options: {
       name: str,
       instructions: str,
       "instructions-file": str,
       tools: str,
+      effects: str,
       "cwd-mode": str,
       ...placementOptions,
     },
@@ -205,12 +215,13 @@ const specs: Record<string, Spec> = {
     },
   },
   "bot update": {
-    usage: `<bot-id> [--instructions <text> | --instructions-file <path|->] [--tools <Tool=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] ${placementUsage}`,
+    usage: `<bot-id> [--instructions <text> | --instructions-file <path|->] [--tools <Tool=allow|ask|deny,...>] [--effects <slack.post|github.comment=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] ${placementUsage}`,
     args: 1,
     options: {
       instructions: str,
       "instructions-file": str,
       tools: str,
+      effects: str,
       "cwd-mode": str,
       ...placementOptions,
     },
@@ -230,7 +241,7 @@ const specs: Record<string, Spec> = {
       const placement = placementPolicy(c.values, current?.placementPolicy);
       if (instructions === undefined && policy === undefined && placement === undefined)
         throw invalid(
-          "nothing to update: give --instructions(-file), --tools, --cwd-mode or placement flags",
+          "nothing to update: give --instructions(-file), --tools, --effects, --cwd-mode or placement flags",
         );
       c.print(
         await cmd.botUpdate(c.client(), c.envelope(), botId, {
@@ -292,6 +303,41 @@ const specs: Record<string, Spec> = {
     options: { timeout: str },
     run: async (c) =>
       cmd.watchApprovals(c.client(), c.workspace(), { ...c.wait(), onApproval: c.print }),
+  },
+  "effect list": {
+    usage: "[--state prepared|approved|executing|succeeded|failed|unknown] [--run <run-id>]",
+    options: { state: str, run: str },
+    run: async (c) =>
+      c.print(
+        await cmd.listEffects(c.client(), c.workspace(), {
+          state: c.values.state as string | undefined,
+          runId: c.values.run as string | undefined,
+        }),
+      ),
+  },
+  "effect resolve": {
+    usage: "<effect-id> (--succeeded <external-id> [--url <url>] | --failed | --retry)",
+    args: 1,
+    options: { succeeded: str, url: str, failed: flag, retry: flag },
+    run: async (c) => {
+      const { succeeded, failed, retry, url } = c.values;
+      if ([succeeded !== undefined, failed === true, retry === true].filter(Boolean).length !== 1)
+        throw invalid("exactly one of --succeeded <external-id>, --failed, --retry is required");
+      c.print(
+        await cmd.effectResolve(
+          c.client(),
+          c.envelope(),
+          c.args[0]!,
+          succeeded !== undefined
+            ? {
+                action: "mark_succeeded",
+                externalId: succeeded as string,
+                ...(url ? { externalUrl: url as string } : {}),
+              }
+            : { action: failed ? "mark_failed" : "retry" },
+        ),
+      );
+    },
   },
   search: {
     usage: "<query> [--kinds message,task,memory]",

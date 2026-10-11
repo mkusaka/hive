@@ -15,15 +15,18 @@ hive device register --name <n> --os <os> --agent-version <v>
                                                        # prints the token once, stores it for `executor run`
 hive channel create --name <name>
 hive bot create --name <name> [--instructions <text> | --instructions-file <path|->]
-                [--tools <Tool=allow|ask|deny,...>] [--cwd-mode run_scratch|environment] [placement flags]
-hive bot update <bot-id> [--instructions <text> | --instructions-file <path|->] [--tools ...] [--cwd-mode ...]
-                [placement flags]
+                [--tools <Tool=allow|ask|deny,...>] [--effects <slack.post|github.comment=allow|ask|deny,...>]
+                [--cwd-mode run_scratch|environment] [placement flags]
+hive bot update <bot-id> [--instructions <text> | --instructions-file <path|->] [--tools ...] [--effects ...]
+                [--cwd-mode ...] [placement flags]
   placement flags: [--mode any|preferred|pinned] [--preferred <id,...>] [--allowed <id,...>] [--allowed-device <id>]...
                    [--overflow|--no-overflow] [--fallback|--no-fallback] [--capabilities <name,...>] [--environment <name>]
 hive device env add --name <name> --repo <url> --path <local checkout root>
 hive approval list [--state pending|approved|denied|expired]   # default pending
 hive approval resolve <approval-id> (--allow | --deny) [--reason <text>]
 hive approval watch [--timeout <s>]                # prints each new pending approval once, polls every 2 s
+hive effect list [--state <state>] [--run <run-id>]  # external effects, newest first
+hive effect resolve <effect-id> (--succeeded <external-id> [--url <url>] | --failed | --retry)
 hive search <query> [--kinds message,task,memory]   # GET /v1/search; 1-2 characters take the bounded short path
 hive memory write --scope <workspace|channel:<id>|project:<id>|bot:<id>|task:<id>> (--content <text> | --file <path|->)
 hive memory list --scope <...>                         # live memories of the scope, newest first
@@ -95,6 +98,9 @@ a fresh UUID per invocation).
 - **`search`** and **`memory`** follow `apps/api-worker/README.md`, Search and memory. `search` is the one
   one-word command: the dispatcher tries `<group> <action>`, then `<group>`. `memory delete` defaults `--revision` to
   1 because a memory's content never changes (corrections supersede it); a deleted one is 422 (exit 2).
+- **`effect resolve`** is manual recovery of an `unknown` effect (`--succeeded` / `--failed`) or a re-send of an
+  `unknown` or performed `failed` one (`--retry`); see `apps/api-worker/README.md`, External effects. `--tools` and
+  `--effects` each replace their own list on `bot update`; the other is kept.
 - **`approval resolve`** is one-use: a second resolve, an expired approval or one whose Run is no longer current is
   409 (exit 4).
 - **`subscription create`** sends the file's JSON object as the `subscription.create` command, for example

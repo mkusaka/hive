@@ -27,7 +27,7 @@ type Change = { scope: string; entityKind: string };
 
 /**
  * `channel:*` → messages / inbox (and the channel list for a new channel); `workspace:*` → jobs / bots / devices /
- * approvals (and the inspected Run for a `run` row).
+ * approvals (and the inspected Run for a `run` or `effect` row).
  */
 export const refetchFor = (changes: Change[]) => {
   const keys = new Set<ListKey>();
@@ -37,7 +37,7 @@ export const refetchFor = (changes: Change[]) => {
       if (entityKind === "channel") keys.add("channels");
     } else if (scope.startsWith("workspace:")) {
       keys.add("jobs").add("bots").add("devices").add("approvals");
-      if (entityKind === "run") keys.add("run");
+      if (entityKind === "run" || entityKind === "effect") keys.add("run");
     }
   }
   return keys;

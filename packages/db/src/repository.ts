@@ -551,15 +551,22 @@ export const expireApprovals = async (db: D1Database, limit = 50) => {
   const now = iso();
   const { results } = await db
     .prepare(
-      `SELECT a.id, a.workspace_id, a.run_id, a.expires_at < ? AS timed_out FROM approvals a
+      `SELECT a.id, a.workspace_id, a.run_id, a.expires_at < ? AS timed_out, e.id AS effect_id FROM approvals a
          JOIN runs r ON r.workspace_id = a.workspace_id AND r.id = a.run_id
+         LEFT JOIN effects e ON e.approval_id = a.id
         WHERE a.state = 'pending'
           AND (a.expires_at < ? OR r.state NOT IN ${activeRunStates}
                OR r.execution_generation <> a.execution_generation)
         LIMIT ?`,
     )
     .bind(now, now, limit)
-    .all<{ id: string; workspace_id: string; run_id: string; timed_out: number }>();
+    .all<{
+      id: string;
+      workspace_id: string;
+      run_id: string;
+      timed_out: number;
+      effect_id: string | null;
+    }>();
   if (results.length === 0) return [];
   await db.batch(
     results.flatMap((a) => {
@@ -584,11 +591,46 @@ export const expireApprovals = async (db: D1Database, limit = 50) => {
           entityId: a.run_id,
           scope,
         }),
+        ...(a.effect_id
+          ? [
+              ...settleEffectApproval(db, a.id, false, "approval_expired"),
+              appendChange(db, {
+                workspaceId: a.workspace_id,
+                entityKind: "effect",
+                entityId: a.effect_id,
+                scope,
+              }),
+            ]
+          : []),
       ];
     }),
   );
   return [...new Set(results.map((a) => a.workspace_id))];
 };
+
+/**
+ * An external effect's approval was decided (docs/architecture.md §19): its `prepared` effect goes `approved` with an
+ * `effect.perform` outbox row, or `failed` with `reason`. For the batch that resolves the approval.
+ */
+export const settleEffectApproval = (
+  db: D1Database,
+  approvalId: string,
+  approved: boolean,
+  reason: string,
+) => [
+  db
+    .prepare(
+      `UPDATE effects SET state = ?, last_error = ?, updated_at = ? WHERE approval_id = ? AND state = 'prepared'`,
+    )
+    .bind(approved ? "approved" : "failed", approved ? null : reason, iso(), approvalId),
+  db
+    .prepare(
+      `INSERT INTO outbox (id, workspace_id, topic, payload)
+       SELECT ?, workspace_id, 'effect.perform', json_object('effectId', id, 'attempt', attempts)
+         FROM effects WHERE approval_id = ? AND state = 'approved' AND ?`,
+    )
+    .bind(crypto.randomUUID(), approvalId, approved ? 1 : 0),
+];
 
 /**
  * Moves the given Jobs between `queued` and `waiting_device` (§10.4, AT-30) with their change rows in one batch. Which
@@ -654,11 +696,19 @@ export const appendChange = (
 /** Returns a statement to include in the batch that commits the state change. */
 export const enqueueOutbox = (
   db: D1Database,
-  input: { workspaceId: string; topic: string; payload: unknown },
+  input: { workspaceId: string; topic: string; payload: unknown; availableAt?: string },
 ) =>
   db
-    .prepare("INSERT INTO outbox (id, workspace_id, topic, payload) VALUES (?, ?, ?, ?)")
-    .bind(crypto.randomUUID(), input.workspaceId, input.topic, JSON.stringify(input.payload));
+    .prepare(
+      "INSERT INTO outbox (id, workspace_id, topic, payload, available_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(
+      crypto.randomUUID(),
+      input.workspaceId,
+      input.topic,
+      JSON.stringify(input.payload),
+      input.availableAt ?? iso(),
+    );
 
 /** Conditional acquisition: one UPDATE claims ready rows (pending, or `sending` with an expired lease). */
 export const acquireOutboxBatch = (

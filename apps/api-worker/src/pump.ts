@@ -20,6 +20,7 @@ import {
   routeToRecipients,
   sealDueBatches,
 } from "@hive/db";
+import { performEffect, type Performers, reconcileEffect } from "./effects.ts";
 import { parkWaitingJobs } from "./executor.ts";
 import type { Notification } from "./realtime.ts";
 import { fireDueRoutines } from "./routines.ts";
@@ -195,7 +196,13 @@ export const routeEvent = async (db: D1Database, eventId: string): Promise<Notif
  */
 export const pump = async (
   db: D1Database,
-  input: { owner: string; limit: number; notify?: (n: Notification) => void },
+  input: {
+    owner: string;
+    limit: number;
+    notify?: (n: Notification) => void;
+    /** External effect providers (effects.ts); the Worker builds them from its secrets. */
+    performers: Performers;
+  },
 ) => {
   const rows = await acquireOutboxBatch(db, {
     owner: input.owner,
@@ -213,6 +220,22 @@ export const pump = async (
         }
         if (row.topic === "search.index") {
           await indexSource(db, row.payload as { sourceKind: SearchKind; sourceId: string });
+        }
+        // Provider errors settle the effect inside; only a D1 error throws (and the claim CAS makes a retry safe).
+        if (row.topic === "effect.perform" || row.topic === "effect.reconcile") {
+          const workspaceId =
+            row.topic === "effect.perform"
+              ? await performEffect(
+                  db,
+                  input.performers,
+                  row.payload as { effectId: string; attempt: number },
+                )
+              : await reconcileEffect(
+                  db,
+                  input.performers,
+                  row.payload as { effectId: string; round: number },
+                );
+          if (workspaceId) input.notify?.({ workspaceId, scopes: [`workspace:${workspaceId}`] });
         }
         await markOutboxSent(db, settle);
         return "processed";

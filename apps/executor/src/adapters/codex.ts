@@ -283,7 +283,9 @@ export const codexAdapter = ({
       }
     };
 
-    const tools = ctx.run ? hiveTools(ctx.context, ctx.run) : [];
+    const tools = ctx.run
+      ? hiveTools(ctx.context, ctx.run, { signal: abort.signal, pollMs: approvalPollMs })
+      : [];
     const gate = approvalGate({
       policy,
       run: ctx.run,

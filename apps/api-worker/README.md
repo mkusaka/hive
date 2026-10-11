@@ -28,6 +28,7 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/tasks/:id`                                             | Access assertion (user)                | A Task with prerequisites, dependents, Results and Jobs                                                                                                        |
 | `GET /v1/subscriptions?workspaceId=`                            | Access assertion (user)                | Subscriptions of the Workspace with their spec (max 500); see Subscriptions below                                                                              |
 | `GET /v1/approvals?workspaceId=&state=`                         | Access assertion (user)                | Newest-first approvals (max 100), optionally one state; see Tools and approvals                                                                                |
+| `GET /v1/effects?workspaceId=&state=&runId=`                    | Access assertion (user)                | Newest-first external effects (max 200), optionally one state / Run; see External effects                                                                      |
 | `GET /v1/search?workspaceId=&q=&kinds=&limit=&cursor=`          | Access assertion (user)                | Full-text search over permitted scopes (limit 1..100, default 20); see Search and memory                                                                       |
 | `GET /v1/memories?workspaceId=&scopeKind=&scopeId=`             | Access assertion (user)                | Live memories of one scope, newest first (max 200; channel needs membership)                                                                                   |
 | `POST /v1/admin/search/rebuild?workspaceId=`                    | Access assertion (user, owner)         | Drops the Workspace's search documents and re-enqueues every source (AT-38)                                                                                    |
@@ -37,6 +38,7 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 | `GET /v1/run/me`                                                | `Authorization: Bearer cap.<run>.<s>`  | The Run principal (`RunPrincipal`)                                                                                                                             |
 | `GET /v1/run/tasks/:id`                                         | `Authorization: Bearer cap.<run>.<s>`  | A Task of the Run's own Task's Project (`task.read`; 403 otherwise)                                                                                            |
 | `GET /v1/run/approvals/:id`                                     | `Authorization: Bearer cap.<run>.<s>`  | The Run's own approval at its generation (`ApprovalStatus`), polled by the executor                                                                            |
+| `GET /v1/run/effects/:id`                                       | `Authorization: Bearer cap.<run>.<s>`  | The Run's own effect (`Effect`), polled by the executor's effect tools                                                                                         |
 | `GET /v1/run/search?q=&kinds=&limit=`                           | `Authorization: Bearer cap.<run>.<s>`  | Search within the Run's scopes (`search.read`; limit 1..50, default 10)                                                                                        |
 | `GET /v1/executor/me`                                           | `Authorization: Bearer <device-token>` | Returns the device principal                                                                                                                                   |
 | `POST /v1/executor/pump`                                        | `Authorization: Bearer <device-token>` | Runs the outbox pump and time-driven work once; returns counts (see Outbox pump)                                                                               |
@@ -62,7 +64,7 @@ The Access-protected API Worker (Hono on Cloudflare Workers, D1 binding `DB`). S
 - **Command types:** `workspace.create`, `device.register`, `device.revoke`, `channel.create`, `bot.create`,
   `agent.send`, `event.emit`, the Work commands, the Subscription / integration commands, the Routine commands,
   `job.cancel` / `job.resolve` below, `bot.update`, `device.environment.register`, `approval.resolve` (Tools and
-  approvals), and `memory.write` / `memory.delete` (Search and memory).
+  approvals), `memory.write` / `memory.delete` (Search and memory) and `effect.resolve` (External effects).
 - **Actors.** A user's `actors` row is created by `workspace.create` together with the membership (the only path
   that creates a membership today), unique per `(workspace_id, user_id)`. Messages and channel membership use it.
 - **`channel.create`** creates the channel, its main conversation and an `owner` channel membership for the caller.
@@ -340,6 +342,8 @@ expired, parked}`; the last two count Workspaces.
   and is retried when it expires; after 5 attempts it is marked `dead`. Topics without a consumer yet
   (`run.finished`) are marked `sent`.
 - `search.index {sourceKind, sourceId}` rows are handled by the search indexer (see Search and memory).
+- `effect.perform {effectId, attempt}` and `effect.reconcile {effectId, round}` rows are handled by the effect broker
+  (see External effects). Provider errors never throw there, so the outbox retry never re-sends a write.
 
 It runs from the `scheduled()` cron trigger (every minute) and from `POST /v1/executor/pump`.
 
@@ -407,6 +411,51 @@ canonical tool input), argsSummary (≤ 2 KiB), cwdLabel}`. One batch inserts a 
 - **Expiry.** The pump sweeps `pending` approvals past `expires_at` (`decision_reason: timeout`) or whose Run is not
   current (`run_not_current`) to `expired`, which the executor treats as deny, and resumes their Run
   (`approvalsExpired` counts Workspaces).
+
+## External effects
+
+The effect broker (docs/architecture.md §19; EFFECT-01, AT-28, AT-40): a Bot's external writes are performed by this
+Worker with the integration's credentials. Tokens never reach a device or a model. Code: `src/effects.ts`.
+
+- **Policy.** `toolPolicy.effects` is `{"slack.post" | "github.comment": allow | ask | deny}`; a missing kind (and
+  every Bot created before EFFECT-01) is `deny`.
+- **`effect.prepare`** (run command): `{kind: "slack.post", integrationId?, request: {channel (conversation id), text,
+threadTs?}}` or `{kind: "github.comment", integrationId?, request: {owner, repo, issueNumber, body}}`, request ≤ 32
+  KiB. The installation must be in the Run's Workspace (404), of the kind's provider and enabled (422
+  `integration_kind` / `integration_disabled`); without `integrationId` the Workspace's only enabled one is used (422
+  `integration_ambiguous` for none or several). `deny` → 403 `effect_denied`. `ask` → the effect is `prepared` and
+  the same batch inserts a pending approval (`action_kind` = the kind, `args_hash` = the request digest,
+  `args_summary` = target + text ≤ 2 KiB, `cwd_label: cloud`) and moves the Run to `waiting_approval`, exactly like
+  `approval.request`. `allow` → `approved` + `effect.perform` in the same batch. Response `{effectId, state,
+approvalId}`. `request_digest` = SHA-256 of `{kind, integrationId, request}`; UNIQUE (run_id, request_digest)
+  makes the same request twice from one Run return the existing effect (the tools' random idempotency keys would
+  not dedupe it).
+- **Approval.** `approval.resolve` on an effect approval moves the effect `approved` + `effect.perform` or `failed`
+  (`approval_denied`) in its batch; the expiry sweep fails it with `approval_expired`.
+- **Perform.** CAS `approved → executing` with `attempts = attempt` (`attempts + 1`; a duplicate message is a
+  no-op). The first perform also needs the requesting Run active at the effect's generation, else `failed`
+  `run_not_current` without a request (AT-40). The outbound object carries the operation marker `hive:<effectId>`:
+  Slack `chat.postMessage` with `metadata: {event_type: "hive_effect", event_payload: {marker}}`; GitHub
+  `POST /repos/{owner}/{repo}/issues/{n}/comments` with a trailing `<!-- hive:<effectId> -->`, after minting an
+  installation token with an RS256 App JWT (`iat` −60 s, `exp` +9 min). 2xx → `succeeded` with `external_id` (Slack
+  `ts`, GitHub comment id) and `external_url` (GitHub `html_url`; null for Slack). Definite errors (4xx except 408 /
+  429, Slack `ok: false` errors) → `failed`, never retried. A network error, a 10 s timeout, 408, 429, 5xx or Slack
+  `ratelimited / internal_error / fatal_error / service_unavailable / request_timeout` → `unknown`, never re-sent
+  (§19), with `effect.reconcile` due in 30 s. A message redelivered after its handler died mid-perform also makes
+  the effect `unknown`.
+- **Reconcile.** Looks the object up by its marker among objects since `created_at` − 60 s: GitHub lists the issue's
+  comments (`since`, 100 per page, ascending by id); Slack reads `conversations.replies` (thread) or
+  `conversations.history` with `include_all_metadata`, which needs a `*:history` scope besides `chat:write`. Found →
+  `succeeded`. Definitely absent → `approved` and performed again while `attempts < 3`, else it stays `unknown`
+  (`resolve manually`). A failed lookup is retried with backoff (30 s × 2^round, 5 rounds), then left `unknown`.
+- **`effect.resolve {effectId, action, externalId?, externalUrl?}`** (any member): `mark_succeeded` (needs
+  `externalId`) / `mark_failed` an `unknown` effect; `retry` an `unknown` or `failed` effect that was performed at
+  least once (an effect that was never approved cannot be retried). Wrong state → 409 `effect_<state>`.
+- **Changes.** Every state change writes an `effect` change row (scope `workspace:<id>`).
+- **Secrets.** Workers secrets (`.dev.vars` locally): `SLACK_BOT_TOKEN`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`
+  (PKCS#8 PEM; GitHub downloads PKCS#1, convert with `openssl pkcs8 -topk8 -nocrypt -in app.pem`; `\n` escapes
+  are accepted), `GITHUB_INSTALLATION_ID`. Unset → the kind fails with `... not configured`. They are
+  environment-level: one Slack app and one GitHub App installation for every `integration_installations` row.
 
 ## Search and memory
 
@@ -491,6 +540,10 @@ Raw provider transcripts in R2 with a D1 manifest (docs/architecture.md §3.3, �
 
 ## Known gaps
 
+- **Effect generation fence.** Only an effect's first perform requires its Run to be active at the effect's
+  generation (AT-40). A re-perform after reconcile proved the object absent, or a human `effect.resolve retry`, runs
+  even after the Run ended, because the write was already authorized. Effect secrets are environment-level, not per
+  installation.
 - **No Queues yet.** The design (docs/architecture.md §6.1, §6.3) hands outbox rows to Cloudflare Queues and
   routes in a Queue consumer. The cron pump does both in-process, so routing lag is up to a minute without a
   manual pump.

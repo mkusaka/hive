@@ -184,6 +184,16 @@ result is resumed (lease renewed, adapter started again); a terminal Run gets it
 Run the cloud does not know gets `missing`. A failed confirmation is retried on the next start. Only then does the
 loop claim new Jobs.
 
+## Effect tools
+
+`hive_slack_post {integrationId?, channel, text, threadTs?}` and `hive_github_comment {integrationId?, owner, repo,
+issueNumber, body}` (`src/tools.ts`; docs/architecture.md §19) are offered only for kinds the Bot's
+`toolPolicy.effects` allows or asks. Each sends `effect.prepare` and polls `GET /v1/run/effects/:id` every 2 s until
+the effect is `succeeded` (returns `{effectId, state, externalUrl?}`), `failed` (an error text with the reason) or
+`unknown` (returns the state and a note not to post again; the cloud reconciles). While a human approval is pending
+the effect stays `prepared` and the Run is `waiting_approval` through the cloud's approval path. The Run's stop
+aborts the wait. The provider response never reaches the model. Codex gets the same tools as `dynamicTools`.
+
 ## Running against `wrangler dev`
 
 1. Start the API Worker locally (see `apps/api-worker/README.md`, Local development).
@@ -225,7 +235,9 @@ loop against the real Hono app runs in `apps/api-worker/test/executor.test.ts` (
 - Transcripts are uploaded after the Run, not streamed while it runs; no artifact upload, no local retention
   cleanup and no SessionStore adapter (G-07), so no cross-device resume. A failed upload is retried only at the
   next start.
-- No OS sandbox and no Bash path restriction; no effect broker for external writes (§19). A Run
+- No OS sandbox and no Bash path restriction. External writes are brokered only through `hive_slack_post` /
+  `hive_github_comment`: a GitHub or Slack token reachable from Bash bypasses the broker's duplicate prevention
+  (§19), and nothing warns about it yet. A Run
   resumed by reconcile has no capability, so no hive tools and every `ask` tool is denied.
 - Only `runtime.run.started` and `runtime.run.stopped` are observed; no usage / cost or other runtime events are
   sent to the cloud. The fake adapter sends no `runtime.run.started`, so its Runs stay `starting`.

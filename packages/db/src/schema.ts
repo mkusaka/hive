@@ -984,6 +984,61 @@ export const approvals = sqliteTable(
   ],
 );
 
+export const effectKinds = ["slack.post", "github.comment"] as const;
+const effectStates = [
+  "prepared",
+  "approved",
+  "executing",
+  "succeeded",
+  "failed",
+  "unknown",
+] as const;
+
+/**
+ * current state (docs/architecture.md §19): a Run's intent to write to an external system, performed by the cloud
+ * with the integration's credentials (claim → perform → reconcile). `request` is the normalized request without the
+ * operation marker; `request_digest` is its SHA-256, so the same request twice from one Run is one effect.
+ * `operation_marker` is embedded in the outbound object to find it again when the response was lost (`unknown`).
+ * `attempts` counts performs; an `unknown` effect is never re-sent unless reconcile proves the object absent.
+ */
+export const effects = sqliteTable(
+  "effects",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: workspaceId(),
+    runId: text("run_id").notNull(),
+    executionGeneration: integer("execution_generation").notNull(),
+    botId: text("bot_id").notNull(),
+    integrationId: text("integration_id").notNull(),
+    kind: text("kind", { enum: effectKinds }).notNull(),
+    request: text("request", { mode: "json" }).notNull(),
+    requestDigest: text("request_digest").notNull(),
+    operationMarker: text("operation_marker").notNull(),
+    state: text("state", { enum: effectStates }).notNull(),
+    approvalId: text("approval_id").references((): AnySQLiteColumn => approvals.id),
+    externalId: text("external_id"),
+    externalUrl: text("external_url"),
+    attempts: integer("attempts").notNull().default(0),
+    lastError: text("last_error"),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    scoped(t),
+    unique().on(t.runId, t.requestDigest),
+    index("effects_workspace_state").on(t.workspaceId, t.state),
+    index("effects_approval").on(t.approvalId),
+    oneOf("effects_kind", t.kind, effectKinds),
+    oneOf("effects_state", t.state, effectStates),
+    foreignKey({ columns: [t.workspaceId, t.runId], foreignColumns: [runs.workspaceId, runs.id] }),
+    foreignKey({ columns: [t.workspaceId, t.botId], foreignColumns: [bots.workspaceId, bots.id] }),
+    foreignKey({
+      columns: [t.workspaceId, t.integrationId],
+      foreignColumns: [integrationInstallations.workspaceId, integrationInstallations.id],
+    }),
+  ],
+);
+
 // ------------------------------------------------------------ Coordination
 
 /** current state. One active owner per (workspace_id, resource_key); released rows stay as history. */

@@ -1,4 +1,5 @@
 import { type Bindings, createApp } from "./app.ts";
+import { createPerformers } from "./effects.ts";
 import { pump } from "./pump.ts";
 import { notify } from "./realtime.ts";
 
@@ -15,6 +16,7 @@ export default {
         owner: "cron",
         limit: 100,
         notify: (n) => ctx.waitUntil(notify(env, n)),
+        performers: createPerformers(env),
       }),
     );
   },

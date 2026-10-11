@@ -26,6 +26,7 @@ import {
   recordObservation,
   runExecutorCommand,
 } from "./executor.ts";
+import { createPerformers, getRunEffect, listEffects } from "./effects.ts";
 import { pump } from "./pump.ts";
 import {
   getJob,
@@ -71,6 +72,11 @@ export type Bindings = {
   ACCESS_AUD: string;
   /** Local dev only: a JSON Web Key Set used instead of the Access certs (`.dev.vars`). */
   ACCESS_DEV_JWKS?: string;
+  /** External effect credentials (effects.ts), Workers secrets. Unset → that effect kind fails as not configured. */
+  SLACK_BOT_TOKEN?: string;
+  GITHUB_APP_ID?: string;
+  GITHUB_APP_PRIVATE_KEY?: string;
+  GITHUB_INSTALLATION_ID?: string;
 };
 export type AppEnv = {
   Bindings: Bindings;
@@ -185,6 +191,7 @@ export const createApp = ({
         owner: `device:${device(c).deviceId}`,
         limit: 50,
         notify: (n) => hint(c, n),
+        performers: createPerformers(c.env),
       }),
     ),
   );
@@ -285,6 +292,9 @@ export const createApp = ({
   });
   app.get("/v1/run/approvals/:id", async (c) =>
     c.json(await getRunApproval(c.env.DB, runPrincipal(c), c.req.param("id"))),
+  );
+  app.get("/v1/run/effects/:id", async (c) =>
+    c.json(await getRunEffect(c.env.DB, runPrincipal(c).runId, c.req.param("id"))),
   );
   app.get("/v1/run/tasks/:id", async (c) => {
     const run = runPrincipal(c);
@@ -405,6 +415,14 @@ export const createApp = ({
 
   app.get("/v1/approvals", async (c) =>
     c.json(await listApprovals(c.env.DB, workspaceParam(c), c.req.query("state"))),
+  );
+  app.get("/v1/effects", async (c) =>
+    c.json(
+      await listEffects(c.env.DB, workspaceParam(c), {
+        state: c.req.query("state"),
+        runId: c.req.query("runId"),
+      }),
+    ),
   );
   app.get("/v1/routines", async (c) => c.json(await listRoutines(c.env.DB, workspaceParam(c))));
   app.get("/v1/subscriptions", async (c) =>
