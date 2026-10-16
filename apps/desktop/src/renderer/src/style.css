@@ -106,9 +106,11 @@ pre {
 
 /* Layout */
 .app {
+  position: relative;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   height: 100vh;
+  padding-top: 38px;
 }
 .app.with-panel {
   grid-template-columns: auto minmax(0, 1fr) 380px;
@@ -137,35 +139,41 @@ main {
   padding: 12px 8px;
   align-items: center;
 }
-/* The window has no title bar: this strip and the chat header move it; their buttons stay clickable. */
-.side-top,
+/* The existing sidebar top spans every view, including the rail and right-hand panels. */
+.window-drag,
 .chat-head {
   -webkit-app-region: drag;
 }
-.side-top button,
-.chat-head button {
+.no-drag,
+button,
+input,
+select,
+textarea,
+a,
+[role="button"],
+[contenteditable],
+[role="menu"],
+[role="menuitem"],
+.backdrop {
   -webkit-app-region: no-drag;
 }
 .side-top {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 38px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
-  min-height: 36px;
-  /* Room for the traffic lights. */
-  padding-left: 68px;
+  /* Keep all content to the right of the hiddenInset traffic lights, even with the rail collapsed. */
+  padding-left: 96px;
 }
 .workspace {
+  width: 148px;
   display: inline-flex;
   align-items: center;
   gap: 4px;
   font-size: 17px;
   font-weight: 700;
-}
-/* The traffic lights (about 70 px wide) cover the top of the 72 px rail: the toggle goes below them. */
-.collapsed .side-top {
-  padding: 32px 0 0;
-  justify-content: center;
 }
 button.icon {
   position: relative;

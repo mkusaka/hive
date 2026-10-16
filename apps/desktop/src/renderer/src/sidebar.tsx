@@ -272,14 +272,14 @@ export const Sidebar = (props: {
 
   return (
     <aside className={`sidebar ${collapsed ? "collapsed" : ""}`}>
-      <div className="side-top">
+      <div className="side-top window-drag">
         {!collapsed && (
           <span className="workspace ellipsis">
             {props.workspaceName} <Icon name="chevron" />
           </span>
         )}
         <button
-          className="icon tip-below"
+          className="icon tip-below no-drag"
           data-tip={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           aria-label="Toggle sidebar"
           onClick={props.toggleCollapsed}
