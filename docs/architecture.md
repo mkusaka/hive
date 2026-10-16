@@ -76,8 +76,15 @@ Local Executor PC1 / PC2
 | Infra            | Terraform / Wrangler / GitHub Actions                              |
 
 Hono / Drizzle / Valibot / Bun match `wr` [S02]. wr's web-only Inertia page structure is not inherited; a JSON
-API shared by Electron / Android / CLI is the common surface. Terraform owns Access / DNS / service tokens,
+API shared by Electron / Android / CLI is the common surface. Terraform owns Access / service tokens / D1 / R2;
 Wrangler owns Workers / bindings / deploy, the migration runner owns the DB schema. No resource has two owners.
+
+Production API: `https://hive-api.<subdomain>.workers.dev`, no custom domain. The owner supplies
+`workers_subdomain` and `access_team_name`; the Access team domain is independent of the API host. Terraform
+protects the production host first, then adds `preview_worker` after the first deploy provides the Worker id
+(infra/README.md). G-04 WebSocket upgrade through worker-level Access: passed 2026-10-13 with a
+`cf-access-token` user token; Bearer / Managed OAuth and Service Token upgrade still open. The earlier blanket
+WebSocket 403 claim is refuted for this workers.dev setup; Managed OAuth remains G-02, untested.
 
 ## 2. Domain boundaries (§5)
 
@@ -834,8 +841,8 @@ Android closes realtime while backgrounded, pulls HTTP on every foreground trans
   principal and permitted scopes, checked on subscribe, permission change and auth refresh. Sensitive IDs or
   excerpts never reach unauthorized connections.
 - Long-lived WS connections are not left open after revocation: short auth lifetimes, reconnect/re-auth, and
-  immediate close on membership revoke. Access uses a hostname-based application (Worker-level Access has
-  WebSocket upgrade limitations [S12]).
+  immediate close on membership revoke. The workers.dev probe passed a user-token WebSocket upgrade through
+  worker-level Access on 2026-10-13; Bearer / Managed OAuth and Service Token upgrades remain open (G-02 / G-04).
 
 ### 12.5 Offline and resend (§15.5)
 
@@ -1164,7 +1171,7 @@ Webhook creation and `routine.rotate_secret` disclose a per-routine secret once;
 retain it. The secret encodes 32 random bytes with a prefix making it longer than HMAC-SHA256's 64-byte key block.
 Only SHA-256(secret), the equivalent normalized HMAC key, is stored. Callers sign the raw body with the displayed
 secret: `X-Hive-Signature: sha256=<hex HMAC-SHA256>`, `POST /v1/hooks/routines/:routineId`. That path bypasses Access
-on the API custom domain (infra/README.md), but the Worker still verifies the signature. JSON is at most 64 KiB;
+on the API workers.dev host (infra/README.md), but the Worker still verifies the signature. JSON is at most 64 KiB;
 disabled Routines return 409, invalid signatures 401, and the per-routine 60/minute budget returns 429.
 An optional `X-Hive-Delivery` dedupes within that Routine for seven days. The occurrence's `payload` reaches the
 Run's inbox text as fenced JSON after `inputText`.
@@ -1206,13 +1213,14 @@ Subscription and Routine edits retain revision checks and the existing receipt/c
 
 ### 18.1 Hosts and credentials (§21.1)
 
-| Host / connection    | Authentication                                             |
-| -------------------- | ---------------------------------------------------------- |
-| api.example.com      | Hostname-based Access, user allow policy and Managed OAuth |
-| executor.example.com | Hostname-based Access, per-device Service Auth             |
-| hooks.example.com    | No Access login; provider signature / shared secret        |
-| Worker to worker     | Private Service Binding + permitted service methods        |
-| Local IPC            | Unix domain socket / named pipe restricted to the OS user  |
+| Host / connection                                    | Authentication                                            |
+| ---------------------------------------------------- | --------------------------------------------------------- |
+| hive-api.<subdomain>.workers.dev (users)             | Access user allow policy and Managed OAuth                |
+| hive-api.<subdomain>.workers.dev (executors)         | Same Access application, per-device Service Auth first    |
+| hive-api.<subdomain>.workers.dev/v1/hooks/routines/* | Access bypass; per-routine HMAC signature                 |
+| hive-integration.<subdomain>.workers.dev             | No Access login; provider signature                       |
+| Worker to worker                                     | Private Service Binding + permitted service methods       |
+| Local IPC                                            | Unix domain socket / named pipe restricted to the OS user |
 
 - CLI / Electron use the system browser with Authorization Code + PKCE. Access Managed OAuth returns an opaque
   token; the origin verifies Access's signed assertion [S23] with `jose` (signature, issuer, audience, expiry) and
