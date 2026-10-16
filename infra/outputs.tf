@@ -16,8 +16,8 @@ output "access_team_domain" {
   value = "${var.access_team_name}.cloudflareaccess.com"
 }
 
-output "api_hostname" {
-  value = var.api_hostname
+output "api_url" {
+  value = "https://${local.api_host}"
 }
 
 # CF-Access-Client-Id per executor device.

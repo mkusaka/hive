@@ -10,6 +10,10 @@ terraform {
 # Reads CLOUDFLARE_API_TOKEN from the environment.
 provider "cloudflare" {}
 
+locals {
+  api_host = "hive-api.${var.workers_subdomain}.workers.dev"
+}
+
 resource "cloudflare_d1_database" "hive" {
   account_id = var.account_id
   name       = "hive"
@@ -45,21 +49,19 @@ resource "cloudflare_zero_trust_access_policy" "executors" {
   { service_token = { token_id = token.id } }]
 }
 
-# One application for the API Worker: the custom domain is a hostname destination because worker destinations
-# reject WebSocket upgrades (/v1/realtime), and preview_worker covers every preview URL. workers.dev is off in
-# wrangler.jsonc. Humans use Managed OAuth (CLI / Electron PKCE on a loopback redirect), executors Service Auth.
-# Worker-level Access answers WebSocket upgrades with 403 (developers.cloudflare.com/workers/configuration/cloudflare-access/).
-# Unconfirmed until G-02: whether Access accepts a public and a preview_worker destination in one application.
-# Fallback: two applications (hostname, preview_worker) attaching the same policies.
+# One application for the API's workers.dev hostname, plus every preview URL after the second apply.
+# The 2026-10-13 workers.dev probe passed HTTP and WebSocket upgrades with a cf-access-token user token.
+# Managed OAuth Bearer and Service Token upgrades remain unconfirmed (G-02 / G-04).
 resource "cloudflare_zero_trust_access_application" "api" {
   account_id = var.account_id
-  name       = "hive api"
+  name       = local.api_host
   type       = "self_hosted"
+  domain     = local.api_host
   # Browser session. The provider takes ns/us/ms/s/m/h only.
   session_duration     = "168h"
   app_launcher_visible = false
   destinations = concat(
-    [{ type = "public", uri = var.api_hostname }],
+    [{ type = "public", uri = local.api_host }],
     var.api_worker_id == "" ? [] : [{ type = "preview_worker", worker_id = var.api_worker_id }],
   )
   # Service Auth first: under an allow policy a Service Token would still be sent to the IdP login.
@@ -87,7 +89,7 @@ resource "cloudflare_zero_trust_access_application" "routine_hooks" {
   name                 = "hive routine hooks"
   type                 = "self_hosted"
   app_launcher_visible = false
-  destinations         = [{ type = "public", uri = "${var.api_hostname}/v1/hooks/routines/*" }]
+  destinations         = [{ type = "public", uri = "${local.api_host}/v1/hooks/routines/*" }]
   policies = [{
     name       = "Signed routine webhooks"
     decision   = "bypass"

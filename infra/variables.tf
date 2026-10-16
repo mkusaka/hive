@@ -8,9 +8,9 @@ variable "access_team_name" {
   description = "Zero Trust team name: the <team> in <team>.cloudflareaccess.com."
 }
 
-variable "api_hostname" {
+variable "workers_subdomain" {
   type        = string
-  description = "Hostname of the API Worker custom domain, e.g. api.hive.example.com."
+  description = "Account workers.dev subdomain: the <subdomain> in hive-api.<subdomain>.workers.dev."
 }
 
 variable "allowed_emails" {

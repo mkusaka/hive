@@ -3,8 +3,8 @@
   "name": "hive-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-15",
-  // Production is the custom domain only; every preview URL sits behind the Access application (infra/).
-  "workers_dev": false,
+  // Production uses workers.dev; Access protects this host and, after the second apply, every preview URL (infra/).
+  "workers_dev": true,
   "preview_urls": true,
   // Outbox pump (src/pump.ts) until Cloudflare Queues carry the outbox.
   "triggers": { "crons": ["* * * * *"] },
